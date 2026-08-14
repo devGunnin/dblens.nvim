@@ -4,15 +4,16 @@ A database viewer for Neovim. dblens gives you a schema tree, a paged result gri
 scratch buffer in one tab page, and drives SQLite, PostgreSQL and MySQL through the `sqlite3`,
 `psql` and `mysql` command-line clients you already have installed. There is no compiled
 component and no server: every query is a one-shot client process, decoded through a record
-protocol chosen so that a SQL `NULL` is never confused with the text `NULL`. Writes go through a
-single choke point that enforces read-only connections, a confirmation preview, and a
-`count(*)` guard proving a row-targeted edit matches exactly one row.
+protocol chosen so that a SQL `NULL` is never confused with the text `NULL`. Every statement
+goes through a single gate that enforces read-only connections, a confirmation preview, and a
+`count(*)` guard proving a row-targeted edit matches exactly one row — and that treats anything
+it cannot prove is a read as a write.
 
 ## Requirements
 
 - Neovim >= 0.10
 - The client for each database you want to reach:
-  - SQLite -> `sqlite3`
+  - SQLite -> `sqlite3` >= 3.34, for the `-safe` flag that refuses `.shell`, `.load` and ATTACH
   - PostgreSQL -> `psql`
   - MySQL / MariaDB -> `mysql`
 
@@ -225,6 +226,9 @@ require('dblens').setup({
   -- Per-scope action -> lhs overrides. `false` disables a binding. See the keymap tables below
   -- for the action names; an unknown action is an error, not a silent no-op.
   keymaps = {
+    -- Per action: a key, a list of keys, or false to drop that binding.
+    -- A whole scope can be `false` to bind nothing in it -- `global = false` is the escape
+    -- hatch for the ten `<leader>d*` maps.
     global  = {},                 -- e.g. { toggle = '<leader>D', txn_begin = false }
     sidebar = {},
     results = {},
@@ -234,7 +238,9 @@ require('dblens').setup({
 ```
 
 `setup{}` rejects unknown keys and type changes, naming the full dotted path — a typo is an
-error, not a silently ignored option.
+error, not a silently ignored option. That includes keymaps: an unknown action name, or an
+override that is not a key, a list of keys or `false`, fails at `setup{}` rather than when the
+pane it belongs to is first opened.
 
 ## Commands
 
@@ -321,25 +327,46 @@ Every binding is declared in one table and can be remapped or disabled per scope
 
 ## Safety model
 
-Every write goes through `Session:execute_write`, so the rules hold no matter which part of the
-UI asked.
+**One gate.** Every statement dblens sends — a browsed page, a filter, ad-hoc editor SQL,
+`EXPLAIN`, a cell edit, a committed batch — goes through `Session:run`, which puts it through
+`Session:gate` before a client process exists. Read-only, the confirmation requirement and the
+refusal of client meta-commands are enforced there, not in whichever part of the UI asked.
+
+**The read proof fails closed.** A statement counts as a read only when dblens can *prove* it
+is one: a single statement led by `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `DESCRIBE`, a
+reporting `PRAGMA`, or an `EXPLAIN` that does not `ANALYZE`; with no write verb anywhere in it,
+no `INTO`/`OUTFILE` redirect, no stacked second statement and no punctuation outside the set
+that appears in real SQL operators. **Everything else is treated as a write**, including verbs
+dblens does not recognise. So `WITH d AS (DELETE …) SELECT …`, `COPY … FROM PROGRAM`,
+`DO $$ … $$`, `CALL`, `SELECT … INTO`, `PRAGMA user_version = 42` and `SELECT 1; DROP TABLE t`
+are all writes, and all refused on a read-only connection.
+
+`EXPLAIN ANALYZE` is classified by the statement *inside* it, because on PostgreSQL and MySQL it
+**runs** that statement. `EXPLAIN ANALYZE DELETE …` is therefore a destructive write: refused on
+a read-only connection, and gated by the destructive confirmation elsewhere, with the float
+saying plainly that it will run. Plain `EXPLAIN` only plans, and stays a read.
+
+**Client meta-commands never reach a client.** `psql` runs `\!` as a shell command in the middle
+of a statement, and `sqlite3 -batch` still honours `.shell`. Neither is SQL, so no connection
+flag covers them; the gate refuses any statement starting with `.` or containing an unquoted
+`\`, on every connection. sqlite3 is additionally run with `-safe`, which refuses `.shell`,
+`.load`, `.import` and `ATTACH` at the client.
 
 **Read-only connections.** A connection with `read_only = true` (or every connection, with
 `safety.read_only_default = true`) refuses every write and every commit, naming the connection.
-The refusal is in the session, not in the keymap that happened to call it.
 
-**The confirm gate.** Statements are classified by their leading verb.
-`UPDATE`, `DELETE`, `REPLACE`, `MERGE`, `DROP`, `TRUNCATE`, `ALTER`, `RENAME`, `GRANT` and
-`REVOKE` are destructive; `INSERT`, `CREATE`, `COMMENT`, `ANALYZE`, `VACUUM`, `REINDEX`,
-`ATTACH` and `DETACH` are non-destructive writes. With `safety.confirm_destructive = true`
-(the default) a destructive statement is shown in a preview float — the exact SQL, the verb and
-target of each destructive statement, and a flag when it affects a whole object with no `WHERE`
-— and runs only when you confirm. `safety.confirm_write = true` extends the same gate to
-non-destructive writes. An unconfirmed write is refused by the session, not merely undrawn.
+**The confirm gate.** `UPDATE`, `DELETE`, `REPLACE`, `MERGE`, `DROP`, `TRUNCATE`, `ALTER`,
+`RENAME`, `GRANT` and `REVOKE` are destructive; other writes are not. With
+`safety.confirm_destructive = true` (the default) a destructive statement is shown in a preview
+float — the exact SQL, the verb and target, and a flag when it affects a whole object with no
+`WHERE` — and runs only when you confirm. `safety.confirm_write = true` extends the same gate to
+non-destructive writes. The two are evaluated per class, so a script holding both an `INSERT` and
+a `DROP` is gated by both settings. An unconfirmed write is refused by the session, not merely
+undrawn.
 
 Before a single destructive ad-hoc statement, adapters that can estimate without executing
 (`caps.estimate_rows`: PostgreSQL via `EXPLAIN (FORMAT JSON)`, MySQL via `EXPLAIN`) show the
-planner's row estimate. SQLite cannot, and says so.
+planner's row estimate. SQLite cannot, and says so; a failed estimate says why.
 
 **The exactly-one-row guard.** A cell edit or a row delete builds a `WHERE` from the primary
 key, or — when the table has none — from every column in the displayed row. Either way the
@@ -349,8 +376,22 @@ predicate actually matched. That is what makes editing a table without a primary
 ambiguous predicate is refused, never applied to several rows. The preview tells you which of
 the two identifications is in use. An `INSERT` targets no existing row and carries no guard.
 
-**Filters are vetted.** A `WHERE` typed into the results filter is checked before it is spliced
-into a statement; a fragment containing a write verb is rejected.
+In transaction mode the guard is emitted **into** the committed batch, immediately before the
+change it guards, so it is re-checked against the database as the transaction sees it rather
+than as it was at queue time. A guard that no longer matches exactly one row aborts the whole
+batch. Outside a transaction the guard and the write are still two separate client invocations,
+so a concurrent writer between them is not excluded — the guard bounds mistakes, not races.
+
+**Connection paths are never shell-evaluated.** A `path` is expanded with `~` and `$VAR`
+substitution only. A backtick, a wildcard or a leading `-` is rejected when the connection is
+validated, so a hostile shared `connections.json` cannot run a command by being opened.
+
+**Filters are vetted by an allow-list.** A `WHERE` typed into the results filter is checked
+before it is spliced into a statement. Rejected: any write verb, a comment (which would comment
+out the `LIMIT`/`OFFSET` appended after it), a backslash, an unclosed quote, and any punctuation
+outside the SQL operator set — which drops `;` and `\` together. A column named after a SQL verb
+can still be filtered on by quoting it. The filter bar is still raw SQL: the check stops it
+escaping the statement, it does not stop an expensive or volatile function call.
 
 ## Transactions
 
@@ -363,8 +404,17 @@ query — the grid marks it as pending rather than pretending it landed, and the
 `statusline()` show `TXN n pending`. `<leader>dP` lists the queue.
 
 `<leader>dC` commits: the whole queue is replayed, in order, inside one client invocation
-wrapped in `BEGIN; ...; COMMIT;`. The batch is genuinely atomic — it succeeds or it leaves
-nothing behind. If it fails, the queue is kept so you can fix and retry.
+wrapped in `BEGIN; ...; COMMIT;`, with each change's row guard emitted immediately before it.
+Atomicity comes from the client's own flags — `sqlite3 -bail`, `psql -v ON_ERROR_STOP=1`, and
+the mysql client's default abort — because without them `sqlite3` prints the error, *skips* the
+failing statement and still runs the trailing `COMMIT`.
+
+If a statement fails, nothing landed, the report names which change failed (and says so plainly
+when the failure was a guard that no longer matches one row), and the queue is kept so you can
+fix and retry. If the commit is instead **interrupted** — a timeout, `<C-c>`, or the output cap
+— the outcome is not known, so the queue is discarded rather than kept: replaying it could apply
+a committed `INSERT` twice or re-run a `DELETE` whose guard has already been spent. dblens says
+so and tells you to check the table.
 
 `<leader>dR` rolls back, which is free: nothing was ever sent. It discards the queue and leaves
 transaction mode.
@@ -470,13 +520,16 @@ vim.o.statusline = "%f %= %{v:lua.require'dblens'.statusline()}"
 databases; browsing, paging, sorting, filtering, editing, transactions and export all work
 against a live file.
 
-**PostgreSQL and MySQL are implemented but were not exercised against a live server.** Both
-adapters implement the same interface as the SQLite one, and their statement builders, command
-construction and output decoding are unit-tested — including the `mysql --xml` decoder, which
-exists because the default tab output cannot distinguish SQL `NULL` from the string `'NULL'`.
-But no PostgreSQL or MySQL server was reachable during development, so nothing beyond the unit
-tests has been observed end to end. Expect rough edges in catalog queries and error reporting
-against a real server, and please report what you hit.
+**PostgreSQL is verified live** against PostgreSQL 18.4: the safety gate, the CSV record
+decoding (including values holding the bytes the previous framing used as separators), plain
+`EXPLAIN`, and the transaction row guard were all exercised end to end.
+
+**MySQL is implemented but was not exercised against a live server.** It implements the same
+interface as the other two, and its statement builders, command construction and `--xml`
+decoding are unit-tested — the XML output exists because the default tab format cannot
+distinguish SQL `NULL` from the string `'NULL'` — but no `mysql` client or server was reachable.
+Its transaction row guard in particular relies on MySQL aborting a scalar subquery that returns
+two rows, which is reasoned from the documentation, not observed. Please report what you hit.
 
 ## Limitations
 
@@ -490,6 +543,14 @@ against a real server, and please report what you hit.
   is meant to be read, not replayed.
 - Every call spawns a fresh client process, so an affected-row count has to ride along in the
   same invocation. An adapter with no affected-rows query (PostgreSQL) reports none.
+- Outside a transaction the exactly-one-row guard and the write it guards are two separate
+  client invocations, so a concurrent writer between them is not excluded.
+- `sqlite3 -ascii` escapes control bytes into caret notation on output, so a cell holding one
+  reads back as `^_` rather than the byte. Framing is unaffected; the cell value is not exact.
+- On PostgreSQL a value that is exactly the single byte `0x1D` is indistinguishable from `NULL`,
+  because that is the NULL marker psql prints unquoted. Every other value round-trips.
+- An unrecognised statement verb is treated as a write. On a read-only connection that means a
+  dialect feature dblens does not know about is refused rather than run.
 
 ## Development
 
