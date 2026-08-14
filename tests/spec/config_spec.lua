@@ -183,7 +183,7 @@ describe('config.setup merging', function()
       page_size = 7,
       ui = { sidebar = { width = 99 }, highlights = { X = { fg = '#fff' } } },
       connections = { a = { kind = 'sqlite' } },
-      keymaps = { results = { y = 'Y' } },
+      keymaps = { results = { yank_cell = 'Y' } },
     })
     local fresh = config.setup({})
     eq(fresh.page_size, 100)
@@ -255,5 +255,44 @@ describe('config.setup validation', function()
       config.setup({ page_size = 0 })
     end, 'positive integer')
     eq(config.get().page_size, 7)
+  end)
+end)
+
+describe('config: keymap scopes', function()
+  it('accepts false as a whole-scope opt-out and binds nothing', function()
+    local options = config.setup({ keymaps = { global = false } })
+    eq(options.keymaps.global, false)
+    eq(require('dblens.keymaps').resolve('global', options.keymaps.global), {})
+  end)
+
+  it('rejects a scope that is neither a table nor false', function()
+    expect_error(function()
+      config.setup({ keymaps = { results = 'x' } })
+    end, 'keymaps.results')
+  end)
+
+  it('names an unknown action at setup time, not when the pane opens', function()
+    expect_error(function()
+      config.setup({ keymaps = { results = { nosuchaction = 'x' } } })
+    end, 'nosuchaction')
+  end)
+
+  it('rejects an override that is not a key, a list of keys or false', function()
+    expect_error(function()
+      config.setup({ keymaps = { results = { sort = 42 } } })
+    end, 'keymaps.results.sort')
+  end)
+
+  it('still accepts the documented override shapes', function()
+    local options = config.setup({
+      keymaps = { results = { sort = '<F2>', filter = { 'f', 'F' }, refresh = false } },
+    })
+    local bound = {}
+    for _, entry in ipairs(require('dblens.keymaps').resolve('results', options.keymaps.results)) do
+      bound[entry.spec.action] = table.concat(entry.lhs, ',')
+    end
+    eq(bound.sort, '<F2>')
+    eq(bound.filter, 'f,F')
+    eq(bound.refresh, nil)
   end)
 end)

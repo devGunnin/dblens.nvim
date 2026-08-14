@@ -118,4 +118,117 @@ function M.leaks(value, needle)
   return false
 end
 
+--- A successful, empty client result.
+local function blank_result()
+  return {
+    ok = true,
+    code = 0,
+    stdout = '',
+    stderr = '',
+    truncated = false,
+    reason = nil,
+    elapsed_ms = 1,
+  }
+end
+
+--- Modules that capture `dblens.exec` or `dblens.session` at require time, so they must be
+--- reloaded alongside the double or they would keep calling the real one.
+local EXEC_DEPENDENTS = { 'dblens.session', 'dblens.connections', 'dblens.app' }
+
+local function make_fake_exec(real, respond, calls)
+  local fake = setmetatable({}, { __index = real })
+  fake.run = function(spec, on_done)
+    assert(type(spec.stdin) == 'string' or spec.stdin == nil, 'fake exec: stdin must be a string')
+    assert(type(on_done) == 'function', 'fake exec: on_done must be a function')
+    local call = { spec = spec, stdin = spec.stdin, argv = spec.argv, cancelled = false }
+    calls[#calls + 1] = call
+    local canned = respond(call, #calls) or {}
+    local pending = canned.pending == true
+    canned.pending = nil
+    local result = vim.tbl_extend('force', blank_result(), canned)
+    if not pending then
+      on_done(result)
+      call.done = true
+      return {
+        cancel = function() end,
+        is_done = function()
+          return true
+        end,
+      }
+    end
+    -- Held open so a spec can close the UI, cancel, or race a second query against it.
+    call.resume = function(final)
+      call.done = true
+      on_done(vim.tbl_extend('force', result, final or {}))
+    end
+    return {
+      cancel = function()
+        call.cancelled = true
+      end,
+      is_done = function()
+        return call.done == true
+      end,
+    }
+  end
+  return fake
+end
+
+--- Run `fn` with `dblens.exec` replaced by a scripted double, so the write path can be driven
+--- end to end with no database. `respond(call, index)` returns fields merged over a successful
+--- empty result; `pending = true` holds the call open until `call.resume(...)`.
+---@param respond fun(call: table, index: integer): table?
+---@param fn fun(session_mod: table, calls: table[])
+function M.with_fake_exec(respond, fn)
+  assert(type(respond) == 'function', 'helpers.with_fake_exec: respond must be a function')
+  assert(type(fn) == 'function', 'helpers.with_fake_exec: fn must be a function')
+  local real = require('dblens.exec')
+  local saved = { ['dblens.exec'] = real }
+  for _, name in ipairs(EXEC_DEPENDENTS) do
+    saved[name] = package.loaded[name]
+    package.loaded[name] = nil
+  end
+  local calls = {}
+  package.loaded['dblens.exec'] = make_fake_exec(real, respond, calls)
+
+  local ok, err = pcall(fn, require('dblens.session'), calls)
+  for name, module in pairs(saved) do
+    package.loaded[name] = module
+  end
+  if not ok then
+    error(err, 0)
+  end
+end
+
+--- A connected session over the fake exec, ready to run statements.
+---@param session_mod table
+---@param spec table?     -- merged over a writable sqlite spec
+---@param overrides table?  -- merged over the default options
+---@return table
+function M.fake_session(session_mod, spec, overrides)
+  local options = require('dblens.config').setup(overrides or {})
+  local full = vim.tbl_extend(
+    'force',
+    { name = 'test', kind = 'sqlite', path = '/tmp/dblens-test.db', read_only = false },
+    spec or {}
+  )
+  local session, err = session_mod.new(full, options)
+  assert(session, tostring(err))
+  session.connected = true
+  return session
+end
+
+--- The single value a synchronous callback was handed, or an explicit "never called" marker.
+---@return table  -- { called = boolean, [1] = ..., [2] = ... }
+function M.capture()
+  local box = { called = false }
+  box.sink = function(...)
+    box.called = true
+    box.n = select('#', ...)
+    for i = 1, box.n do
+      box[i] = (select(i, ...))
+    end
+  end
+  return box
+end
+
 return M

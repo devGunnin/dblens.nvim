@@ -138,18 +138,23 @@ describe('postgres.command', function()
       '-t',
       '-d',
       'app',
+      '-f',
+      '-',
     })
     eq(cmd.env, { PGCONNECT_TIMEOUT = '10' })
   end)
 
-  it('asks for the record protocol in records mode', function()
+  it('asks for quoted CSV in records mode', function()
     local cmd = postgres.command({ database = 'app' }, nil, 'records', CLIENTS)
-    eq(h.flag_value(cmd.argv, '-F'), protocol.FIELD_SEP)
-    eq(h.flag_value(cmd.argv, '-R'), protocol.RECORD_SEP)
+    -- Control-character framing was breakable by a value holding one of the separators; CSV
+    -- quotes anything ambiguous, so only the NULL marker stays a convention.
+    eq(h.has(cmd.argv, '--csv'), true)
     eq(h.has(cmd.argv, 'null=' .. protocol.NULL_SENTINEL), true)
-    eq(h.has(cmd.argv, '-A'), true)
+    eq(h.flag_value(cmd.argv, '-F'), nil)
+    eq(h.flag_value(cmd.argv, '-R'), nil)
     eq(h.has(cmd.argv, '-t'), false)
-    eq(cmd.argv[#cmd.argv], 'app')
+    -- `-f -` is what makes psql prefix an error with the script line number.
+    eq(h.flag_value(cmd.argv, '-f'), '-')
   end)
 
   it('passes host, port and user as flags and takes the binary from the client table', function()
@@ -240,6 +245,8 @@ describe('sqlite.command', function()
     local expected = {
       'sqlite3',
       '-batch',
+      '-bail',
+      '-safe',
       '-ascii',
       '-header',
       '-nullvalue',
@@ -248,7 +255,9 @@ describe('sqlite.command', function()
     }
     eq(records.argv, expected)
     local raw = sqlite.command({ path = '/tmp/x.db' }, nil, 'raw', CLIENTS)
-    eq(raw.argv, { 'sqlite3', '-batch', '/tmp/x.db' })
+    -- `-bail` makes the batch atomic; without it sqlite3 skips the failing statement and still
+    -- runs the trailing COMMIT. `-safe` refuses `.shell`, `.load`, `.import` and ATTACH.
+    eq(raw.argv, { 'sqlite3', '-batch', '-bail', '-safe', '/tmp/x.db' })
     eq(raw.env, nil)
   end)
 
@@ -372,14 +381,8 @@ describe('common.check_predicate', function()
   end)
 
   it('rejects a second statement smuggled in with a `;`', function()
-    eq(
-      common.check_predicate('1=1; DROP TABLE t'),
-      'filter must be a single expression (remove the `;`)'
-    )
-    eq(
-      common.check_predicate('id = 1; DELETE FROM t'),
-      'filter must be a single expression (remove the `;`)'
-    )
+    eq(common.check_predicate('1=1; DROP TABLE t'), 'filter must not contain `;`')
+    eq(common.check_predicate('id = 1; DELETE FROM t'), 'filter must not contain `;`')
   end)
 
   it('rejects a predicate that is really a write statement', function()
@@ -390,7 +393,7 @@ describe('common.check_predicate', function()
 
   it('rejects a write verb anywhere in the predicate, not just at the front', function()
     eq(common.check_predicate('id=1 AND (DELETE FROM t)'), 'filter must not contain `DELETE`')
-    eq(common.check_predicate('x = 1; '), 'filter must be a single expression (remove the `;`)')
+    eq(common.check_predicate('x = 1; '), 'filter must not contain `;`')
     eq(common.check_predicate("id > 5 AND name = 'a;b'"), nil)
     eq(common.check_predicate('"update" > 5'), nil)
   end)
@@ -647,5 +650,45 @@ describe('mysql.estimate', function()
     local parse = get('mysql').estimate('SELECT 1').parse
     eq(parse({ columns = { 'id' }, rows = { { '1' } } }), nil)
     eq(parse({ columns = { 'rows' }, rows = {} }), nil)
+  end)
+end)
+
+describe('mysql.decode result sets', function()
+  local mysql = get('mysql')
+
+  it('reads only the first result set', function()
+    -- A CALL, or some SHOW variants, produce several. Their columns differ, so concatenating
+    -- them aligned the later rows to the first set's headers.
+    local xml = table.concat({
+      '<resultset statement="call p()">',
+      '<row><field name="a">1</field><field name="b">2</field></row>',
+      '</resultset>',
+      '<resultset statement="call p()">',
+      '<row><field name="z">9</field></row>',
+      '</resultset>',
+    })
+    local decoded = mysql.decode(xml)
+    eq(decoded.columns, { 'a', 'b' })
+    eq(decoded.rows, { { '1', '2' } })
+    eq(decoded.malformed, 0)
+  end)
+
+  it('still reads a plain single result set', function()
+    local xml = '<resultset><row><field name="a">1</field></row></resultset>'
+    eq(mysql.decode(xml).rows, { { '1' } })
+  end)
+end)
+
+describe('adapters: the transaction row guard', function()
+  it('every adapter can build a statement that fails unless the count is 1', function()
+    for _, kind in ipairs({ 'sqlite', 'postgres', 'mysql' }) do
+      local adapter = get(kind)
+      local statement = adapter.sql.assert_one('SELECT count(*) FROM t WHERE id = 1')
+      eq(type(statement), 'string', { fail_reason = kind .. ' has no row-guard builder' })
+      h.neq(statement:find('count(*)', 1, true), nil)
+      expect_error(function()
+        adapter.sql.assert_one('')
+      end)
+    end
   end)
 end)

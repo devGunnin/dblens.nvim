@@ -163,3 +163,72 @@ describe('protocol.column_index', function()
     eq(protocol.column_index({ 'n', 'n' }, 'n'), 1)
   end)
 end)
+
+describe('protocol.decode_csv', function()
+  --- Verbatim bytes from `psql --csv -P null=\029 -f -` against PostgreSQL 18.4, for a table
+  --- holding a unit separator, a record separator, a CRLF, a bare NULL marker and a value with
+  --- a quote and a comma. The control-character framing this replaced split rows 3 and 5.
+  local PSQL_OUTPUT = table.concat({
+    'id,v',
+    '1,a',
+    '2,' .. NS,
+    '3,x' .. FS .. 'y',
+    '4,"crlf\r\nend"',
+    '5,sep' .. RS .. 'here',
+    '6,' .. NS,
+    '7,"q""c,comma"',
+    '',
+  }, '\n')
+
+  it('keeps every row intact when a value holds the old separators', function()
+    local decoded = protocol.decode_csv(PSQL_OUTPUT)
+    eq(decoded.columns, { 'id', 'v' })
+    eq(#decoded.rows, 7)
+    eq(decoded.malformed, 0)
+    eq(decoded.rows[1], { '1', 'a' })
+    eq(decoded.rows[2], { '2', NULL })
+    eq(decoded.rows[3], { '3', 'x' .. FS .. 'y' })
+    eq(decoded.rows[4], { '4', 'crlf\r\nend' })
+    eq(decoded.rows[5], { '5', 'sep' .. RS .. 'here' })
+    eq(decoded.rows[7], { '7', 'q"c,comma' })
+  end)
+
+  it('reads a quoted field as text even when it equals the NULL marker', function()
+    local decoded = protocol.decode_csv('a\n"' .. NS .. '"\n')
+    eq(decoded.rows[1], { NS })
+  end)
+
+  it('keeps the header for a zero-row result', function()
+    local decoded = protocol.decode_csv('id,v\n')
+    eq(decoded.columns, { 'id', 'v' })
+    eq(decoded.rows, {})
+  end)
+
+  it('falls back to the supplied columns when the client printed nothing', function()
+    local decoded = protocol.decode_csv('', { columns = { 'id', 'v' } })
+    eq(decoded.columns, { 'id', 'v' })
+    eq(decoded.rows, {})
+  end)
+
+  it('reads an empty unquoted field as the empty string, not NULL', function()
+    local decoded = protocol.decode_csv('a,b\n,x\n')
+    eq(decoded.rows[1], { '', 'x' })
+  end)
+
+  it('counts a short row rather than dropping it', function()
+    local decoded = protocol.decode_csv('a,b,c\n1,2\n')
+    eq(decoded.rows[1], { '1', '2', NULL })
+    eq(decoded.malformed, 1)
+  end)
+
+  it('survives an unterminated quote instead of losing the row', function()
+    local decoded = protocol.decode_csv('a\n"open and never closed\n')
+    eq(decoded.rows[1], { 'open and never closed\n' })
+  end)
+
+  it('handles an embedded newline inside a quoted field', function()
+    local decoded = protocol.decode_csv('a,b\n"one\ntwo",3\n')
+    eq(#decoded.rows, 1)
+    eq(decoded.rows[1], { 'one\ntwo', '3' })
+  end)
+end)
