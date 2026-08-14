@@ -24,6 +24,38 @@ local FORBIDDEN = {
   pwd = 'use `password_env` or `password_cmd` instead of storing the password',
 }
 
+--- Check the shape of a `password_cmd`.
+---
+--- This is argv, not a shell line and not a path: it is run with `vim.system`, so nothing in it
+--- is ever evaluated. It IS a program the user asked dblens to run at connect time, which is the
+--- one place the connections file is trusted rather than defended against — `path.lua` exists
+--- because `vim.fn.expand` would evaluate a path nobody meant as a command, while this field is
+--- a command by definition. All that can be checked here is that it is a runnable argv.
+---@param spec table
+---@return string? error
+local function validate_password_cmd(spec)
+  if not vim.islist(spec.password_cmd) or #spec.password_cmd == 0 then
+    return ('connection `%s`: `password_cmd` must be a non-empty list of arguments'):format(
+      spec.name
+    )
+  end
+  for index, argument in ipairs(spec.password_cmd) do
+    if type(argument) ~= 'string' or argument == '' then
+      return ('connection `%s`: `password_cmd` argument %d must be a non-empty string'):format(
+        spec.name,
+        index
+      )
+    end
+    if argument:find('[%z\n\r]') then
+      return ('connection `%s`: `password_cmd` argument %d must be a single line'):format(
+        spec.name,
+        index
+      )
+    end
+  end
+  return nil
+end
+
 --- Validate one spec.
 ---@param spec table
 ---@return string? error
@@ -39,8 +71,11 @@ function M.validate(spec)
       return ('connection `%s` must not store a plaintext `%s`: %s'):format(spec.name, key, advice)
     end
   end
-  if spec.password_cmd ~= nil and not vim.islist(spec.password_cmd) then
-    return ('connection `%s`: `password_cmd` must be a list of arguments'):format(spec.name)
+  if spec.password_cmd ~= nil then
+    local cmd_error = validate_password_cmd(spec)
+    if cmd_error then
+      return cmd_error
+    end
   end
   if spec.password_env ~= nil and type(spec.password_env) ~= 'string' then
     return ('connection `%s`: `password_env` must be a variable name'):format(spec.name)

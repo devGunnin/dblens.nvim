@@ -64,17 +64,21 @@ function M.ddl(state, relation)
   end
 
   if ddl_mod.available(session.adapter) then
-    require('dblens.loader').relation_details(session, relation, function(err)
-      if err then
-        app.error(err)
-        return
-      end
-      show_ddl(
-        state,
-        relation,
-        ddl_mod.reconstruct(relation, session.catalog:info_for(relation), session.adapter.dialect)
-      )
-    end)
+    require('dblens.loader').relation_details(
+      session,
+      relation,
+      app.live(function(err)
+        if err then
+          app.error(err)
+          return
+        end
+        show_ddl(
+          state,
+          relation,
+          ddl_mod.reconstruct(relation, session.catalog:info_for(relation), session.adapter.dialect)
+        )
+      end)
+    )
     return
   end
 
@@ -83,19 +87,25 @@ function M.ddl(state, relation)
     app.error(('%s cannot show DDL for this object'):format(session.adapter.label))
     return
   end
-  session:run(statement, {}, function(result, err)
-    if err then
-      app.error(err)
-      return
-    end
-    -- sqlite returns one column, mysql's SHOW CREATE returns (name, ddl).
-    local row = result.rows[1]
-    if not row then
-      app.error('no DDL was returned for ' .. relation.name)
-      return
-    end
-    show_ddl(state, relation, protocol.tostring(row[#row]))
-  end)
+  -- `live`: this opens a float from the callback, so it must not fire into a UI the user closed
+  -- or reopened while the client was still running.
+  session:run(
+    statement,
+    {},
+    app.live(function(result, err)
+      if err then
+        app.error(err)
+        return
+      end
+      -- sqlite returns one column, mysql's SHOW CREATE returns (name, ddl).
+      local row = result.rows[1]
+      if not row then
+        app.error('no DDL was returned for ' .. relation.name)
+        return
+      end
+      show_ddl(state, relation, protocol.tostring(row[#row]))
+    end)
+  )
 end
 
 return M

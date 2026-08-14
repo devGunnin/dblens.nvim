@@ -203,7 +203,8 @@ function M.format_error(result, label)
     return ('%s: cancelled'):format(label)
   end
   if result.reason == 'max_bytes' then
-    return ('%s: output limit reached, result truncated'):format(label)
+    -- Not "truncated": the client was killed mid-run, so anything it had not finished is unknown.
+    return ('%s: output limit reached, the client was stopped'):format(label)
   end
   local message = vim.trim(result.stderr)
   if message == '' then

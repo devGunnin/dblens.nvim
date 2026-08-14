@@ -902,4 +902,6 @@ function M.grid_output()
 end
 
 M.set_busy = set_busy
+--- Exported so a UI module that starts its own client call binds the result to this instance too.
+M.live = live
 return M
