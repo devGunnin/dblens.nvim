@@ -67,8 +67,9 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 **Safety**
 
-- Per-connection `read_only`, enforced by the server: the connection is opened read-only
-  (`sqlite3 -readonly`, `default_transaction_read_only`, `SET SESSION TRANSACTION READ ONLY`).
+- **A connection is LOCKED by default** and enforced by the server: every run is sent inside a
+  read-only transaction, so no statement in it can turn write access back on. `:DbLensWrite`
+  (`<leader>dw`) opens it for editing; `:DbLensLock` locks it again.
 - Confirmation gate for destructive statements (on by default), optionally for all writes.
 - Row-targeted edits carry a `count(*)` guard that must return exactly 1.
 - Planner row estimate shown before a single destructive ad-hoc statement, where the adapter
@@ -80,7 +81,7 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 - Server-side sort and WHERE filter on a browsed table, with paging.
 - `:checkhealth dblens`.
-- A `statusline()` segment: connection, read-only, transaction state, running query.
+- A `statusline()` segment: connection, LOCKED/EDIT, transaction state, running query.
 - Highlights derived from your colorscheme, re-derived on `:colorscheme`.
 - Three icon sets: plain Unicode (default), Nerd Font, or ASCII.
 
@@ -170,7 +171,7 @@ require('dblens').setup({
   safety = {
     confirm_destructive = true,   -- preview + confirm UPDATE/DELETE/DROP/TRUNCATE/ALTER/...
     confirm_write       = false,  -- also gate non-destructive writes (INSERT/CREATE/...)
-    read_only_default   = false,  -- applied to connections that do not set `read_only` themselves
+    read_only_default   = true,   -- applied to connections that do not set `read_only` themselves
   },
 
   history = {
@@ -253,6 +254,8 @@ pane it belongs to is first opened.
 | `:DbLensConnections` | Open dblens, or pick a connection if it is already open |
 | `:DbLensAdd` | Add a connection interactively |
 | `:DbLensRemove {name}` | Remove a saved connection (completes names) |
+| `:DbLensWrite` | Open the active connection for editing |
+| `:DbLensLock` | Lock the active connection read-only |
 | `:DbLensRestore` | Reopen the last saved session |
 
 ## Keymaps
@@ -270,6 +273,7 @@ Every binding is declared in one table and can be remapped or disabled per scope
 | `<leader>dt` | `tables` | Find a table |
 | `<leader>dh` | `history` | Query history |
 | `<leader>ds` | `snippets` | Saved snippets |
+| `<leader>dw` | `write_toggle` | Lock the connection / open it for editing |
 | `<leader>dB` | `txn_begin` | Begin transaction |
 | `<leader>dC` | `txn_commit` | Commit transaction |
 | `<leader>dR` | `txn_rollback` | Roll back transaction |
@@ -328,15 +332,26 @@ Every binding is declared in one table and can be remapped or disabled per scope
 
 ## Safety model
 
-**Read-only is enforced by the database server, not by dblens.** A connection with
-`read_only = true` (or every connection, with `safety.read_only_default = true`) is *opened*
-read-only, so the engine itself refuses every write, however the statement is spelled:
+**A connection is LOCKED unless you unlock it, and locked is enforced by the database server.**
+Every connection opens locked; only an explicit `read_only = false` (or
+`safety.read_only_default = false`) opens one for editing. While locked, dblens sends every run
+inside a **server-side read-only transaction**, so the engine refuses every write however the
+statement is spelled:
 
-| | how the connection is opened |
+| | what a locked run sends, and what opens the connection |
 | --- | --- |
-| SQLite | `sqlite3 -readonly` — the file handle is read-only, so a write answers `attempt to write a readonly database` |
-| PostgreSQL | `PGOPTIONS=-c default_transaction_read_only=on` — a write answers `cannot execute … in a read-only transaction` |
-| MySQL / MariaDB | `--init-command=SET SESSION TRANSACTION READ ONLY` — a write answers `ERROR 1792 … Cannot execute statement in a READ ONLY transaction` |
+| SQLite | nothing extra — `sqlite3 -readonly` is the file handle's open mode, so a write answers `attempt to write a readonly database` |
+| PostgreSQL | `BEGIN READ ONLY; DECLARE … CURSOR …;` around the run, plus `PGOPTIONS=-c default_transaction_read_only=on`. A write answers `cannot execute … in a read-only transaction` |
+| MySQL / MariaDB | `START TRANSACTION READ ONLY;` around the run, plus `--init-command=SET SESSION TRANSACTION READ ONLY`. A write answers `ERROR 1792 … Cannot execute statement in a READ ONLY transaction` |
+
+The transaction is the guarantee; the connection-level switch is the backup. On PostgreSQL and
+MySQL that switch is *session state a statement in the same run can turn off* —
+`SET default_transaction_read_only = off; INSERT …` and `SET SESSION TRANSACTION READ WRITE;
+INSERT …` both used to land a row on a `read_only` connection. Inside an open read-only
+transaction they cannot: a `SET` retargets only LATER transactions, and the running one can no
+longer be switched. (PostgreSQL will let `SET TRANSACTION READ WRITE` escalate a read-only
+transaction until it has taken a snapshot, which is why the `DECLARE … CURSOR` is there — it
+takes one and returns nothing.)
 
 This is the guarantee because the alternative is not one. dblens used to decide read-only by
 lexing the SQL itself, and three independent reviews broke it — nested block comments (`/* /* */`
@@ -346,7 +361,15 @@ reimplementation of five dialects' lexers will always disagree with the real par
 and every disagreement is a bypass. The server's own parser cannot disagree with itself.
 
 Reads are unaffected: `SELECT`, `EXPLAIN`, catalog queries and paging all work normally on a
-read-only connection.
+locked connection.
+
+**Unlocking is a deliberate act, and the only way to write.** `:DbLensWrite` (`<leader>dw`) puts
+the active connection in EDIT mode: the next run spawns without the read-only switch and without
+the transaction wrap, so the ordinary write paths work — still behind the confirmation gate
+below. `:DbLensLock` puts it back, and the very next run is refused by the server again. The
+sidebar, the results winbar and `statusline()` all say `LOCKED` or `EDIT`. Locking is refused
+while a transaction queue is pending, because a locked connection cannot commit it: commit or
+roll back first.
 
 **The classifier decides whether you are asked, not whether it is allowed.** dblens still reads
 the statement to work out whether it is a write and whether it is destructive, and that is what
@@ -376,11 +399,15 @@ unquoted `\`, or a line beginning `system`/`source`/`tee`/`pager`/`edit`/`connec
 A column with one of those names can still be used by quoting it. sqlite3 is additionally run
 with `-safe`, MySQL with `--local-infile=0`.
 
-**What server-side read-only does not cover.** A statement that explicitly turns the setting off
-(`SET default_transaction_read_only = off`, `SET SESSION TRANSACTION READ WRITE`) would restore
-write access — `SET` is classified as a write, so it is refused on a read-only connection before
-it is sent. That pairing is the point: the classifier catches the statement that names the
-setting, the server catches the statement that outwitted the classifier.
+**What server-side read-only does not cover.** On PostgreSQL and MySQL the read-only transaction
+holds against everything *inside* it, but a statement can still END or REPLACE it and write in a
+new one — `ROLLBACK; SET default_transaction_read_only = off; BEGIN; INSERT …` on PostgreSQL,
+`START TRANSACTION READ WRITE; INSERT …` on MySQL. There is no session setting either engine
+offers that a statement cannot undo, so the last line there is the classifier: every one of
+those needs a second top-level statement, and a script that is not a single provable read is
+refused on a locked connection before it is sent. That pairing is the point, and it is why
+`sql.lua` is still security-relevant on those two engines. SQLite needs none of it: `-readonly`
+is the file handle's open mode and there is no session state to flip.
 
 **The confirm gate.** `UPDATE`, `DELETE`, `REPLACE`, `MERGE`, `DROP`, `TRUNCATE`, `ALTER`,
 `RENAME`, `GRANT` and `REVOKE` are destructive; other writes are not. With
@@ -536,7 +563,7 @@ dblens.restore()            -- reopen the last saved session
 dblens.add_connection()     -- the :DbLensAdd form
 dblens.remove_connection(name)
 dblens.connection_names()   -- string[], sorted
-dblens.statusline()         -- 'prod · read-only · TXN 2 pending · query…', '' when closed
+dblens.statusline()         -- 'prod · LOCKED · TXN 2 pending · query…', '' when closed
 ```
 
 `statusline()` is a plain string, so it drops straight into your statusline:
@@ -555,12 +582,17 @@ against a live file.
 decoding (including values holding the bytes the previous framing used as separators), plain
 `EXPLAIN`, and the transaction row guard were all exercised end to end.
 
-**MySQL is implemented but was not exercised against a live server.** It implements the same
-interface as the other two, and its statement builders, command construction and `--xml`
-decoding are unit-tested — the XML output exists because the default tab format cannot
-distinguish SQL `NULL` from the string `'NULL'` — but no `mysql` client or server was reachable.
-Its transaction row guard in particular relies on MySQL aborting a scalar subquery that returns
-two rows, which is reasoned from the documentation, not observed. Please report what you hit.
+**MySQL is verified live** against MySQL 8.4: the read-only transaction, the transaction row
+guard, batch atomicity and `--xml` decoding — the XML output exists because the default tab
+format cannot distinguish SQL `NULL` from the string `'NULL'`.
+
+**The read-only guarantee is verified live on all three**, by
+`tests/spec/readonly_spec.lua`. It sends each escape payload to a real server on a locked
+connection and asserts the table did not change, with a writable control that does change so the
+assertion cannot pass vacuously. The PostgreSQL and MySQL cases need a server
+(`DBLENS_TEST_POSTGRES_PORT` / `DBLENS_TEST_MYSQL_PORT`, plus `_HOST` `_USER` `_PASSWORD` `_DB`
+`_CLIENT`) and skip with a note when there is none. Catalog queries, DDL reconstruction and
+error reporting have much thinner live coverage on those two — please report what you hit.
 
 ## Limitations
 
