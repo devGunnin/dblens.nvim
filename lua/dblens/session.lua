@@ -8,7 +8,10 @@
 --- which. It starts from the spec (locked unless `read_only = false`) and `set_locked` flips it
 --- at runtime, so unlocking is an explicit user action rather than a hole in the gate.
 ---
---- What makes a LOCKED connection read-only is TWO things, and neither is the classifier:
+--- What LOCKED GUARANTEES, and what it does not, stated exactly:
+---
+--- GUARANTEED — no write reaches the database through any normal SQL statement, whatever the
+--- dialect and however it is spelled. Two mechanisms, and neither is the classifier:
 ---  * the SERVER — the run is sent inside a read-only TRANSACTION (`adapter.read_only_script`)
 ---    over a connection opened read-only (`adapter.command`). No `SET` in the same run escapes
 ---    it; sqlite needs none, its `-readonly` is the file open mode. That holds for ONE statement.
@@ -16,6 +19,16 @@
 ---    transaction and write in a fresh one, so a locked connection refuses any input
 ---    `sql.single_statement_problem` cannot prove is exactly one. It is a byte scan, so unlike
 ---    the four lexer generations before it there is no dialect it can be wrong about.
+---
+--- NOT GUARANTEED — a user who ALREADY HOLDS WRITE CREDENTIALS and deliberately calls a function
+--- that writes through a side channel. `SELECT dblink_exec('...','INSERT ...')` runs its INSERT
+--- in a SECOND postgres backend, outside this transaction, as one statement led by SELECT; the
+--- same shape covers `postgres_fdw` and a shell UDF. `sql.side_channel_problem` refuses the KNOWN
+--- names below and is BEST-EFFORT ONLY: a `SECURITY DEFINER` wrapper or a rename defeats it, and
+--- no client-side check can close that, because only the server knows what a function does.
+--- The hard read-only boundary is a database-level read-only ROLE — connect as one when the
+--- threat model is a deliberate user rather than an accidental keystroke. See README and
+--- `:h dblens-safety-side-channel`.
 ---
 --- What the gate additionally owns:
 ---  * client meta-commands (`.shell`, `\!`, mysql `system`/`source`) — these run on THIS machine,
@@ -192,6 +205,17 @@ local function multi_statement_refusal(name, problem)
   ):format(name, problem)
 end
 
+--- The same, for a statement that reaches outside the read-only transaction entirely.
+---@param name string
+---@param problem string
+---@return string
+local function side_channel_refusal(name, problem)
+  return (
+    'connection `%s` is LOCKED and %s, so the read-only transaction does not cover it. '
+    .. 'Unlock with `:DbLensWrite` (<leader>dw) to run it.'
+  ):format(name, problem)
+end
+
 --- The one gate. Returns a refusal message, or nil when the statement may be sent.
 ---
 --- `approval` is produced only by a caller that has already been through `refuse_write`
@@ -211,6 +235,13 @@ function Session:gate(statement, approval)
     local framing = sqlmod.single_statement_problem(statement)
     if framing then
       return multi_statement_refusal(self.spec.name, framing), info
+    end
+    -- Defence in depth, by NAME, and deliberately not a boundary: a SECURITY DEFINER wrapper
+    -- defeats it. Refused only while locked -- an unlocked connection can write with a plain
+    -- INSERT, so refusing there would only break a legitimate dblink query.
+    local side_channel = sqlmod.side_channel_problem(statement, dialect)
+    if side_channel then
+      return side_channel_refusal(self.spec.name, side_channel), info
     end
   end
   local meta = sqlmod.client_meta_problem(statement, dialect)

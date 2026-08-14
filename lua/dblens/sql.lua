@@ -886,6 +886,89 @@ function M.client_meta_problem(text, dialect)
   return nil
 end
 
+--- Names that reach OUTSIDE dblens's read-only transaction — a SECOND database backend, whose
+--- transaction is read-write, or the server's own filesystem. A locked connection cannot prove a
+--- statement calling one of these does not write: it is a single statement led by `SELECT`, so
+--- the framing rule proves it is one and the transaction wrap never governs what it does.
+---
+--- BEST-EFFORT, AND NOT A SECURITY BOUNDARY. It matches NAMES, so a `SECURITY DEFINER` wrapper, a
+--- rename or a copy in another schema walks straight through it, and nothing on this side of the
+--- connection can tell the difference — only the server knows what a function does. It raises the
+--- bar against a casual or accidental `SELECT dblink_exec(...)`. The hard boundary against a user
+--- who has write credentials and means to use them is a database-level read-only ROLE; see
+--- `:h dblens-safety-side-channel`.
+---
+--- sqlite is absent on purpose: `-safe` refuses `writefile()`, `.load` and ATTACH at the client,
+--- and `-readonly` is the file open mode, so there is nothing here to duplicate.
+local SIDE_CHANNEL = {
+  {
+    why = 'opens a second database session, whose transaction dblens cannot make read-only',
+    prefixes = { 'DBLINK', 'POSTGRES_FDW' },
+  },
+  {
+    why = "reaches the server's filesystem, which a read-only transaction does not govern",
+    names = {
+      'LO_IMPORT',
+      'LO_EXPORT',
+      'PG_READ_FILE',
+      'PG_READ_BINARY_FILE',
+      'PG_LS_DIR',
+      'PG_STAT_FILE',
+      'LOAD_FILE',
+    },
+  },
+  {
+    why = 'is a user-defined function that runs a command on the server',
+    names = { 'SYS_EXEC', 'SYS_EVAL' },
+  },
+}
+
+local SIDE_CHANNEL_NAME, SIDE_CHANNEL_PREFIX = {}, {}
+for _, group in ipairs(SIDE_CHANNEL) do
+  for _, name in ipairs(group.names or {}) do
+    SIDE_CHANNEL_NAME[name] = group.why
+  end
+  for _, prefix in ipairs(group.prefixes or {}) do
+    SIDE_CHANNEL_PREFIX[#SIDE_CHANNEL_PREFIX + 1] = { text = prefix, why = group.why }
+  end
+end
+
+--- Why an upper-cased bare word is a known side channel, or nil.
+local function side_channel_reason(word)
+  local exact = SIDE_CHANNEL_NAME[word]
+  if exact then
+    return exact
+  end
+  for _, prefix in ipairs(SIDE_CHANNEL_PREFIX) do
+    if word:sub(1, #prefix.text) == prefix.text then
+      return prefix.why
+    end
+  end
+  return nil
+end
+
+--- Why a LOCKED connection cannot vouch for this statement, by the name it calls.
+---
+--- Only UNQUOTED words are matched: a quoted identifier is a name and a string literal is data,
+--- the same rule `client_meta_problem` uses, so a column called `dblink_log` stays usable when
+--- quoted. A MySQL executable comment is not scanned either — it has no leading keyword, so it
+--- already classifies as a write and a locked connection refuses every write.
+---@param text string
+---@param dialect dblens.Dialect?
+---@return string? problem  -- nil when no known side channel is named
+function M.side_channel_problem(text, dialect)
+  assert(type(text) == 'string', 'sql.side_channel_problem: expected string')
+  for _, token in ipairs(M.tokens(text, dialect or M.dialects.permissive)) do
+    if token.type == 'word' then
+      local why = side_channel_reason(token.text:upper())
+      if why then
+        return ('`%s` %s'):format(token.text, why)
+      end
+    end
+  end
+  return nil
+end
+
 --- Classify every statement in a script.
 ---@return dblens.Statement[]
 function M.classify_all(sql, dialect)
