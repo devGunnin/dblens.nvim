@@ -15,7 +15,6 @@ local INERT = {
   { name = 'line comment mid script', text = 'SELECT 1 -- DROP TABLE users\nFROM t' },
   { name = 'hash comment', text = 'SELECT 1 # DROP TABLE users\nFROM t' },
   { name = 'block comment', text = '/* DROP TABLE users */ SELECT 1' },
-  { name = 'nested block comment', text = '/* outer /* DROP TABLE users */ tail */ SELECT 1' },
   { name = 'dollar-quoted body', text = 'SELECT $$ DROP TABLE users $$' },
   { name = 'tagged dollar-quoted body', text = 'SELECT $fn$ DROP TABLE users $fn$' },
   { name = 'mysql backticks', text = 'SELECT `drop table users` FROM t' },
@@ -325,6 +324,34 @@ describe('sql.classify', function()
   it('upper-cases the verb of a lower-case statement', function()
     eq(sql.classify('delete from t').verb, 'DELETE')
     eq(sql.classify('delete from t').destructive, true)
+  end)
+
+  --- Only postgres nests block comments. `/* /* */` is a COMPLETE comment everywhere else, so a
+  --- lexer that nests unconditionally swallows the closing `*/` and every statement after it.
+  it('nests block comments only where the server does', function()
+    local stacked = 'SELECT 1 /* /* */ ; DROP TABLE victim'
+    for _, dialect in ipairs({ 'sqlite', 'mysql', 'standard', 'permissive' }) do
+      local d = sql.dialects[dialect]
+      eq(#sql.split(stacked, d), 2, { fail_reason = dialect .. ' must see two statements' })
+      eq(sql.classify(stacked, d).write, true, { fail_reason = dialect .. ' must see the DROP' })
+    end
+    -- postgres genuinely nests, so the same text is one unterminated comment and one read.
+    eq(#sql.split(stacked, sql.dialects.postgres), 1)
+    eq(sql.classify(stacked, sql.dialects.postgres).write, false)
+  end)
+
+  it('treats a MySQL executable comment as code, not as a comment', function()
+    local hidden = '/*!40000 DROP TABLE victim */'
+    for _, dialect in ipairs({ 'mysql', 'permissive' }) do
+      local d = sql.dialects[dialect]
+      eq(sql.classify(hidden, d).write, true, { fail_reason = dialect .. ' must run-check `/*!`' })
+      eq(sql.classify('/*M!100000 DROP TABLE victim */', d).write, true)
+      -- `strip` blanks comments; an executable body is not one, so it must survive.
+      eq(sql.strip(hidden, d), hidden)
+    end
+    -- sqlite and postgres really do treat it as a comment, so it stays inert there.
+    eq(sql.classify(hidden, sql.dialects.sqlite).write, false)
+    eq(sql.classify(hidden, sql.dialects.postgres).write, false)
   end)
 
   it('treats a destructive keyword inside a quoted or commented span as inert', function()

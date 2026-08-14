@@ -239,6 +239,60 @@ describe('session: transactions are atomic or they are not applied', function()
     end
   end)
 
+  --- The byte cap kills the client with output already collected, so the real result carries
+  --- `truncated = true`. That flag routed the kill down the SUCCESS path: the UI reported
+  --- "committed N change(s)" and cleared the marks while the server had rolled the batch back.
+  it('reports failure when the byte cap killed the commit, and does not keep the queue', function()
+    h.with_fake_exec(function()
+      return {
+        ok = false,
+        code = -1,
+        reason = 'max_bytes',
+        truncated = true,
+        stdout = string.rep('x', 64),
+      }
+    end, function(session_mod)
+      local session = queued_session(session_mod)
+      local box = h.capture()
+      session:commit(box.sink)
+      eq(box[1], false, { fail_reason = 'a killed commit must not be reported as committed' })
+      eq(box[3], false, { fail_reason = 'the queue must not be replayed after an unknown outcome' })
+      eq(session.txn:count(), 0)
+      neq(box[2]:find('verify', 1, true), nil, { fail_reason = 'the user must be told to check' })
+    end)
+  end)
+
+  it('reports failure when the byte cap killed a non-transactional write', function()
+    h.with_fake_exec(function()
+      return { ok = false, code = -1, reason = 'max_bytes', truncated = true, stdout = 'x' }
+    end, function(session_mod)
+      local session = h.fake_session(session_mod)
+      local box = h.capture()
+      session:execute_write({ sql = 'DELETE FROM t', summary = 'd', confirmed = true }, box.sink)
+      eq(box[1], nil, { fail_reason = 'a killed write must not report an outcome' })
+      eq(type(box[2]), 'string', { fail_reason = 'a killed write must report the failure' })
+    end)
+  end)
+
+  it('still delivers what a truncated READ managed to return', function()
+    h.with_fake_exec(function()
+      return {
+        ok = false,
+        code = -1,
+        reason = 'max_bytes',
+        truncated = true,
+        stdout = h.wire({ h.record('a'), h.record('1') }),
+      }
+    end, function(session_mod)
+      local session = h.fake_session(session_mod)
+      local box = h.capture()
+      session:run('SELECT a FROM t', {}, box.sink)
+      eq(box[2], nil, { fail_reason = 'a truncated read is shown, not thrown away' })
+      eq(box[1].truncated, true)
+      eq(box[1].rows, { { '1' } })
+    end)
+  end)
+
   it('refuses to commit on a read-only connection', function()
     h.with_fake_exec(ok_result, function(session_mod, calls)
       local session = queued_session(session_mod)

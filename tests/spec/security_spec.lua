@@ -1,9 +1,14 @@
---- Every exploit three independent reviews reproduced against this plugin, as a test that the
---- attempt is now refused. Each case here failed on the pre-fix tree.
+--- Every exploit four independent reviews reproduced against this plugin, as a test that the
+--- attempt is now caught. Each case here failed on the tree that preceded its fix.
 ---
---- The rule these encode: a statement is a read only if dblens can PROVE it is one. Anything
---- unproven — an unknown verb, a stacked script, a client meta-command, an EXPLAIN ANALYZE — is
---- a write, and a write on a read-only connection is refused before a client is ever spawned.
+--- What these cover is DEFENCE IN DEPTH, not the read-only guarantee. Read-only is enforced by
+--- the server (see `readonly_spec`); classification decides whether the user is asked to confirm.
+--- So a miss here is a missing prompt on a writable connection, and the cases stay because a
+--- prompt is the last thing standing between a smuggled DROP and a writable database.
+---
+--- The exception is `client_meta_problem`: `.shell`, `\!` and mysql's `system`/`source` run on
+--- the user's own machine, so no connection setting reaches them and refusing them is the whole
+--- defence.
 local h = require('helpers')
 local common = require('dblens.adapters.common')
 local sql = require('dblens.sql')
@@ -66,6 +71,24 @@ describe('security: write classification cannot be talked out of', function()
       destructive = true,
     },
     { name = 'EXPLAIN ANALYZE insert', text = 'EXPLAIN ANALYZE INSERT INTO t VALUES (1)' },
+    -- Round 2: the lexer consumed more input than the server did, so live SQL looked inert.
+    {
+      name = 'nested comment stacks a DROP',
+      text = 'SELECT 1 /* /* */ ; DROP TABLE victim',
+      destructive = true,
+    },
+    { name = 'MySQL executable comment', text = '/*!40000 DROP TABLE victim */' },
+    { name = 'MariaDB executable comment', text = '/*M!100000 DROP TABLE victim */' },
+    {
+      name = 'backslash-smuggled DROP',
+      text = [[SELECT 'a\'; DROP TABLE payroll; -- ']],
+    },
+    {
+      name = 'DESCRIBE ANALYZE delete',
+      text = 'DESCRIBE ANALYZE DELETE FROM users WHERE 1',
+      destructive = true,
+    },
+    { name = 'DESC ANALYZE update', text = 'DESC ANALYZE UPDATE t SET a = 1', destructive = true },
   }
 
   it('treats every reproduced bypass as a write', function()
@@ -115,6 +138,46 @@ describe('security: write classification cannot be talked out of', function()
     end
   end)
 
+  --- A read tool that refuses reads is a bug in its own right: browsing a read-only production
+  --- database is the flagship use case, and a reviewer found the write sweep rejecting standard
+  --- functions, an everyday column name and any unquoted non-ASCII identifier.
+  it('does not refuse a read because a write verb appears as a name or a function', function()
+    local WRONGLY_REFUSED = {
+      { text = "SELECT REPLACE(name, 'a', 'b') FROM t", why = 'REPLACE is a string function' },
+      { text = 'SELECT TRUNCATE(x, 2) FROM t', why = 'TRUNCATE is a numeric function' },
+      { text = "SELECT a, REPLACE(b, 'x', 'y') FROM t", why = 'a function after a comma' },
+      { text = "SELECT INSERT('abc', 1, 1, 'x')", why = 'INSERT is a MySQL string function' },
+      { text = 'SELECT comment FROM posts', why = '`comment` is an everyday column name' },
+      { text = 'SELECT id, comment FROM t WHERE comment IS NOT NULL', why = 'the same, twice' },
+      { text = 'SELECT größe FROM messwerte', why = 'unquoted non-ASCII identifier' },
+      { text = 'SELECT * FROM t FOR UPDATE', why = 'FOR UPDATE locks, it does not modify' },
+      { text = 'SELECT 1;', why = 'a trailing semicolon is a separator, not a statement' },
+    }
+    for _, case in ipairs(WRONGLY_REFUSED) do
+      for _, dialect in ipairs({ sql.dialects.postgres, sql.dialects.mysql, sql.dialects.sqlite }) do
+        local info = sql.classify(case.text, dialect)
+        eq(info.write, false, { fail_reason = ('`%s` is a read: %s'):format(case.text, case.why) })
+        eq(info.destructive, false, {
+          fail_reason = ('`%s` must not be previewed as destructive'):format(case.text),
+        })
+      end
+    end
+  end)
+
+  it('accepts the same shapes in a filter predicate', function()
+    for _, text in ipairs({
+      "REPLACE(name, 'a', 'b') = 'zb'",
+      'comment IS NOT NULL',
+      "größe > 10 AND ort = 'Berlin'",
+    }) do
+      eq(
+        common.check_predicate(text, sql.dialects.postgres),
+        nil,
+        { fail_reason = ('`%s` must be an acceptable filter'):format(text) }
+      )
+    end
+  end)
+
   it('names a client meta-command as a problem in its own right', function()
     local META = {
       '.shell id',
@@ -124,6 +187,14 @@ describe('security: write classification cannot be talked out of', function()
       -- sqlite3 reads dot-commands per line, so a comment in front does not disarm one.
       '-- a scratch buffer comment\n.shell touch /tmp/x',
       'SELECT 1;\n.import /etc/passwd t',
+      -- mysql honours these from stdin in batch mode, and no client flag turns them off:
+      -- `system` shells out and `source` reads and executes a file on this machine.
+      'system touch /tmp/dblens-pwned',
+      'source /tmp/inc.sql',
+      'SELECT 1;\nsystem id',
+      'tee /tmp/out.txt',
+      'pager cat > /tmp/x',
+      'DELIMITER //',
     }
     for _, text in ipairs(META) do
       local problem = sql.client_meta_problem(text, sql.dialects.permissive)
@@ -132,6 +203,11 @@ describe('security: write classification cannot be talked out of', function()
     eq(sql.client_meta_problem('SELECT 1', sql.dialects.permissive), nil)
     -- A backslash inside a literal is data, not a meta-command.
     eq(sql.client_meta_problem([[SELECT 'a\b']], sql.dialects.mysql), nil)
+    -- A named command is only a command at the head of a line, and quoting it disarms it.
+    eq(sql.client_meta_problem('SELECT source FROM t', sql.dialects.mysql), nil)
+    eq(sql.client_meta_problem('SELECT a,\n`source`\nFROM t', sql.dialects.mysql), nil)
+    -- sqlite and postgres have no named commands, so an ordinary column keeps working there.
+    eq(sql.client_meta_problem('SELECT a,\nsource\nFROM t', sql.dialects.postgres), nil)
   end)
 end)
 
@@ -163,12 +239,20 @@ describe('security: the session gate', function()
     end)
   end)
 
+  --- The shipped default posture is writable with `confirm_write = false`, so a non-destructive
+  --- write is sent without a prompt. That is why a client command has to be refused as a client
+  --- command: on that posture `system touch ...` was reaching the mysql client unchallenged.
   it('refuses a client meta-command even on a writable connection', function()
     h.with_fake_exec(function()
       return {}
     end, function(session_mod, calls)
-      local session = h.fake_session(session_mod)
-      for _, text in ipairs({ '.shell touch /tmp/x', 'SELECT 1 \\! id' }) do
+      local session = h.fake_session(session_mod, { kind = 'mysql', database = 'app' })
+      for _, text in ipairs({
+        '.shell touch /tmp/x',
+        'SELECT 1 \\! id',
+        'system touch /tmp/dblens-pwned',
+        'source /tmp/inc.sql',
+      }) do
         local box = h.capture()
         session:run(text, {}, box.sink)
         eq(type(box[2]), 'string', { fail_reason = text .. ': must be refused' })
@@ -234,6 +318,48 @@ describe('security: connection paths are never shell-evaluated', function()
     eq(select(1, path.expand('$DBLENS_DEFINITELY_UNSET/x')), nil)
     eq(select(1, path.expand('-batch')), nil)
     eq(select(1, path.expand('')), nil)
+    -- `$(id)` never ran, but it is the one evaluation-shaped form that used to be accepted.
+    eq(select(1, path.expand('$(id)/db')), nil)
+  end)
+
+  --- `vim.fs.normalize` rewrites a leading `~` whatever follows it, so `~root/x.db` expanded to
+  --- `<current-user-home>root/x.db` and silently opened -- or created -- the wrong file.
+  it('refuses `~user`, which it cannot expand correctly', function()
+    local path = require('dblens.path')
+    for _, raw in ipairs({ '~root/x.db', '~postgres/data.db', '~nobody' }) do
+      eq(select(1, path.expand(raw)), nil, { fail_reason = raw .. ' must be refused' })
+      eq(type(select(2, path.expand(raw))), 'string')
+    end
+    eq(path.expand('~'), vim.uv.os_homedir())
+    eq(path.expand('~/x.db'), (vim.uv.os_homedir() or '~') .. '/x.db')
+  end)
+
+  --- Reached from `connections.load` -> `app.lua`, which is not wrapped, so a raise here took
+  --- `:DbLens` down with a traceback instead of naming the bad connection.
+  it('reports a bad path as an error, never as a raise', function()
+    local path = require('dblens.path')
+    vim.env.DBLENS_BACKTICK_TEST = 'has`backtick'
+    h.expect_no_error(function()
+      local expanded, err = path.expand('$DBLENS_BACKTICK_TEST/x.db')
+      eq(expanded, nil)
+      eq(type(err), 'string')
+      -- The expansion can hold a secret; only the raw text may be echoed back.
+      eq(err:find('has`backtick', 1, true), nil)
+    end)
+    vim.env.DBLENS_BACKTICK_TEST = nil
+  end)
+
+  it('rejects a password_cmd that is not a runnable argv', function()
+    local connections = require('dblens.connections')
+    local function spec(cmd)
+      return { name = 'c', kind = 'sqlite', path = '/tmp/x.db', password_cmd = cmd }
+    end
+    eq(connections.validate(spec({ 'pass', 'show', 'db' })), nil)
+    for _, bad in ipairs({ {}, { '' }, { 'pass', 42 }, { 'pass\nshow' }, 'pass show' }) do
+      eq(type(connections.validate(spec(bad))), 'string', {
+        fail_reason = ('password_cmd %s must be rejected'):format(vim.inspect(bad)),
+      })
+    end
   end)
 end)
 
@@ -249,8 +375,9 @@ describe('security: the filter bar', function()
     { name = 'backslash escape smuggle (mysql)', text = "x = 'a\\' ; DROP TABLE t -- '" },
     { name = 'backslash escape smuggle (postgres)', text = "x = 'a\\'' ; DROP TABLE t --" },
     { name = 'unterminated literal', text = "v = 'a" },
-    { name = 'bare write verb', text = 'x = 1 OR DELETE' },
-    { name = 'copy verb', text = 'x = 1 OR COPY' },
+    { name = 'write verb opening a subquery', text = 'x IN (DELETE FROM t RETURNING id)' },
+    { name = 'write verb after a closed group', text = '(x = 1) COPY t FROM PROGRAM' },
+    { name = 'executable comment', text = '1=1 /*!40000 OR 1=1 */' },
   }
 
   it('rejects every fragment a reviewer got through', function()

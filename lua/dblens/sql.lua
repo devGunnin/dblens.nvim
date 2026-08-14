@@ -1,8 +1,13 @@
---- SQL lexing primitives shared by the safety gate, statement splitting and completion.
+--- SQL lexing primitives shared by the destructive-change prompt, statement splitting and
+--- completion.
 ---
 --- Pure: no vim API, no IO. One scanner produces every span of the input; `tokens()` is the
 --- code-only view and `strip()` is the blank-the-opaque-spans view. Both exist so that no
 --- later scan for a keyword or a `;` can be fooled by text inside a string or a comment.
+---
+--- This module is BEST-EFFORT, not a security boundary. Read-only is enforced by the server
+--- (`dblens.adapters.*.command` opens a read-only connection); classification decides whether
+--- the UI asks for confirmation. A miss here costs a missing prompt, not a lost table.
 local M = {}
 
 --- The `backtick`/`bracket` flags say what the lexer must RECOGNISE; `ident_quote` says what we
@@ -13,7 +18,10 @@ local M = {}
 ---@field bracket boolean          -- [ident]
 ---@field hash_comment boolean     -- # to end of line
 ---@field dollar_quote boolean     -- $tag$ ... $tag$
----@field backslash_escape boolean -- backslash escapes inside string literals
+---@field backslash_escape boolean -- backslash MAY escape inside string literals
+---@field nested_comment boolean   -- /* /* */ */ nests; only postgres does
+---@field exec_comment boolean     -- /*! ... */ is executed, so its body is code
+---@field named_commands boolean   -- a bare leading `system`/`source` is a client command
 
 M.dialects = {
   standard = {
@@ -23,6 +31,9 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = false,
     backslash_escape = false,
+    nested_comment = false,
+    exec_comment = false,
+    named_commands = false,
   },
   sqlite = {
     ident_quote = '"',
@@ -31,6 +42,9 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = false,
     backslash_escape = false,
+    nested_comment = false,
+    exec_comment = false,
+    named_commands = false,
   },
   postgres = {
     ident_quote = '"',
@@ -39,6 +53,9 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = true,
     backslash_escape = false,
+    nested_comment = true,
+    exec_comment = false,
+    named_commands = false,
   },
   mysql = {
     ident_quote = '`',
@@ -47,11 +64,17 @@ M.dialects = {
     hash_comment = true,
     dollar_quote = false,
     backslash_escape = true,
+    nested_comment = false,
+    exec_comment = true,
+    named_commands = true,
   },
 }
 
---- Widest dialect, used when no connection context is known. Accepting every quoting form can
---- only blank MORE text, which fails safe for keyword scanning.
+--- Widest dialect, used when no connection context is known.
+---
+--- "Widest" means the fail-safe direction on every axis, which is not the same as "all true":
+--- a scanner that over-consumes hides live SQL, so nesting is OFF here (only postgres nests) and
+--- executable comments are ON (their body is code).
 M.dialects.permissive = {
   ident_quote = '"',
   backtick = true,
@@ -59,10 +82,13 @@ M.dialects.permissive = {
   hash_comment = true,
   dollar_quote = true,
   backslash_escape = true,
+  nested_comment = false,
+  exec_comment = true,
+  named_commands = true,
 }
 
 ---@class dblens.Token
----@field type 'space'|'comment'|'string'|'ident'|'word'|'number'|'punct'
+---@field type 'space'|'comment'|'exec_comment'|'string'|'ident'|'word'|'number'|'punct'
 ---@field text string   -- exact source text
 ---@field from integer  -- 1-based inclusive byte offset
 ---@field to integer    -- 1-based inclusive byte offset
@@ -73,9 +99,16 @@ local function find_eol(sql, i)
   return (sql:find('\n', i, true) or #sql + 1) - 1
 end
 
---- Block comments nest in postgres. Treating them as nesting elsewhere only over-consumes
---- input that is already malformed for those dialects.
-local function find_block_comment_end(sql, i)
+--- End offset of the block comment opened at `i`.
+---
+--- Only postgres nests. Nesting where the server does not makes the lexer swallow the first
+--- `*/` and every statement after it, so `SELECT 1 /* /* */ ; DROP TABLE t` looked like a
+--- single read here while sqlite and mysql ran the DROP.
+local function find_block_comment_end(sql, i, nested)
+  if not nested then
+    local close = sql:find('*/', i + 2, true)
+    return close and (close + 1) or #sql
+  end
   local depth, j = 0, i
   while j <= #sql do
     local two = sql:sub(j, j + 1)
@@ -134,7 +167,13 @@ local function scan_token(sql, i, d)
     return tok('comment', find_eol(sql, i))
   end
   if two == '/*' then
-    return tok('comment', find_block_comment_end(sql, i))
+    local to = find_block_comment_end(sql, i, d.nested_comment)
+    -- MySQL/MariaDB RUN the body of `/*!40000 ... */` and `/*M! ... */`, so it is code, not a
+    -- comment. Emitting it as its own type keeps it in the code stream and out of `strip`.
+    if d.exec_comment and sql:match('^/%*M?!', i) then
+      return tok('exec_comment', to)
+    end
+    return tok('comment', to)
   end
   if c == "'" then
     local to, closed = find_quoted_end(sql, i, "'", true, d.backslash_escape)
@@ -160,8 +199,10 @@ local function scan_token(sql, i, d)
     local to, closed = find_quoted_end(sql, i, ']', false, false)
     return tok('ident', to, unquote(sql:sub(i, to), ']', false), closed)
   end
-  if c:match('[%a_]') then
-    local _, to = sql:find('^[%w_]+', i)
+  -- Bytes >= 0x80 continue a word: every engine we drive accepts unquoted non-ASCII identifiers,
+  -- and falling through to `punct` made `SELECT größe FROM t` unprovable.
+  if c:match('[%a_\128-\255]') then
+    local _, to = sql:find('^[%w_\128-\255]+', i)
     return tok('word', to)
   end
   if c:match('%d') then
@@ -271,14 +312,17 @@ local WRITE_VERBS = {
 
 --- Leading verbs that can begin a provable read. `scan` marks the ones whose tail can carry a
 --- data-modifying CTE or subquery, so the whole statement has to be swept.
+---
+--- SHOW/DESCRIBE/DESC are swept too: `DESCRIBE`/`DESC` are MySQL synonyms for EXPLAIN, so their
+--- tail can be a whole write statement.
 local READ_VERBS = {
   SELECT = { scan = true },
   WITH = { scan = true },
   VALUES = { scan = true },
   TABLE = { scan = true },
-  SHOW = {},
-  DESCRIBE = {},
-  DESC = {},
+  SHOW = { scan = true },
+  DESCRIBE = { scan = true },
+  DESC = { scan = true },
 }
 
 --- Words that turn a SELECT into a write by redirecting its output.
@@ -458,6 +502,20 @@ local function slice(list, from)
   return out
 end
 
+--- `EXPLAIN (ANALYZE false)` plans without running, so the option word alone does not mean the
+--- statement executes.
+local OPTION_OFF = { FALSE = true, OFF = true, ['0'] = true }
+
+local function analyze_is_on(next_token)
+  if not next_token then
+    return true
+  end
+  if next_token.type ~= 'word' and next_token.type ~= 'number' then
+    return true
+  end
+  return not OPTION_OFF[next_token.text:upper()]
+end
+
 --- Where the statement an EXPLAIN plans begins, and whether the plan executes it.
 ---@return integer index, boolean analyzing
 local function explain_inner(toks)
@@ -474,7 +532,7 @@ local function explain_inner(toks)
           return i + 1, analyzing
         end
       elseif t.type == 'word' and t.text:upper() == 'ANALYZE' then
-        analyzing = true
+        analyzing = analyzing or analyze_is_on(toks[i + 1])
       end
       i = i + 1
     end
@@ -488,23 +546,51 @@ local function explain_inner(toks)
       break
     end
     if is_option and t.text:upper() == 'ANALYZE' then
-      analyzing = true
+      analyzing = analyzing or analyze_is_on(toks[i + 1])
     end
     i = i + 1
   end
   return i, analyzing
 end
 
---- Prove a token stream is a read, or fail closed.
+--- Punctuation a nested statement can start after: a CTE body `(`, the `)` that closes the CTE
+--- list, or a statement separator.
+local STATEMENT_START_AFTER = { ['('] = true, [')'] = true, [';'] = true }
+
+--- Whether the word at `index` sits where a nested statement could begin, rather than naming
+--- something.
 ---
---- The whole safety model rests on this being a proof and not a guess: `write` false must mean
---- "this cannot change anything", so every shape that is merely unrecognised comes back a write.
+--- `REPLACE`, `TRUNCATE` and `INSERT` are also standard functions in all three engines,
+--- `comment` is an everyday column name, and `FOR UPDATE` is a locking clause. Flagging the bare
+--- word refused every one of them, and a read tool that refuses reads is its own defect.
+---
+--- The head of the token stream is deliberately NOT such a place: a filter predicate starts with
+--- a column name, and a statement's own leading verb is classified before this is consulted.
+---@param toks dblens.Token[]
+---@param index integer
+---@return boolean
+function M.opens_statement(toks, index)
+  assert(type(index) == 'number' and index >= 1, 'sql.opens_statement: index must be positive')
+  local previous = toks[index - 1]
+  if not (previous and previous.type == 'punct' and STATEMENT_START_AFTER[previous.text]) then
+    return false
+  end
+  local following = toks[index + 1]
+  return not (following and following.type == 'punct' and following.text == '(')
+end
+
+--- Classify a token stream as a read, or fail closed.
+---
+--- Best-effort, and deliberately biased: a shape that is merely unrecognised comes back a write
+--- so the confirmation prompt appears. Read-only itself is enforced by the server, so a miss
+--- here costs a prompt rather than a table.
 ---@return { read: boolean, destructive: boolean, verb: string, explain_analyze: boolean }
-local function analyse(toks, depth)
+local function analyse(toks, depth, d)
   assert(depth <= 2, 'sql.analyse: EXPLAIN nesting is bounded')
+  assert(type(d) == 'table', 'sql.analyse: needs a dialect')
   local first = toks[1]
   if not first or first.type ~= 'word' then
-    -- No leading keyword: a client dot-command, a `\` meta-command, or something unparsed.
+    -- No leading keyword: a client dot-command, an executable comment, or something unparsed.
     return { read = false, destructive = false, verb = '', explain_analyze = false }
   end
   local verb = first.text:upper()
@@ -516,7 +602,10 @@ local function analyse(toks, depth)
     return unread
   end
 
-  if verb == 'EXPLAIN' then
+  -- MySQL treats DESCRIBE/DESC as EXPLAIN synonyms. `DESCRIBE tbl` is a plain read; only the
+  -- `... ANALYZE <stmt>` form carries a statement that runs.
+  local second_is_analyze = toks[2] and toks[2].type == 'word' and toks[2].text:upper() == 'ANALYZE'
+  if verb == 'EXPLAIN' or ((verb == 'DESCRIBE' or verb == 'DESC') and second_is_analyze) then
     local at, analyzing = explain_inner(toks)
     if not analyzing then
       -- A plan is not an execution: every client dblens drives plans without running.
@@ -525,7 +614,7 @@ local function analyse(toks, depth)
     if depth == 2 then
       return unread
     end
-    local inner = analyse(slice(toks, at), depth + 1)
+    local inner = analyse(slice(toks, at), depth + 1, d)
     return {
       read = inner.read,
       destructive = inner.destructive,
@@ -564,36 +653,52 @@ local function analyse(toks, depth)
   if not read then
     return unread
   end
-  for _, t in ipairs(toks) do
+  for index, t in ipairs(toks) do
     if t.type == 'word' then
       local word = t.text:upper()
       local hidden = read.scan and WRITE_VERBS[word]
-      if hidden then
+      if hidden and M.opens_statement(toks, index) then
         unread.destructive = hidden.destructive == true
         return unread
       end
       if read.scan and READ_TAIL_BAN[word] then
         return unread
       end
-    elseif t.type == 'punct' and not M.SAFE_PUNCT[t.text] then
-      return unread
-    elseif (t.type == 'string' or t.type == 'ident') and t.closed == false then
+    elseif t.type == 'punct' then
+      if not M.SAFE_PUNCT[t.text] then
+        return unread
+      end
+    elseif t.type == 'string' then
+      -- Whether `\` escapes is a SERVER setting (NO_BACKSLASH_ESCAPES), so under a dialect that
+      -- may escape, this lexer and the server can disagree about where the literal ends and a
+      -- stacked statement becomes invisible. Same rule `common.check_predicate` already applies.
+      if t.closed == false or (d.backslash_escape and t.text:find('\\', 1, true)) then
+        return unread
+      end
+    elseif t.type == 'ident' then
+      if t.closed == false then
+        return unread
+      end
+    elseif t.type ~= 'number' then
+      -- An executable comment, or any span this lexer does not model as inert.
       return unread
     end
   end
   return { read = true, destructive = false, verb = verb, explain_analyze = false }
 end
 
---- Classify one statement, or a whole script, for the safety gate.
+--- Classify one statement, or a whole script.
 ---
---- Fails closed by construction: a script that does not split into exactly one provably-read
---- statement is reported as a write, so a caller that only asks "is this a write?" is safe.
+--- Biased closed: a script that does not split into exactly one recognised read is reported as a
+--- write, so a caller that only asks "is this a write?" errs towards asking the user.
 ---@return dblens.Statement
 function M.classify(sql, dialect)
   assert(type(sql) == 'string', 'sql.classify: expected string')
-  local toks = M.tokens(sql, dialect)
-  if #toks == 0 then
-    -- Blank, or nothing but comments: there is no statement to run.
+  local d = dialect or M.dialects.permissive
+  local toks = M.tokens(sql, d)
+  local pieces = M.split(sql, d)
+  if #toks == 0 or #pieces == 0 then
+    -- Blank, or nothing but comments and separators: there is no statement to run.
     return {
       sql = sql,
       verb = '',
@@ -606,16 +711,18 @@ function M.classify(sql, dialect)
     }
   end
 
-  local pieces = M.split(sql, dialect)
-  local info = analyse(toks, 0)
+  -- Per PIECE, not per input: a trailing `;` is a separator, and analysing the raw token stream
+  -- made `SELECT 1;` a write because the `;` is not safe punctuation mid-statement.
+  local info = analyse(M.tokens(pieces[1].sql, d), 0, d)
   if #pieces > 1 then
-    -- Stacked statements: no proof covers the pair, and every part's danger still counts.
-    info = { read = false, destructive = false, verb = info.verb, explain_analyze = false }
+    -- Stacked statements: no single read covers the pair, and every part's danger still counts.
+    local stacked = { read = false, destructive = false, verb = info.verb, explain_analyze = false }
     for _, piece in ipairs(pieces) do
-      local part = analyse(M.tokens(piece.sql, dialect), 0)
-      info.destructive = info.destructive or part.destructive
-      info.explain_analyze = info.explain_analyze or part.explain_analyze
+      local part = analyse(M.tokens(piece.sql, d), 0, d)
+      stacked.destructive = stacked.destructive or part.destructive
+      stacked.explain_analyze = stacked.explain_analyze or part.explain_analyze
     end
+    info = stacked
   end
 
   local has_where = false
@@ -646,27 +753,49 @@ function M.is_write_verb(word)
   return WRITE_VERBS[tostring(word):upper()] ~= nil
 end
 
+--- mysql client commands that reach the filesystem, a shell, or the lexer's own framing. They
+--- run in the CLIENT, on this machine, and no server setting or client flag disables them —
+--- `--skip-named-commands` still honours them at the start of a line.
+local NAMED_COMMAND = {
+  SYSTEM = true,
+  SOURCE = true,
+  TEE = true,
+  PAGER = true,
+  EDIT = true,
+  CONNECT = true,
+  DELIMITER = true,
+}
+
 --- Reject a client meta-command before it reaches a client.
 ---
---- These are not SQL and no `read_only` flag applies to them: `psql` runs `\!` as a shell
---- command mid-statement, and `sqlite3 -batch` still honours `.shell`. Neither is ever something
---- dblens legitimately sends, so the check is unconditional rather than part of the read proof.
+--- These are not SQL and no connection setting covers them: `psql` runs `\!` as a shell command
+--- mid-statement, `sqlite3 -batch` honours `.shell`, and `mysql` honours a bare `system` or
+--- `source` at the head of a line even in batch mode. A server-side read-only connection cannot
+--- stop any of them, which is why this check is unconditional.
+---
+--- A column genuinely named after one of these can still be used by quoting it, which makes it
+--- an identifier token that `strip` blanks.
 ---@param text string
 ---@param dialect dblens.Dialect?
 ---@return string? problem
 function M.client_meta_problem(text, dialect)
   assert(type(text) == 'string', 'sql.client_meta_problem: expected string')
+  local d = dialect or M.dialects.permissive
   -- sqlite3 reads dot-commands per LINE, so checking the head of the statement is not enough:
   -- a `.shell` on its own line after a comment is still a dot-command. `strip` blanks comments
   -- and quoted spans while preserving offsets, so what is left is real code.
-  local stripped = M.strip(text, dialect)
+  local stripped = M.strip(text, d)
   for line in (stripped .. '\n'):gmatch('([^\n]*)\n') do
-    local head = line:match('^%s*(%.%S*)')
-    if head then
-      return ('refusing `%s`: client dot-commands are not SQL'):format(head)
+    local dot = line:match('^%s*(%.%S*)')
+    if dot then
+      return ('refusing `%s`: client dot-commands are not SQL'):format(dot)
+    end
+    local word = d.named_commands and line:match('^%s*([%a_]+)') or nil
+    if word and NAMED_COMMAND[word:upper()] then
+      return ('refusing `%s`: it is a client command that runs outside the database'):format(word)
     end
   end
-  for _, token in ipairs(M.tokens(text, dialect)) do
+  for _, token in ipairs(M.tokens(text, d)) do
     if token.type == 'punct' and token.text == '\\' then
       return 'refusing a `\\` meta-command: it would run outside the database'
     end

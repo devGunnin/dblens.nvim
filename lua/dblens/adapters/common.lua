@@ -39,8 +39,11 @@ end
 --- meaning depends on a server setting, so the lexer and the server can disagree about where
 --- the string ends and a stacked statement becomes invisible).
 ---
---- A column genuinely named after a SQL verb can still be filtered on by quoting it, which makes
---- it an identifier token rather than a bare word.
+--- What keeps the predicate safe is structural: no `;`, no comment, no backslash, no unsafe
+--- punctuation, no unclosed quote. A write verb is refused only where it could OPEN a nested
+--- statement — `REPLACE(...)`, a column called `comment` and `größe` are ordinary predicates, and
+--- refusing them made a read-only browser unusable. A bare `x = 1 OR DELETE` now reaches the
+--- server, which answers with a syntax error; it never had a way to modify anything.
 ---@param where string?
 ---@param dialect dblens.Dialect?
 ---@return string? error message, nil when the predicate is safe to splice
@@ -51,18 +54,31 @@ function M.check_predicate(where, dialect)
   if where:find('\\', 1, true) then
     return 'filter must not contain a backslash'
   end
+  local code = {}
   for _, token in ipairs(sql.scan(where, dialect)) do
     if token.type == 'comment' then
       return 'filter must not contain a comment'
     end
+    if token.type == 'exec_comment' then
+      return 'filter must not contain an executable `/*!` comment'
+    end
     if token.type == 'punct' and not sql.SAFE_PUNCT[token.text] then
       return ('filter must not contain `%s`'):format(token.text)
     end
-    if token.type == 'word' and sql.is_write_verb(token.text) then
-      return ('filter must not contain `%s`'):format(token.text:upper())
-    end
     if (token.type == 'string' or token.type == 'ident') and token.closed == false then
       return 'filter has an unclosed quote'
+    end
+    if token.type ~= 'space' then
+      code[#code + 1] = token
+    end
+  end
+  for index, token in ipairs(code) do
+    if
+      token.type == 'word'
+      and sql.is_write_verb(token.text)
+      and sql.opens_statement(code, index)
+    then
+      return ('filter must not contain `%s`'):format(token.text:upper())
     end
   end
   return nil
