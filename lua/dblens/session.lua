@@ -23,8 +23,8 @@
 --- NOT GUARANTEED — a user who ALREADY HOLDS WRITE CREDENTIALS and deliberately calls a function
 --- that writes through a side channel. `SELECT dblink_exec('...','INSERT ...')` runs its INSERT
 --- in a SECOND postgres backend, outside this transaction, as one statement led by SELECT; the
---- same shape covers `postgres_fdw` and a shell UDF. `sql.side_channel_problem` refuses the KNOWN
---- names below and is BEST-EFFORT ONLY: a `SECURITY DEFINER` wrapper or a rename defeats it, and
+--- same shape covers `postgres_fdw` and a shell UDF. `sql.side_channel_problem` holds the list of
+--- KNOWN names and is BEST-EFFORT ONLY: a `SECURITY DEFINER` wrapper or a rename defeats it, and
 --- no client-side check can close that, because only the server knows what a function does.
 --- The hard read-only boundary is a database-level read-only ROLE — connect as one when the
 --- threat model is a deliberate user rather than an accidental keystroke. See README and
