@@ -14,10 +14,12 @@ local M = {}
 
 local PANES = { 'sidebar', 'editor', 'results' }
 
+--- No slashes: the default tabline shows a buffer name's tail, and `dblens://schema` renders as
+--- the meaningless `d//schema`.
 local BUF_NAMES = {
-  sidebar = 'dblens://schema',
-  editor = 'dblens://query.sql',
-  results = 'dblens://results',
+  sidebar = 'dblens: schema',
+  editor = 'dblens: query.sql',
+  results = 'dblens: results',
 }
 
 local function make_buffer(pane)
@@ -44,6 +46,8 @@ local function configure_window(win, pane, options)
   wo.list = false
   wo.wrap = false
   wo.cursorline = pane ~= 'editor'
+  -- `~` past the last line reads as clutter in a data pane.
+  wo.fillchars = 'eob: '
   wo.winfixwidth = pane == 'sidebar'
   wo.winfixheight = pane == 'results'
   if not options.ui.winbar then

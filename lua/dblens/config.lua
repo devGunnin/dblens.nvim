@@ -36,6 +36,7 @@ M.defaults = {
 
   ui = {
     border = 'rounded',
+    --- true = plain Unicode symbols, 'nerd' = Nerd Font glyphs, false = ASCII.
     icons = true,
     winbar = true,
     sidebar = { width = 34, position = 'left' },
@@ -68,6 +69,9 @@ M.defaults = {
 --- absent from `defaults`, so the unknown-key check needs to know they are real.
 local DERIVED = { connections_file = 'string', history_file = 'string', state_file = 'string' }
 
+--- Options that legitimately accept more than one type; `validate` checks their values instead.
+local MULTI_TYPE = { ['ui.icons'] = true }
+
 --- Subtrees whose keys are user-defined rather than fixed by the schema.
 local OPEN_PATHS = {
   ['connections'] = true,
@@ -98,6 +102,9 @@ local function merge(base, user, path)
       error(('dblens: unknown option `%s`'):format(at), 0)
     end
     local want = derived or (default ~= nil and type(default) or nil)
+    if MULTI_TYPE[at] then
+      want = nil
+    end
     if want and value ~= nil and not OPEN_PATHS[at] and type(value) ~= want then
       error(('dblens: option `%s` expects %s, got %s'):format(at, want, type(value)), 0)
     end
@@ -135,6 +142,10 @@ local function validate(options)
   end
   if options.ui.sidebar.position ~= 'left' and options.ui.sidebar.position ~= 'right' then
     error("dblens: option `ui.sidebar.position` must be 'left' or 'right'", 0)
+  end
+  local icons = options.ui.icons
+  if icons ~= true and icons ~= false and icons ~= 'nerd' then
+    error("dblens: option `ui.icons` must be true, false or 'nerd'", 0)
   end
   if options.ui.grid.max_col_width < 4 then
     error('dblens: option `ui.grid.max_col_width` must be at least 4', 0)

@@ -72,11 +72,11 @@ function M.row_lines(columns, row)
     local pad = string.rep(' ', width - vim.fn.strdisplaywidth(name))
     local value = row[i]
     local text = (value == protocol.NULL or value == nil) and 'NULL' or tostring(value)
-    -- keep multi-line values readable rather than collapsing them
-    local first, rest = text:match('^([^\n]*)\n(.*)$')
-    lines[#lines + 1] = ('%s%s  %s'):format(name, pad, first or text)
-    for extra in (rest or ''):gmatch('[^\n]*') do
-      lines[#lines + 1] = string.rep(' ', width + 2) .. extra
+    -- keep multi-line values readable rather than collapsing them, indented under the name
+    local pieces = vim.split(text, '\n', { plain = true })
+    lines[#lines + 1] = ('%s%s  %s'):format(name, pad, pieces[1])
+    for index = 2, #pieces do
+      lines[#lines + 1] = string.rep(' ', width + 2) .. pieces[index]
     end
   end
   return lines

@@ -329,6 +329,13 @@ local function present(result, source, extra)
     end
     truncated = true
   end
+  -- Sorting, filtering and paging are properties of a browsed relation. A query result carries
+  -- none of them, so they must not survive from whatever was shown before.
+  if source.kind ~= 'relation' then
+    state.grid.sort = nil
+    state.grid.filter = nil
+    state.grid.paging = paging.new(state.options.page_size)
+  end
   state.grid.source = source
   state.grid.result = result
   state.grid.types = types_for(result, source.relation)

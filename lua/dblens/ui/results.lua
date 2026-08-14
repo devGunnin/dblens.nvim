@@ -117,8 +117,11 @@ function M.render_winbar(state)
     { text = ' ' .. (source and source.label or 'results'), hl = 'DbLensTitle' },
   }
   if state.grid.result then
-    segments[#segments + 1] =
-      { text = paging.label(state.grid.paging, #state.grid.result.rows), hl = 'DbLensDim' }
+    -- Only a browsed relation is paged; a query result is just however many rows came back.
+    local rows = #state.grid.result.rows
+    local text = source and source.kind == 'relation' and paging.label(state.grid.paging, rows)
+      or ('%d row%s'):format(rows, rows == 1 and '' or 's')
+    segments[#segments + 1] = { text = text, hl = 'DbLensDim' }
   end
   if state.grid.sort then
     segments[#segments + 1] = {

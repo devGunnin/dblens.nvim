@@ -43,13 +43,38 @@ function M.dotted(segments)
   return out
 end
 
+--- Drop and clip segments that do not fit the window, so a long path can never push the winbar
+--- past its window and bleed into the pane beside it.
+---@param segments dblens.Segment[]
+---@param width integer
+---@return dblens.Segment[]
+function M.fit(segments, width)
+  local out, used = {}, 0
+  for _, segment in ipairs(segments) do
+    local text_width = vim.fn.strdisplaywidth(segment.text)
+    if used + text_width <= width then
+      out[#out + 1] = segment
+      used = used + text_width
+    else
+      local room = width - used - 1
+      if room > 1 then
+        out[#out + 1] =
+          { text = vim.fn.strcharpart(segment.text, 0, room) .. '…', hl = segment.hl }
+      end
+      break
+    end
+  end
+  return out
+end
+
 ---@param win integer
 ---@param segments dblens.Segment[]
 function M.set(win, segments)
   if not vim.api.nvim_win_is_valid(win) then
     return
   end
-  vim.wo[win].winbar = M.compose(M.dotted(segments))
+  local width = vim.api.nvim_win_get_width(win)
+  vim.wo[win].winbar = M.compose(M.fit(M.dotted(segments), width))
 end
 
 ---@class dblens.Spinner
