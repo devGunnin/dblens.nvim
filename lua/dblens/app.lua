@@ -11,6 +11,7 @@ local layout_mod = require('dblens.ui.layout')
 local loader = require('dblens.loader')
 local paging = require('dblens.paging')
 local session_mod = require('dblens.session')
+local state_mod = require('dblens.state')
 local sqlmod = require('dblens.sql')
 local status = require('dblens.ui.status')
 local tree = require('dblens.tree')
@@ -105,9 +106,10 @@ local function build_state(options)
   }
 end
 
---- Open the UI. With no name, picks the sole connection or shows the picker.
+--- Open the UI. With no name, picks the sole connection, restores, or shows the picker.
 ---@param name string?
-function M.open(name)
+---@param opts { restore: boolean? }?
+function M.open(name, opts)
   local options = config.get()
   if M.is_open() then
     if name then
@@ -140,18 +142,91 @@ function M.open(name)
       end
     end,
   })
+  vim.api.nvim_create_autocmd('VimLeavePre', {
+    group = 'DbLensLifecycle',
+    callback = function()
+      M.save_session()
+    end,
+  })
 
   M.render()
+  M.choose_connection(name, opts and opts.restore)
+end
+
+--- Decide what to connect to when the UI opens.
+---
+--- Restoring reconnects, so it only happens when the user asked for it: either `:DbLensRestore`
+--- or `session.restore = true`.
+---@param name string?
+---@param force_restore boolean?
+function M.choose_connection(name, force_restore)
   if name then
     M.connect(name)
-  elseif #specs == 1 then
-    M.connect(specs[1].name)
-  elseif #specs == 0 then
+    return
+  end
+  if (force_restore or state.options.session.restore) and M.restore_saved() then
+    return
+  end
+  if force_restore then
+    M.notify('no saved session to restore')
+  end
+
+  local specs = state.specs
+  if #specs == 0 then
     M.notify('no connections configured - add one with :DbLensAdd')
-  else
-    require('dblens.ui.picker').connections(state, function(spec)
-      M.connect(spec.name)
-    end)
+    return
+  end
+  if #specs == 1 then
+    M.connect(specs[1].name)
+    return
+  end
+  require('dblens.ui.picker').connections(state, function(spec)
+    M.connect(spec.name)
+  end)
+end
+
+--- Reopen the last session, table included.
+---@return boolean started, false when there is nothing usable to restore
+function M.restore_saved()
+  local saved, err = state_mod.load(state.options)
+  if err then
+    M.error(err)
+    return false
+  end
+  if not saved or not saved.connection then
+    return false
+  end
+  if not connections.find(state.specs, saved.connection) then
+    M.notify(('the saved connection `%s` no longer exists'):format(saved.connection))
+    return false
+  end
+  M.connect(saved.connection, function()
+    if not saved.relation or not state.session then
+      return
+    end
+    for _, relation in ipairs(state.session.catalog:all_relations()) do
+      if relation.name == saved.relation and (relation.schema or '') == (saved.schema or '') then
+        M.open_relation(relation)
+        return
+      end
+    end
+    M.notify(('`%s` is no longer in the schema'):format(saved.relation))
+  end)
+  return true
+end
+
+--- Remember the connection and table currently open.
+function M.save_session()
+  if not state or not state.options.session.auto_save then
+    return
+  end
+  local snapshot = state_mod.snapshot(state)
+  if not snapshot then
+    return
+  end
+  local ok, err = state_mod.save(state.options, snapshot)
+  if not ok then
+    M.error(err)
   end
 end
 
@@ -159,6 +234,7 @@ function M.close()
   if not state then
     return
   end
+  M.save_session()
   local closing = state
   state = nil
   if closing.session then
@@ -185,7 +261,8 @@ end
 
 --- Connect by name, replacing any current session.
 ---@param name string
-function M.connect(name)
+---@param on_ready fun()?  runs once the schema and its first level of relations are loaded
+function M.connect(name, on_ready)
   if not M.is_open() then
     M.open(name)
     return
@@ -225,13 +302,14 @@ function M.connect(name)
         M.error(schema_err)
         return
       end
-      M.expand_default_schema()
+      M.expand_default_schema(on_ready)
     end)
   end)
 end
 
 --- Expand the first schema so the tree is never a single unhelpful row.
-function M.expand_default_schema()
+---@param on_done fun()?
+function M.expand_default_schema(on_done)
   local session = state.session
   if not session then
     return
@@ -240,16 +318,20 @@ function M.expand_default_schema()
   local first = schemas[1]
   if first == nil then
     M.render()
+    if on_done then
+      on_done()
+    end
     return
   end
   if session.catalog.has_schemas then
     state.tree.expanded[tree.schema_id(first)] = true
   end
-  M.load_relations(first)
+  M.load_relations(first, on_done)
 end
 
 ---@param schema string
-function M.load_relations(schema)
+---@param on_done fun()?
+function M.load_relations(schema, on_done)
   local session = state.session
   if not session then
     return
@@ -263,6 +345,9 @@ function M.load_relations(schema)
       M.error(err)
     end
     M.render()
+    if on_done then
+      on_done()
+    end
   end)
 end
 

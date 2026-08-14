@@ -77,7 +77,9 @@ end
 --- Duplicate names are rejected rather than silently shadowed, so `:DbLens` can never open a
 --- different database than the one the name suggests.
 ---@param options table  resolved config
----@return dblens.ConnectionSpec[] specs, string[] problems
+---@return dblens.ConnectionSpec[] specs, string[] problems, string? file_error
+--- `file_error` is set only when the connections file itself could not be read as JSON. Callers
+--- that intend to WRITE the file must refuse on it, or they would overwrite unreadable content.
 function M.load(options)
   local specs, problems, seen = {}, {}, {}
 
@@ -107,14 +109,14 @@ function M.load(options)
   for _, spec in ipairs(options.connections) do
     accept(spec, 'config')
   end
-  local stored, err = read_json_file(options.connections_file)
-  if err then
-    problems[#problems + 1] = err
+  local stored, file_error = read_json_file(options.connections_file)
+  if file_error then
+    problems[#problems + 1] = file_error
   end
   for _, spec in ipairs(stored or {}) do
     accept(spec, 'file')
   end
-  return specs, problems
+  return specs, problems, file_error
 end
 
 --- Persist the file-sourced specs. Config-sourced specs are owned by the user's `setup{}` call

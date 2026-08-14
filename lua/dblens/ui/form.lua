@@ -105,7 +105,12 @@ function M.persist(options, spec, on_done)
     vim.notify('dblens: ' .. problem, vim.log.levels.ERROR)
     return
   end
-  local existing = connections.load(options)
+  -- Saving rewrites the whole file, so a file we could not parse must not be overwritten.
+  local existing, _, file_error = connections.load(options)
+  if file_error then
+    vim.notify(('dblens: refusing to write - %s'):format(file_error), vim.log.levels.ERROR)
+    return
+  end
   for _, other in ipairs(existing) do
     if other.name == spec.name then
       vim.notify(
@@ -130,7 +135,11 @@ end
 
 --- Remove a saved connection by name. Connections declared in `setup{}` cannot be removed here.
 function M.remove(options, name)
-  local specs = connections.load(options)
+  local specs, _, file_error = connections.load(options)
+  if file_error then
+    vim.notify(('dblens: refusing to write - %s'):format(file_error), vim.log.levels.ERROR)
+    return
+  end
   local keep, found = {}, nil
   for _, spec in ipairs(specs) do
     if spec.name == name then

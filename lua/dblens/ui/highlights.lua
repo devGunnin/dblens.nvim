@@ -33,7 +33,9 @@ local LINKS = {
 
   -- grid
   DbLensHeader = 'Title',
-  DbLensRule = 'WinSeparator',
+  -- NonText, not WinSeparator: many colorschemes give WinSeparator a background, which turns the
+  -- header rule into a filled bar instead of a line.
+  DbLensRule = 'NonText',
   DbLensNull = 'Comment',
   DbLensNumber = 'Number',
   DbLensBoolean = 'Boolean',

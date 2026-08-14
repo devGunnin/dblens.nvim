@@ -138,50 +138,12 @@ end
 --- Reopen the last connection and table.
 function M.restore()
   M.ensure_setup()
-  local options = config.get()
-  local saved, err = require('dblens.state').load(options)
-  if err then
-    vim.notify('dblens: ' .. err, vim.log.levels.ERROR)
-    return
-  end
-  if not saved or not saved.connection then
-    vim.notify('dblens: no saved session to restore')
-    return
-  end
   local app = require('dblens.app')
-  app.open(saved.connection)
-  if not saved.relation then
+  if app.is_open() then
+    app.restore_saved()
     return
   end
-  -- Reopening the table has to wait until the schema for that connection has loaded.
-  local attempts = 0
-  local timer = vim.uv.new_timer()
-  timer:start(
-    120,
-    120,
-    vim.schedule_wrap(function()
-      attempts = attempts + 1
-      local state = app.state()
-      local session = state and state.session
-      if session then
-        for _, relation in ipairs(session.catalog:all_relations()) do
-          if
-            relation.name == saved.relation and (relation.schema or '') == (saved.schema or '')
-          then
-            timer:stop()
-            timer:close()
-            app.open_relation(relation)
-            return
-          end
-        end
-      end
-      if attempts >= 40 then
-        timer:stop()
-        timer:close()
-        vim.notify(('dblens: could not reopen `%s`'):format(saved.relation), vim.log.levels.WARN)
-      end
-    end)
-  )
+  app.open(nil, { restore = true })
 end
 
 --- Add a connection interactively.
