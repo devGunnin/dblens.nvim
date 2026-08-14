@@ -136,6 +136,13 @@ local function check_connections(options)
     local access = spec.read_only and 'read-only' or 'writable'
     health.info(('%s [%s] %s, %s'):format(spec.name, spec.kind, access, describe_secret(spec)))
   end
+  -- Surfaced where a user reviews their connections, because "read-only" above reads stronger
+  -- than it is: it stops every ordinary write, not a deliberate dblink/UDF one.
+  health.info(
+    'a read-only connection is enforced by the server per run, and is not a boundary against '
+      .. 'a user with write credentials -- connect as a database read-only role for that '
+      .. '(:h dblens-safety-guarantee)'
+  )
 end
 
 local INTEGRATIONS = {

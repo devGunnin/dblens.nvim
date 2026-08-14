@@ -433,6 +433,42 @@ confirmation prompt and the refusal of client meta-commands - is enforced at
 one choke point, `Session:gate`, which every statement dblens sends passes
 through before a client process exists.
 
+WHAT LOCKED GUARANTEES                              *dblens-safety-guarantee*
+
+Read this before pointing dblens at a database you care about. LOCKED is the
+default for every connection.
+
+LOCKED DOES guarantee: >
+    no accidental write - nothing you did not mean to run reaches the database
+    no write through any ORDINARY SQL statement, however it is spelled, on any
+      of the three engines. The DATABASE SERVER refuses it - a read-only
+      transaction on PostgreSQL and MySQL, the file handle's open mode on
+      SQLite - not dblens reading your SQL
+    no second statement. Every framing trick that stacked one (a `;` inside a
+      comment, a bare \r, a nested block comment, a Unicode line separator) is
+      refused unparsed, by a byte scan
+<
+LOCKED DOES NOT guarantee protection from someone who both HOLDS WRITE
+CREDENTIALS and deliberately calls a write-capable extension: >
+    SELECT dblink_exec('dbname=app ...', 'INSERT ...')
+<
+That INSERT runs in a SECOND PostgreSQL backend, outside dblens's read-only
+transaction, and the whole thing is a single statement beginning with SELECT -
+so neither the transaction nor the one-statement rule reaches it.
+`postgres_fdw`, `lo_export`, `pg_read_file` and a MySQL shell UDF are the same
+shape. dblens refuses the known names (|dblens-safety-side-channel|), and that
+is BEST-EFFORT, EXPLICITLY NOT A BOUNDARY: a SECURITY DEFINER wrapper walks
+straight through it.
+
+If your threat model is a deliberate user rather than a slip of the keyboard,
+connect as a database read-only role - |dblens-safety-role|. That is the only
+hard boundary, and the server is the one enforcing it.
+
+Compared honestly: this is what a client-side read-only mode can be. dblens's
+is stronger than parsing your SQL and hoping, because the server refuses the
+write - but no client can constrain what a function does once it is running
+inside the server.
+
 READ-ONLY CONNECTIONS                                *dblens-safety-read-only*
 
 Every connection is LOCKED unless it says `read_only = false` (or
@@ -504,6 +540,83 @@ trailing `;` all pass. The deliberate cost: while locked, a statement carrying
 a `;` inside a string literal or a quoted identifier (`SELECT ';'`) is refused
 too, because proving that one is a single statement would mean trusting the
 lexer again.
+
+SIDE CHANNELS                                     *dblens-safety-side-channel*
+
+Some functions do their work OUTSIDE the transaction dblens opened - in a
+second database backend, or on the server's filesystem. A read-only
+transaction governs neither. Each is one statement led by SELECT, so every
+layer above passes it. A LOCKED connection refuses these names: >
+    dblink...          the whole family, by prefix
+    postgres_fdw...    a second database session dblens cannot make read-only
+    lo_import lo_export pg_read_file pg_read_binary_file pg_ls_dir
+    pg_stat_file       the PostgreSQL server's filesystem
+    LOAD_FILE          the MySQL server's filesystem
+    sys_exec sys_eval  a shell on the MySQL server, via a UDF
+<
+The refusal names the function it objected to; unlock to run it. This is
+measurable, not decorative. Verified live on PostgreSQL 16: inside dblens's
+read-only wrap `lo_export` WROTE a file on the server, `pg_read_file` READ
+one, and `dblink_exec` landed a row. All three are now refused.
+
+AND IT IS A NAME CHECK, so treat it as raising the bar, never as a boundary.
+A SECURITY DEFINER wrapper, a rename, or a copy in another schema is not
+caught. Verified live: `SELECT refresh_cache('...')`, a one-line wrapper
+around the same `dblink_exec`, still landed its row on a LOCKED connection.
+No client-side check can close that - a function's NAME says nothing about
+what the function DOES. `tests/spec/side_channel_spec.lua` pins that
+limitation as a test case rather than pretending it away.
+
+Quoting decides: a quoted identifier or a string literal holding one of these
+names is data, so `SELECT "dblink_log" FROM audit` is an ordinary read. EDIT
+mode never applies the check - an unlocked connection can write with a plain
+INSERT, so refusing there would only break a legitimate dblink query.
+
+Already covered by the layers above: `COPY ... TO/FROM PROGRAM` (COPY is a
+write verb), `SELECT ... INTO OUTFILE`/`DUMPFILE` and `LOAD DATA INFILE`
+(refused as writes). SQLite needs no name list - `-safe` refuses
+`writefile()`, `.load` and ATTACH at the client, and `-readonly` is the file
+handle's open mode.
+
+A DATABASE READ-ONLY ROLE                                 *dblens-safety-role*
+
+The only guarantee that holds against a user who HAS write credentials is not
+to give the connection write credentials. dblens uses whatever role you point
+it at, so this is a change to your database, not to your config: create a
+read-only role and put it in the connection's `user`. >
+    -- PostgreSQL
+    CREATE ROLE dblens_ro LOGIN PASSWORD '...'
+      NOSUPERUSER NOCREATEDB NOCREATEROLE;
+    GRANT CONNECT ON DATABASE app TO dblens_ro;
+    GRANT USAGE ON SCHEMA public TO dblens_ro;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO dblens_ro;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+      GRANT SELECT ON TABLES TO dblens_ro;
+
+    -- MySQL / MariaDB. No FILE privilege, so LOAD_FILE and INTO OUTFILE
+    -- fail; no CREATE ROUTINE, so a shell UDF cannot be installed.
+    CREATE USER 'dblens_ro'@'%' IDENTIFIED BY '...';
+    GRANT SELECT, SHOW VIEW ON app.* TO 'dblens_ro'@'%';
+<
+SQLite has no roles: `-readonly` is already the open mode, and the file's own
+permissions (`chmod a-w app.db`) are the layer under it.
+
+Verified live on PostgreSQL 16, as that role: a plain INSERT is "permission
+denied for table"; `lo_export` and `pg_read_file` are "permission denied for
+function"; and a direct `dblink_exec` over the server's own socket is refused
+with "Non-superusers must provide a password in the connection string" - the
+peer-auth escape closes with the superuser bit.
+
+ONE THING A READ-ONLY ROLE STILL DOES NOT COVER. A SECURITY DEFINER function
+runs with its OWNER's privileges - that is what it is for. The same
+`refresh_cache()` wrapper wrote its row as `dblens_ro` too, because a
+superuser owns it and PostgreSQL grants EXECUTE to PUBLIC by default. That is
+a privilege escalation the database already contains, reachable by every role
+and by every client. If it matters to you, take the grant back: >
+    REVOKE EXECUTE ON FUNCTION refresh_cache(text) FROM PUBLIC;
+<
+Verified: after that the same call is "permission denied for function", and
+no row lands.
 
 WHAT THE CLASSIFIER IS FOR                                *dblens-safety-read*
 
@@ -822,5 +935,9 @@ Other limits:
   from the catalog. It is meant to be read, not replayed.
 - Affected-row counts must ride along in the same client invocation, so an
   adapter with no affected-rows query (PostgreSQL) reports none.
+- A LOCKED connection is not a sandbox around a user who already holds write
+  credentials. The side-channel refusal matches names and a SECURITY DEFINER
+  wrapper defeats it; a database read-only role is the hard boundary. What
+  each does and does not cover: |dblens-safety-guarantee|.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

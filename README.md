@@ -332,6 +332,43 @@ Every binding is declared in one table and can be remapped or disabled per scope
 
 ## Safety model
 
+### What LOCKED guarantees, and what it does not
+
+Read this before pointing dblens at a database you care about. LOCKED is the default for every
+connection.
+
+LOCKED **does** guarantee:
+
+- **no accidental write** — nothing you did not mean to run reaches the database;
+- **no write through any ordinary SQL statement**, however it is spelled, on any of the three
+  engines. It is the *database server* that refuses it — a read-only transaction on PostgreSQL and
+  MySQL, the file handle's open mode on SQLite — not dblens reading your SQL;
+- **no second statement.** Every framing trick that stacked one (a `;` inside a comment, a bare
+  `\r`, a nested block comment, a Unicode line separator) is refused unparsed, by a byte scan.
+
+LOCKED **does not** guarantee:
+
+- **protection from someone who both holds write credentials and deliberately calls a
+  write-capable extension.** `SELECT dblink_exec('dbname=app …','INSERT …')` runs its `INSERT` in
+  a **second** PostgreSQL backend, outside dblens's read-only transaction — and it is a single
+  statement beginning with `SELECT`, so neither the transaction nor the one-statement rule reaches
+  it. `postgres_fdw`, `lo_export`, `pg_read_file` and a MySQL shell UDF are the same shape.
+
+dblens refuses [the known names](#side-channels-a-best-effort-refusal-not-a-boundary) while
+locked. That is **best-effort and explicitly not a security boundary**: a `SECURITY DEFINER`
+wrapper called `refresh_cache()` walks straight through it, and nothing on the client side can
+tell the difference, because only the server knows what a function does.
+
+**If your threat model is a deliberate user rather than a slip of the keyboard, connect as a
+[database read-only role](#a-database-read-only-role-the-hard-boundary).** That is the only hard
+boundary, and the server is the one enforcing it.
+
+Compared honestly: this is what a client-side read-only mode can be. dblens's is stronger than
+parsing your SQL and hoping — the server refuses the write — but no client can constrain what a
+function does once it is running inside the server.
+
+### How it is enforced
+
 **A connection is LOCKED unless you unlock it, and locked is enforced by the database server.**
 Every connection opens locked; only an explicit `read_only = false` (or
 `safety.read_only_default = false`) opens one for editing. While locked, dblens sends every run
@@ -425,6 +462,85 @@ are unaffected — multi-line SQL, comments, tabs and a trailing `;` all pass. T
 and deliberate: while locked, a statement carrying a `;` inside a string literal or a quoted
 identifier (`SELECT ';'`, a column named `a;b`) is refused as well, because proving *that* one is
 a single statement would mean trusting the lexer again.
+
+### Side channels: a best-effort refusal, not a boundary
+
+Some functions do their work **outside** the transaction dblens opened — in a second database
+backend, or on the server's filesystem. A read-only transaction does not govern either. All of
+these are one statement led by `SELECT`, so every layer above passes them:
+
+| named while locked | what it reaches |
+| --- | --- |
+| `dblink…` (the whole family), `postgres_fdw…` | a second database session, whose transaction dblens cannot make read-only |
+| `lo_import`, `lo_export`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file` | the PostgreSQL server's filesystem |
+| `LOAD_FILE` | the MySQL server's filesystem |
+| `sys_exec`, `sys_eval` | a shell on the MySQL server, via a UDF |
+
+A LOCKED connection refuses a statement naming one of them, and says which name it objected to.
+Unlock to run it. This is measurable, not decorative — verified live on PostgreSQL 16: inside
+dblens's read-only wrap `lo_export` *wrote* a file on the server and `pg_read_file` *read* one,
+and `dblink_exec` landed a row in the table. All three are now refused.
+
+**And it is a name check, so treat it as raising the bar, never as a boundary.** A
+`SECURITY DEFINER` wrapper, a rename, or a copy in another schema is not caught — verified live:
+`SELECT refresh_cache('…')`, a one-line wrapper around the same `dblink_exec`, still landed its
+row on a LOCKED connection. No client-side check can close that; a function name says nothing
+about what the function does. `tests/spec/side_channel_spec.lua` pins that limitation as a test
+case rather than pretending it away.
+
+Only quoting matters: a *quoted* identifier or a string literal holding one of these names is
+data, so `SELECT "dblink_log" FROM audit` is an ordinary read. EDIT mode never applies the check —
+an unlocked connection can write with a plain `INSERT`, so refusing there would only break a
+legitimate `dblink` query.
+
+Already covered by the layers above, and confirmed as such: `COPY … TO/FROM PROGRAM` (`COPY` is a
+write verb), `SELECT … INTO OUTFILE`/`DUMPFILE` and `LOAD DATA INFILE` (refused as writes). SQLite
+needs no name list: `-safe` refuses `writefile()`, `.load` and `ATTACH` at the client (verified on
+3.53), and `-readonly` is the file handle's open mode.
+
+### A database read-only role (the hard boundary)
+
+The only guarantee that holds against a user who *has* write credentials is not to give the
+connection write credentials. dblens uses whatever role you point it at, so this is a change to
+your database, not to your config: create a read-only role and put it in the connection's `user`.
+
+```sql
+-- PostgreSQL
+CREATE ROLE dblens_ro LOGIN PASSWORD '…' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+GRANT CONNECT ON DATABASE app TO dblens_ro;
+GRANT USAGE ON SCHEMA public TO dblens_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO dblens_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dblens_ro;
+```
+
+```sql
+-- MySQL / MariaDB. No FILE privilege, so LOAD_FILE and INTO OUTFILE fail; no CREATE
+-- ROUTINE, so a shell UDF cannot be installed.
+CREATE USER 'dblens_ro'@'%' IDENTIFIED BY '…';
+GRANT SELECT, SHOW VIEW ON app.* TO 'dblens_ro'@'%';
+```
+
+SQLite has no roles: `-readonly` is already the open mode, and the file's own permissions
+(`chmod a-w app.db`) are the layer under it.
+
+Verified live on PostgreSQL 16, as that role: a plain `INSERT` is `permission denied for table`;
+`lo_export` and `pg_read_file` are `permission denied for function`; and a direct `dblink_exec`
+over the server's own socket is refused with *"Non-superusers must provide a password in the
+connection string"* — the peer-auth escape closes with the superuser bit.
+
+**One thing a read-only role still does not cover, so it is worth knowing.** A `SECURITY DEFINER`
+function runs with its **owner's** privileges — that is what it is for. The same
+`refresh_cache()` wrapper wrote its row as `dblens_ro` too, because a superuser owns it and
+PostgreSQL grants `EXECUTE` to `PUBLIC` by default. That is a privilege escalation the database
+already contains, reachable by every role and by every client. If it matters to you, take the
+grant back:
+
+```sql
+REVOKE EXECUTE ON FUNCTION refresh_cache(text) FROM PUBLIC;
+```
+
+Verified: after that the same call is `permission denied for function refresh_cache`, and no row
+lands.
 
 **The confirm gate.** `UPDATE`, `DELETE`, `REPLACE`, `MERGE`, `DROP`, `TRUNCATE`, `ALTER`,
 `RENAME`, `GRANT` and `REVOKE` are destructive; other writes are not. With
@@ -631,6 +747,10 @@ error reporting have much thinner live coverage on those two — please report w
   because that is the NULL marker psql prints unquoted. Every other value round-trips.
 - An unrecognised statement verb is treated as a write. On a read-only connection that means a
   dialect feature dblens does not know about is refused rather than run.
+- A LOCKED connection is not a sandbox around a user who already holds write credentials. The
+  side-channel refusal matches names and a `SECURITY DEFINER` wrapper defeats it; a database
+  [read-only role](#a-database-read-only-role-the-hard-boundary) is the hard boundary. Both are
+  spelled out, with what each does and does not cover, in the safety model above.
 
 ## Development
 
