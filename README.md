@@ -354,11 +354,12 @@ transaction until it has taken a snapshot, which is why the `DECLARE … CURSOR`
 takes one and returns nothing.)
 
 This is the guarantee because the alternative is not one. dblens used to decide read-only by
-lexing the SQL itself, and three independent reviews broke it — nested block comments (`/* /* */`
-closes the comment everywhere except PostgreSQL), MySQL's executable `/*!…*/` comments, and
-backslash escaping, which depends on the server's `sql_mode` rather than on the dialect. A Lua
-reimplementation of five dialects' lexers will always disagree with the real parser somewhere,
-and every disagreement is a bypass. The server's own parser cannot disagree with itself.
+lexing the SQL itself, and four independent reviews broke it — nested block comments (`/* /* */`
+closes the comment everywhere except PostgreSQL), MySQL's executable `/*!…*/` comments, backslash
+escaping, which depends on the server's `sql_mode` rather than on the dialect, and a bare `\r`,
+which ends a `--` comment for psql. A Lua reimplementation of five dialects' lexers will always
+disagree with the real parser somewhere, and every disagreement is a bypass. The server's own
+parser cannot disagree with itself.
 
 Reads are unaffected: `SELECT`, `EXPLAIN`, catalog queries and paging all work normally on a
 locked connection.
@@ -399,15 +400,31 @@ unquoted `\`, or a line beginning `system`/`source`/`tee`/`pager`/`edit`/`connec
 A column with one of those names can still be used by quoting it. sqlite3 is additionally run
 with `-safe`, MySQL with `--local-infile=0`.
 
-**What server-side read-only does not cover.** On PostgreSQL and MySQL the read-only transaction
-holds against everything *inside* it, but a statement can still END or REPLACE it and write in a
-new one — `ROLLBACK; SET default_transaction_read_only = off; BEGIN; INSERT …` on PostgreSQL,
-`START TRANSACTION READ WRITE; INSERT …` on MySQL. There is no session setting either engine
-offers that a statement cannot undo, so the last line there is the classifier: every one of
-those needs a second top-level statement, and a script that is not a single provable read is
-refused on a locked connection before it is sent. That pairing is the point, and it is why
-`sql.lua` is still security-relevant on those two engines. SQLite needs none of it: `-readonly`
-is the file handle's open mode and there is no session state to flip.
+**A locked connection runs exactly one statement.** On PostgreSQL and MySQL the read-only
+transaction holds against everything *inside* it, but a statement can still END or REPLACE it and
+write in a new one — `ROLLBACK; SET default_transaction_read_only = off; BEGIN; INSERT …` on
+PostgreSQL, `START TRANSACTION READ WRITE; INSERT …` on MySQL. Every escape of that shape needs a
+**second** top-level statement. So while locked, dblens refuses any input it cannot prove is
+exactly one:
+
+- a `;` anywhere but as the final character;
+- any control byte other than tab and newline (`\r`, `\v`, `\f`, `NUL`, `0x1C`–`0x1F`, …);
+- a Unicode line or paragraph separator (`U+0085`, `U+2028`, `U+2029`).
+
+That check is a byte scan, not a parse. The defence before it was the classifier's statement
+count, and a bare `\r` — which psql reads as the end of a `--` comment and the classifier did not
+— hid a stacked `DROP TABLE` from it and dropped the table on a locked connection. Teaching the
+lexer about `\r` would only move the gap to the next character; refusing every framing closes the
+class. The two layers together are the model: **the read-only transaction makes one statement
+unescapable, and the single-statement rule makes a second statement unreachable.** SQLite needs
+neither for writes — `-readonly` is the file handle's open mode — but the rule applies there too.
+
+The refusal names the mode and the way out: multi-statement scripts are an EDIT-mode feature,
+reached with `:DbLensWrite` (`<leader>dw`) and still behind the confirmation gate. Ordinary reads
+are unaffected — multi-line SQL, comments, tabs and a trailing `;` all pass. The cost is exact
+and deliberate: while locked, a statement carrying a `;` inside a string literal or a quoted
+identifier (`SELECT ';'`, a column named `a;b`) is refused as well, because proving *that* one is
+a single statement would mean trusting the lexer again.
 
 **The confirm gate.** `UPDATE`, `DELETE`, `REPLACE`, `MERGE`, `DROP`, `TRUNCATE`, `ALTER`,
 `RENAME`, `GRANT` and `REVOKE` are destructive; other writes are not. With

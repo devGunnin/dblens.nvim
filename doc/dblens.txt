@@ -459,12 +459,13 @@ transactions. PostgreSQL additionally lets `SET TRANSACTION READ WRITE`
 escalate a read-only transaction until it has taken a snapshot, which is what
 the `DECLARE ... CURSOR` is for - it takes one and returns nothing.
 This is the guarantee because the alternative is not one. dblens used to
-decide read-only by lexing the SQL itself, and three independent reviews broke
+decide read-only by lexing the SQL itself, and four independent reviews broke
 it: nested block comments (`/* /* */` closes the comment everywhere except
-PostgreSQL), MySQL's executable `/*!...*/` comments, and backslash escaping,
-which depends on the server's sql_mode rather than on the dialect. A Lua
-reimplementation of five dialects' lexers will always disagree with the real
-parser somewhere, and every disagreement is a bypass.
+PostgreSQL), MySQL's executable `/*!...*/` comments, backslash escaping, which
+depends on the server's sql_mode rather than on the dialect, and a bare \r,
+which ends a `--` comment for psql. A Lua reimplementation of five dialects'
+lexers will always disagree with the real parser somewhere, and every
+disagreement is a bypass.
 
 Reads are unaffected: SELECT, EXPLAIN, catalog queries and paging all work
 normally on a locked connection.
@@ -476,24 +477,41 @@ work - still behind the confirmation gate. |:DbLensLock| puts it back and the
 very next run is refused by the server again. The sidebar, the results winbar
 and |dblens.statusline()| say LOCKED or EDIT.
 
+ONE STATEMENT AT A TIME                             *dblens-safety-one-stmt*
+
 What the server still cannot stop on PostgreSQL and MySQL: a statement that
 ENDS or REPLACES the read-only transaction and writes in a new one - >
     ROLLBACK; SET default_transaction_read_only = off; BEGIN; INSERT ...
     START TRANSACTION READ WRITE; INSERT ...
 <
-Neither engine offers a session setting a statement cannot undo, so the last
-line there is the classifier: each of those needs a second top-level
-statement, and a script that is not a single provable read is refused on a
-locked connection before it is sent. The two layers cover each other.
+Every escape of that shape needs a SECOND top-level statement. So a LOCKED
+connection refuses any input it cannot prove is exactly one statement: >
+    a `;` anywhere but as the final character
+    any control byte except tab and newline (\r \v \f NUL 0x1C-0x1F ...)
+    a Unicode line separator (U+0085, U+2028, U+2029)
+<
+That is a byte scan, not a parse. The defence before it was the classifier's
+statement count, and a bare \r - which psql reads as the end of a `--` comment
+and the classifier did not - hid a stacked DROP TABLE from it and dropped the
+table on a locked connection. Teaching the lexer about \r would only move the
+gap. The two layers are the model: the read-only transaction makes ONE
+statement unescapable, and this rule makes a SECOND statement unreachable.
+
+The refusal names the mode and the way out. Multi-statement scripts are an
+EDIT-mode feature: unlock with |:DbLensWrite|, and the confirmation gate still
+applies. Ordinary reads are unaffected - multi-line SQL, comments, tabs and a
+trailing `;` all pass. The deliberate cost: while locked, a statement carrying
+a `;` inside a string literal or a quoted identifier (`SELECT ';'`) is refused
+too, because proving that one is a single statement would mean trusting the
+lexer again.
 
 WHAT THE CLASSIFIER IS FOR                                *dblens-safety-read*
 
 dblens still reads each statement to decide whether it is a write and whether
 it is destructive. That drives the confirmation prompt, and the early
-"connection X is read-only" message. It is BEST-EFFORT, but on PostgreSQL and
-MySQL it is also the layer that catches the transaction-escape above, so a
-miss there can cost more than a prompt. On SQLite a miss costs a prompt on a
-writable connection, not a table.
+"connection X is read-only" message. It is BEST-EFFORT and it is UX: a miss
+costs a prompt on a writable connection, not a table. What a locked connection
+is allowed to send is decided by the rule above, which consults no lexer.
 
 It is still biased closed. A statement counts as a read only when it is a
 single statement led by SELECT, WITH, VALUES, TABLE, SHOW, DESCRIBE, a
