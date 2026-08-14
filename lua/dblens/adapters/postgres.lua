@@ -71,10 +71,9 @@ end
 --- `-f -` makes psql prefix an error with `psql:<stdin>:LINE:`, which is how a failed statement
 --- in a committed batch is traced back to the change that produced it.
 ---
---- A read-only connection sets `default_transaction_read_only` as a STARTUP option, so the
---- server refuses every write itself: `nextval()`, `setval()`, writable CTEs, DO blocks and DDL
---- all come back `cannot execute ... in a read-only transaction`, whatever the statement text
---- looked like to this plugin's lexer.
+--- A read-only connection sets `default_transaction_read_only` as a STARTUP option, so any
+--- transaction the script opens for itself is read-only too. It is the BACKUP; the guarantee is
+--- the read-only transaction `read_only_script` wraps the run in.
 function M.command(spec, secret, mode, clients)
   local argv = {
     clients.postgres,
@@ -114,6 +113,34 @@ function M.command(spec, secret, mode, clients)
     env.PGSSLMODE = spec.sslmode
   end
   return { argv = argv, env = env }
+end
+
+--- Opens the read-only transaction and PINS it.
+---
+--- The pin is load-bearing, not decoration: `BEGIN READ ONLY` alone can still be escalated by
+--- `SET TRANSACTION READ WRITE` as the very next statement (verified live on 16.15 — the INSERT
+--- landed). PostgreSQL refuses that switch once the transaction has taken a snapshot, and
+--- `DECLARE ... CURSOR` takes one while emitting no rows and no output under `-q`.
+local READ_ONLY_OPEN = 'BEGIN READ ONLY;\n'
+  .. 'DECLARE dblens_read_only_pin NO SCROLL CURSOR FOR SELECT 1;\n'
+
+--- The script a read-only run actually sends.
+---
+--- Inside the pinned transaction the server refuses every write, and refuses to be talked out of
+--- it: `SET default_transaction_read_only = off` only affects LATER transactions, and
+--- `SET TRANSACTION READ WRITE` / `set_config('transaction_read_only', ...)` come back
+--- `transaction read-write mode must be set before any query`.
+---
+--- The bare `;` before COMMIT terminates a statement that did not terminate itself; psql accepts
+--- the empty statement it makes when the caller already ended with one.
+---@param statement string
+---@return string
+function M.read_only_script(statement)
+  assert(
+    type(statement) == 'string' and statement ~= '',
+    'postgres.read_only_script: needs a statement'
+  )
+  return READ_ONLY_OPEN .. statement .. '\n;\nCOMMIT;\n'
 end
 
 M.decode = protocol.decode_csv

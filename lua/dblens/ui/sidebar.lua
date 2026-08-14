@@ -127,8 +127,8 @@ function M.render(state)
       },
       { text = session and session:describe() or '', hl = 'DbLensDim' },
       {
-        text = session and session:is_read_only() and (icons.lock .. ' read-only') or '',
-        hl = 'DbLensReadOnly',
+        text = session and (session:is_read_only() and (icons.lock .. ' LOCKED') or 'EDIT') or '',
+        hl = session and not session:is_read_only() and 'DbLensWarn' or 'DbLensReadOnly',
       },
     }, state.options)
   end

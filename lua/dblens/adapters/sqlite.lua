@@ -83,6 +83,18 @@ function M.command(spec, _secret, mode, clients)
   return { argv = argv, env = nil }
 end
 
+--- sqlite needs no transaction wrap: `-readonly` is the open mode of the file handle, so there
+--- is no session state for a statement to flip and nothing a wrapper could add.
+---@param statement string
+---@return string
+function M.read_only_script(statement)
+  assert(
+    type(statement) == 'string' and statement ~= '',
+    'sqlite.read_only_script: needs a statement'
+  )
+  return statement
+end
+
 M.decode = protocol.decode
 
 M.sql = {}

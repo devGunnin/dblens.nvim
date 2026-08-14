@@ -144,8 +144,9 @@ function M.render_winbar(state)
   if session and session.txn:is_active() then
     segments[#segments + 1] = { text = session.txn:label(), hl = 'DbLensTxn' }
   end
-  if session and session:is_read_only() then
-    segments[#segments + 1] = { text = 'read-only', hl = 'DbLensReadOnly' }
+  if session then
+    segments[#segments + 1] = session:is_read_only() and { text = 'LOCKED', hl = 'DbLensReadOnly' }
+      or { text = 'EDIT', hl = 'DbLensWarn' }
   end
   if state.spinner and state.spinner:is_running() then
     segments[#segments + 1] = { text = state.spinner:label(), hl = 'DbLensSpinner' }

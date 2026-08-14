@@ -819,6 +819,36 @@ function M.refresh_after_write(statements)
 end
 
 -- ---------------------------------------------------------------------------
+-- connection mode
+
+--- Lock the active connection, or open it for editing.
+---
+--- `locked = nil` toggles. Unlocking is the sanctioned write path: the server stops refusing
+--- writes, and the confirmation gate in front of destructive ones is untouched.
+---@param locked boolean?
+function M.set_locked(locked)
+  local session = state and state.session
+  if not session then
+    M.error('not connected')
+    return
+  end
+  local want = locked
+  if want == nil then
+    want = not session:is_read_only()
+  end
+  local ok, err = session:set_locked(want)
+  if not ok then
+    M.error(err)
+    return
+  end
+  M.notify(
+    want and ('`%s` is locked - the server refuses every write'):format(session.spec.name)
+      or ('`%s` is open for editing - writes still confirm'):format(session.spec.name)
+  )
+  M.render()
+end
+
+-- ---------------------------------------------------------------------------
 -- transactions
 
 function M.txn_begin()

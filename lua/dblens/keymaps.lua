@@ -47,6 +47,13 @@ M.specs = {
       group = 'dblens',
     },
     {
+      action = 'write_toggle',
+      lhs = '<leader>dw',
+      desc = 'Lock the connection / open it for editing',
+      mode = 'n',
+      group = 'dblens',
+    },
+    {
       action = 'txn_begin',
       lhs = '<leader>dB',
       desc = 'Begin transaction',

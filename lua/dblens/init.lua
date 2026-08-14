@@ -52,6 +52,9 @@ local function global_handlers()
     snippets = in_ui(function(state)
       require('dblens.ui.picker').snippets(state)
     end),
+    write_toggle = function()
+      app.set_locked(nil)
+    end,
     txn_begin = function()
       app.txn_begin()
     end,
@@ -158,7 +161,19 @@ function M.remove_connection(name)
   require('dblens.ui.form').remove(config.get(), name)
 end
 
---- A segment for the user's own statusline: connection, transaction and running state.
+--- Open the active connection for editing. The sanctioned write path; writes still confirm.
+function M.write_mode()
+  M.ensure_setup()
+  require('dblens.app').set_locked(false)
+end
+
+--- Lock the active connection: the server refuses every write again.
+function M.lock()
+  M.ensure_setup()
+  require('dblens.app').set_locked(true)
+end
+
+--- A segment for the user's own statusline: connection, mode, transaction and running state.
 ---@return string
 function M.statusline()
   local app = require('dblens.app')
@@ -166,10 +181,7 @@ function M.statusline()
   if not state or not state.session then
     return ''
   end
-  local parts = { state.session.spec.name }
-  if state.session:is_read_only() then
-    parts[#parts + 1] = 'read-only'
-  end
+  local parts = { state.session.spec.name, state.session:mode() }
   local txn = state.session.txn:label()
   if txn then
     parts[#parts + 1] = txn

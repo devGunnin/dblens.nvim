@@ -137,6 +137,9 @@ function M.load(options)
     if copy.read_only == nil then
       copy.read_only = options.safety.read_only_default
     end
+    -- Normalised here so every reader agrees. The connections file is hand-editable JSON, and a
+    -- truthy non-boolean used to read as "read-only" in the UI while enforcement saw `~= true`.
+    copy.read_only = copy.read_only ~= false
     seen[copy.name] = source
     specs[#specs + 1] = copy
   end

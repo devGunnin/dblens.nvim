@@ -293,14 +293,24 @@ describe('session: transactions are atomic or they are not applied', function()
     end)
   end)
 
-  it('refuses to commit on a read-only connection', function()
+  it('refuses to commit on a locked connection', function()
     h.with_fake_exec(ok_result, function(session_mod, calls)
       local session = queued_session(session_mod)
-      session.spec.read_only = true
+      -- `set_locked` refuses while a queue is pending (below); commit checks the mode itself.
+      session.locked = true
       local box = h.capture()
       session:commit(box.sink)
       eq(box[1], false)
       eq(#calls, 0)
+    end)
+  end)
+
+  it('refuses to lock while changes are queued, rather than stranding them', function()
+    h.with_fake_exec(ok_result, function(session_mod)
+      local session = queued_session(session_mod)
+      local ok, err = session:set_locked(true)
+      eq({ ok, session:is_read_only(), session.txn:count() }, { false, false, 2 })
+      neq(err, nil)
     end)
   end)
 end)

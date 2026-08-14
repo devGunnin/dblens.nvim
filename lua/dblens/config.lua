@@ -25,8 +25,9 @@ M.defaults = {
     confirm_destructive = true,
     --- Also gate non-destructive writes (INSERT/CREATE/...).
     confirm_write = false,
-    --- Applied to connections that do not set `read_only` themselves.
-    read_only_default = false,
+    --- Applied to connections that do not set `read_only` themselves. Locked by default: a
+    --- connection you have not thought about should not be one you can write to by accident.
+    read_only_default = true,
   },
 
   history = { enabled = true, max_entries = 500 },

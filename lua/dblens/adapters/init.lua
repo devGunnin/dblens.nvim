@@ -13,6 +13,7 @@
 ---@field validate fun(spec: dblens.ConnectionSpec): string?
 ---@field describe fun(spec: dblens.ConnectionSpec): string
 ---@field command fun(spec, secret: string?, mode: 'records'|'raw', clients: table): { argv: string[], env: table? }
+---@field read_only_script fun(statement: string): string  -- what a read_only run sends on stdin
 ---@field decode fun(stdout: string, opts: table?): dblens.ResultSet
 ---@field estimate nil|fun(statement: string): { sql: string, mode: string, parse: fun(decoded, raw): integer? }
 ---@field sql table

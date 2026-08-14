@@ -47,6 +47,14 @@ command('DbLensRemove', function(args)
   require('dblens').remove_connection(args.args)
 end, { nargs = 1, complete = complete_connections, desc = 'Remove a dblens connection' })
 
+command('DbLensWrite', function()
+  require('dblens').write_mode()
+end, { desc = 'Open the active dblens connection for editing' })
+
+command('DbLensLock', function()
+  require('dblens').lock()
+end, { desc = 'Lock the active dblens connection read-only' })
+
 command('DbLensRestore', function()
   require('dblens').restore()
 end, { desc = 'Reopen the last dblens session' })

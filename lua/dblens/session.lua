@@ -4,19 +4,28 @@
 --- write, a committed batch — goes through `Session:run`, and `run` puts every one of them
 --- through `Session:gate` first.
 ---
---- The gate is NOT what makes a read-only connection read-only. That is enforced by the SERVER:
---- `adapter.command` opens a read-only connection (sqlite `-readonly`, postgres
---- `default_transaction_read_only`, mysql `SET SESSION TRANSACTION READ ONLY`) whenever
---- `spec.read_only` is set, so the engine refuses writes however the statement is spelled. Three
---- adversarial reviews defeated a Lua reimplementation of five dialects' lexers; the server's own
---- parser is the only one that cannot disagree with itself.
+--- A connection is LOCKED or in EDIT mode, and `Session.locked` is the only thing that says
+--- which. It starts from the spec (locked unless `read_only = false`) and `set_locked` flips it
+--- at runtime, so unlocking is an explicit user action rather than a hole in the gate.
+---
+--- The gate is NOT what makes a LOCKED connection read-only. That is enforced by the SERVER,
+--- in two layers, for as long as the connection is locked:
+---  * the run is sent inside a read-only TRANSACTION (`adapter.read_only_script`), which no `SET`
+---    in the same run can escape — sqlite needs none, its `-readonly` is the file open mode;
+---  * the connection itself is opened read-only (`adapter.command`), so a transaction the script
+---    opens for ITSELF is read-only too.
+--- Three adversarial reviews defeated a Lua reimplementation of five dialects' lexers; the
+--- server's own parser is the only one that cannot disagree with itself.
 ---
 --- What the gate does own:
 ---  * client meta-commands (`.shell`, `\!`, mysql `system`/`source`) — these run on THIS machine,
 ---    so no connection setting covers them and the refusal is unconditional;
 ---  * the destructive-change confirmation, and refusing a write on a read-only connection early
----    so the user gets "connection X is read-only" instead of a server error.
---- Classification is best-effort for those two jobs: a miss costs a prompt, not a table.
+---    so the user gets "connection X is read-only" instead of a server error;
+---  * on postgres/mysql only, the last statement class the server cannot stop: one that ENDS or
+---    REPLACES dblens's read-only transaction (`COMMIT`, `ROLLBACK`, `START TRANSACTION READ
+---    WRITE`) and writes in a new one. That needs a second top-level statement, and a script of
+---    more than one statement never classifies as a read.
 local adapters = require('dblens.adapters')
 local catalog = require('dblens.catalog')
 local connections = require('dblens.connections')
@@ -56,12 +65,52 @@ function M.new(spec, options)
     secret = nil,
     connected = false,
     jobs = {},
+    -- Runtime mode, and the ONLY source of truth for it. Locked unless the spec opted out, so a
+    -- missing, misspelt or non-boolean `read_only` opens locked rather than silently writable.
+    locked = spec.read_only ~= false,
   }, Session),
     nil
 end
 
 function Session:is_read_only()
-  return self.spec.read_only == true
+  return self.locked == true
+end
+
+--- The one label for the connection's mode. LOCKED means the server refuses every write.
+---@return 'LOCKED'|'EDIT'
+function Session:mode()
+  return self:is_read_only() and 'LOCKED' or 'EDIT'
+end
+
+--- Flip between LOCKED and EDIT.
+---
+--- Unlocking is an explicit user action and the only way to write; it does not clear the
+--- destructive-change confirmation. Locking is refused while changes are queued, because a
+--- locked connection cannot commit them and dropping them would discard the user's work.
+---@param locked boolean
+---@return boolean ok, string? error
+function Session:set_locked(locked)
+  assert(type(locked) == 'boolean', 'session:set_locked: locked must be a boolean')
+  local queued = self.txn:count()
+  if locked and queued > 0 then
+    return false,
+      ('%d queued change(s) would be stranded: commit or roll back before locking'):format(queued)
+  end
+  self.locked = locked
+  assert(self:is_read_only() == locked, 'session:set_locked: mode did not take')
+  return true, nil
+end
+
+--- The connection as the CLIENT must see it right now.
+---
+--- `adapter.command` reads `read_only` off the spec to pick the argv/env switch, and the runtime
+--- lock — not the stored spec — decides it, so a toggle changes what the next run spawns with.
+---@return dblens.ConnectionSpec
+function Session:client_spec()
+  if self.spec.read_only == self.locked then
+    return self.spec
+  end
+  return vim.tbl_extend('force', self.spec, { read_only = self.locked })
 end
 
 function Session:describe()
@@ -164,6 +213,29 @@ function Session:gate(statement, approval)
   return refusal, info
 end
 
+--- What a run puts on the client's stdin.
+---
+--- On a read-only connection that is the adapter's read-only script, not the bare statement: the
+--- server-side read-only TRANSACTION it opens is what makes read-only a guarantee rather than a
+--- session setting the same run could turn off. A writable connection sends the statement as-is,
+--- so the transaction the commit path builds for itself is never wrapped twice.
+---@param statement string
+---@return string
+function Session:stdin_for(statement)
+  assert(type(statement) == 'string' and statement ~= '', 'session:stdin_for: needs a statement')
+  if not self:is_read_only() then
+    return statement
+  end
+  local wrap = self.adapter.read_only_script
+  assert(type(wrap) == 'function', 'session:stdin_for: adapter cannot open a read-only run')
+  local script = wrap(statement)
+  assert(
+    type(script) == 'string' and script:find(statement, 1, true) ~= nil,
+    'session:stdin_for: the read-only script must carry the statement'
+  )
+  return script
+end
+
 --- Run one statement, through the gate.
 ---
 --- `opts.mode` selects the record protocol ('records', the default) or the client's plain text
@@ -185,7 +257,8 @@ function Session:run(statement, opts, on_done)
   local is_write = info.write
 
   local mode = opts.mode or 'records'
-  local command = self.adapter.command(self.spec, self.secret, mode, self.options.clients)
+  local command = self.adapter.command(self:client_spec(), self.secret, mode, self.options.clients)
+  local stdin = self:stdin_for(statement)
 
   -- The handle is registered BEFORE the process starts, so `cancel_all` can never miss a job
   -- that called back before `exec.run` returned.
@@ -200,7 +273,7 @@ function Session:run(statement, opts, on_done)
   local job = exec.run({
     argv = command.argv,
     env = command.env,
-    stdin = statement,
+    stdin = stdin,
     timeout_ms = opts.timeout_ms or self.options.timeout_ms,
     max_bytes = self.options.max_bytes,
   }, function(result)

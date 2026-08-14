@@ -57,9 +57,9 @@ end
 
 --- The password goes through MYSQL_PWD, never argv, which would expose it in the process list.
 ---
---- A read-only connection starts every statement in a read-only transaction, so the server
---- itself answers ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION to writes and DDL alike — including
---- ones smuggled past this plugin's lexer through `/*!…*/` or a backslash-escaped literal.
+--- A read-only connection makes READ ONLY the session's transaction default, so a transaction
+--- the script opens for itself is read-only too. It is the BACKUP; the guarantee is the read-only
+--- transaction `read_only_script` wraps the run in.
 ---
 --- `--local-infile=0` blocks `LOAD DATA LOCAL INFILE`, which reads a file on THIS machine. There
 --- is no client flag that disables `system`/`source` (`--skip-named-commands` still honours them
@@ -84,6 +84,25 @@ function M.command(spec, secret, mode, clients)
 
   local env = secret and { MYSQL_PWD = secret } or nil
   return { argv = argv, env = env }
+end
+
+--- The script a read-only run actually sends.
+---
+--- An open READ ONLY transaction cannot be talked out of itself: `SET SESSION TRANSACTION READ
+--- WRITE` retargets only later transactions and the write still comes back ER_CANT_EXECUTE_IN_
+--- READ_ONLY_TRANSACTION (1792), and `SET TRANSACTION READ WRITE` is refused outright with
+--- ER_CANT_CHANGE_TX_CHARACTERISTICS (1568). Both verified live on 8.4.
+---
+--- The bare `;` before COMMIT terminates a statement that did not terminate itself; the client
+--- ignores the empty statement it makes when the caller already ended with one.
+---@param statement string
+---@return string
+function M.read_only_script(statement)
+  assert(
+    type(statement) == 'string' and statement ~= '',
+    'mysql.read_only_script: needs a statement'
+  )
+  return 'START TRANSACTION READ ONLY;\n' .. statement .. '\n;\nCOMMIT;\n'
 end
 
 local ENTITIES = { amp = '&', lt = '<', gt = '>', quot = '"', apos = "'" }
