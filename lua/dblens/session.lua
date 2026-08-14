@@ -8,24 +8,20 @@
 --- which. It starts from the spec (locked unless `read_only = false`) and `set_locked` flips it
 --- at runtime, so unlocking is an explicit user action rather than a hole in the gate.
 ---
---- The gate is NOT what makes a LOCKED connection read-only. That is enforced by the SERVER,
---- in two layers, for as long as the connection is locked:
----  * the run is sent inside a read-only TRANSACTION (`adapter.read_only_script`), which no `SET`
----    in the same run can escape — sqlite needs none, its `-readonly` is the file open mode;
----  * the connection itself is opened read-only (`adapter.command`), so a transaction the script
----    opens for ITSELF is read-only too.
---- Three adversarial reviews defeated a Lua reimplementation of five dialects' lexers; the
---- server's own parser is the only one that cannot disagree with itself.
+--- What makes a LOCKED connection read-only is TWO things, and neither is the classifier:
+---  * the SERVER — the run is sent inside a read-only TRANSACTION (`adapter.read_only_script`)
+---    over a connection opened read-only (`adapter.command`). No `SET` in the same run escapes
+---    it; sqlite needs none, its `-readonly` is the file open mode. That holds for ONE statement.
+---  * the ONE-STATEMENT rule — postgres and mysql let a SECOND statement end or replace that
+---    transaction and write in a fresh one, so a locked connection refuses any input
+---    `sql.single_statement_problem` cannot prove is exactly one. It is a byte scan, so unlike
+---    the four lexer generations before it there is no dialect it can be wrong about.
 ---
---- What the gate does own:
+--- What the gate additionally owns:
 ---  * client meta-commands (`.shell`, `\!`, mysql `system`/`source`) — these run on THIS machine,
 ---    so no connection setting covers them and the refusal is unconditional;
 ---  * the destructive-change confirmation, and refusing a write on a read-only connection early
----    so the user gets "connection X is read-only" instead of a server error;
----  * on postgres/mysql only, the last statement class the server cannot stop: one that ENDS or
----    REPLACES dblens's read-only transaction (`COMMIT`, `ROLLBACK`, `START TRANSACTION READ
----    WRITE`) and writes in a new one. That needs a second top-level statement, and a script of
----    more than one statement never classifies as a read.
+---    so the user gets "connection X is read-only" instead of a server error.
 local adapters = require('dblens.adapters')
 local catalog = require('dblens.catalog')
 local connections = require('dblens.connections')
@@ -185,6 +181,17 @@ local function refused(message, on_done)
   }
 end
 
+--- Tell the user why a LOCKED connection will not run this, and how to run it anyway.
+---@param name string
+---@param problem string
+---@return string
+local function multi_statement_refusal(name, problem)
+  return (
+    'connection `%s` is LOCKED, so it runs one statement at a time: found %s. '
+    .. 'Unlock with `:DbLensWrite` (<leader>dw) to run more than one; writes still ask first.'
+  ):format(name, problem)
+end
+
 --- The one gate. Returns a refusal message, or nil when the statement may be sent.
 ---
 --- `approval` is produced only by a caller that has already been through `refuse_write`
@@ -197,6 +204,15 @@ function Session:gate(statement, approval)
   assert(type(statement) == 'string', 'session:gate: expected a statement')
   local dialect = self.adapter.dialect
   local info = sqlmod.classify(statement, dialect)
+  if self:is_read_only() then
+    -- Checked BEFORE the classification is trusted, and without consulting it: the read-only
+    -- transaction makes ONE statement unescapable, so a locked connection refuses everything it
+    -- cannot prove is one. That leaves the classifier nothing to be wrong about.
+    local framing = sqlmod.single_statement_problem(statement)
+    if framing then
+      return multi_statement_refusal(self.spec.name, framing), info
+    end
+  end
   local meta = sqlmod.client_meta_problem(statement, dialect)
   if meta then
     -- Not SQL at all, so no connection setting covers it: `\!`, `.shell` and mysql's `system`
@@ -226,6 +242,14 @@ function Session:stdin_for(statement)
   if not self:is_read_only() then
     return statement
   end
+  -- The wrap only guarantees read-only for ONE statement, so this is the invariant `gate` exists
+  -- to hold. Asserted here too: a future caller that reaches the client without the gate must
+  -- fail loudly rather than send an unprovable script.
+  local framing = sqlmod.single_statement_problem(statement)
+  assert(
+    framing == nil,
+    'session:stdin_for: a locked run must be one statement: ' .. tostring(framing)
+  )
   local wrap = self.adapter.read_only_script
   assert(type(wrap) == 'function', 'session:stdin_for: adapter cannot open a read-only run')
   local script = wrap(statement)

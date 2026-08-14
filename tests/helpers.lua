@@ -217,6 +217,38 @@ function M.fake_session(session_mod, spec, overrides)
   return session
 end
 
+--- The client each adapter drives by default.
+M.CLIENTS = { sqlite = 'sqlite3', postgres = 'psql', mysql = 'mysql' }
+
+--- A live server, described entirely by environment so the suite stays green without one.
+---
+--- `DBLENS_TEST_<KIND>_PORT` is what turns a live case on; `_HOST`, `_USER`, `_PASSWORD`, `_DB`
+--- and `_CLIENT` fill in the rest.
+---@param kind 'postgres'|'mysql'
+---@return { spec: table, secret: string?, clients: table }?
+function M.live_target(kind)
+  assert(type(kind) == 'string' and kind ~= '', 'helpers.live_target: expected a kind')
+  local prefix = 'DBLENS_TEST_' .. kind:upper()
+  local port = tonumber(vim.env[prefix .. '_PORT'] or '')
+  if not port then
+    return nil
+  end
+  local clients = vim.tbl_extend('force', M.CLIENTS, {})
+  clients[kind] = vim.env[prefix .. '_CLIENT'] or M.CLIENTS[kind]
+  return {
+    spec = {
+      name = 'live',
+      kind = kind,
+      host = vim.env[prefix .. '_HOST'] or '127.0.0.1',
+      port = port,
+      user = vim.env[prefix .. '_USER'],
+      database = vim.env[prefix .. '_DB'] or 'app',
+    },
+    secret = vim.env[prefix .. '_PASSWORD'],
+    clients = clients,
+  }
+end
+
 --- The single value a synchronous callback was handed, or an explicit "never called" marker.
 ---@return table  -- { called = boolean, [1] = ..., [2] = ... }
 function M.capture()

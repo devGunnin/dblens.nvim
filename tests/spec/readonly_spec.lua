@@ -2,9 +2,11 @@
 --- by sending a write to a real database over a real locked connection and observing that
 --- nothing changed.
 ---
---- Three adversarial reviews defeated the Lua classifier — nested block comments, MySQL
---- executable comments, backslash escaping under NO_BACKSLASH_ESCAPES, client meta-commands —
---- because dblens's lexer and the server's parse differently and every divergence is a bypass.
+--- Four adversarial reviews defeated the Lua classifier — nested block comments, MySQL executable
+--- comments, backslash escaping under NO_BACKSLASH_ESCAPES, client meta-commands, and a bare `\r`
+--- that ends a psql comment — because dblens's lexer and the server's parse differently and every
+--- divergence is a bypass. The one-statement rule that closes that class is in
+--- `single_statement_spec.lua`.
 --- So the cases below DELIBERATELY skip `Session:gate`: a test that asks the classifier first
 --- proves nothing about what protects a user from the divergence nobody has found yet.
 ---
@@ -392,29 +394,7 @@ local FLIPS = {
   },
 }
 
---- A live server, described entirely by environment so the suite stays green without one.
----@return { spec: table, secret: string?, clients: table }?
-local function live_target(kind)
-  local prefix = 'DBLENS_TEST_' .. kind:upper()
-  local port = tonumber(vim.env[prefix .. '_PORT'] or '')
-  if not port then
-    return nil
-  end
-  local clients = vim.tbl_extend('force', CLIENTS, {})
-  clients[kind] = vim.env[prefix .. '_CLIENT'] or CLIENTS[kind]
-  return {
-    spec = {
-      name = 'live',
-      kind = kind,
-      host = vim.env[prefix .. '_HOST'] or '127.0.0.1',
-      port = port,
-      user = vim.env[prefix .. '_USER'],
-      database = vim.env[prefix .. '_DB'] or 'app',
-    },
-    secret = vim.env[prefix .. '_PASSWORD'],
-    clients = clients,
-  }
-end
+local live_target = h.live_target
 
 --- A real `dblens.session.Session` in the requested mode. The spec is untouched: `set_locked`
 --- is the runtime toggle a user reaches through `:DbLensWrite` / `:DbLensLock`.
@@ -429,13 +409,16 @@ end
 
 --- Send `statement` the way `Session:run` would: the argv the session's mode picks, and the
 --- stdin it composes. Synchronous, so the assertion can go and read the server afterwards.
+---
+--- The wrap is built from the adapter rather than `Session:stdin_for`, which asserts a locked run
+--- is one statement. These cases deliberately skip the gate to test the SERVER, and several of
+--- them are multi-statement on purpose.
 local function send(target, locked, statement)
   local session = live_session(target, locked)
   local command =
     session.adapter.command(session:client_spec(), session.secret, 'records', target.clients)
-  return vim
-    .system(command.argv, { env = command.env, stdin = session:stdin_for(statement) })
-    :wait(60000)
+  local stdin = locked and session.adapter.read_only_script(statement) or statement
+  return vim.system(command.argv, { env = command.env, stdin = stdin }):wait(60000)
 end
 
 --- Rows in `victim`, read over a writable connection so the count is the server's own.
@@ -652,8 +635,13 @@ describe('the statements that can still leave the read-only transaction', functi
         vim.tbl_extend('force', MECHANISM[kind].spec, { read_only = true })
       )
       for _, payload in ipairs(payloads) do
-        eq(session:gate(payload), 'connection `test` is read-only', {
-          fail_reason = ('%s: `%s` reached the client'):format(kind, payload),
+        local refusal = session:gate(payload)
+        eq(refusal ~= nil and refusal:find('one statement at a time', 1, true) ~= nil, true, {
+          fail_reason = ('%s: `%s` reached the client (got %s)'):format(
+            kind,
+            payload,
+            tostring(refusal)
+          ),
         })
       end
     end

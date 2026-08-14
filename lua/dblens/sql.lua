@@ -5,12 +5,10 @@
 --- code-only view and `strip()` is the blank-the-opaque-spans view. Both exist so that no
 --- later scan for a keyword or a `;` can be fooled by text inside a string or a comment.
 ---
---- This module is BEST-EFFORT, and on postgres/mysql it is still SECURITY-RELEVANT. A read-only
---- run is sent inside a server-side read-only TRANSACTION, which no `SET` can escape — but a
---- statement that ENDS or REPLACES that transaction (`COMMIT`, `ROLLBACK`, `START TRANSACTION
---- READ WRITE`) can, and the only thing that stops one is classifying the script as a write.
---- That takes a second top-level `;`, so every divergence about where a statement ENDS is a
---- potential bypass. Only sqlite's `-readonly` open mode needs no help from here.
+--- Classification here is BEST-EFFORT UX: it decides whether to prompt, not whether a write is
+--- allowed. What a LOCKED connection is allowed to send is decided by `single_statement_problem`
+--- below, which is a byte scan rather than a lexer — precisely because this lexer and a server's
+--- can disagree, and every disagreement about where a statement ENDS was a bypass.
 local M = {}
 
 --- The `backtick`/`bracket` flags say what the lexer must RECOGNISE; `ident_quote` says what we
@@ -104,8 +102,71 @@ M.dialects.permissive = {
 ---@field value string? -- unquoted name for `ident`, decoded body for `string`
 ---@field closed boolean? -- for `string`/`ident`: false when the input ended before the delimiter
 
+--- Bytes that end a line — and so a `--`/`#` comment — in SOME client we drive. Only `\n` is
+--- universal; psql ends a comment at a bare `\r` too. The rest are here because ending a comment
+--- EARLY is the fail-safe direction: it exposes hidden code instead of swallowing it.
+local EOL_BYTE = '[%z\1-\8\10-\31\127]'
+
+--- Unicode line/paragraph separators, as UTF-8. Lua patterns are byte-oriented, so these are
+--- matched as plain substrings.
+local EOL_SEQUENCE = {
+  { name = 'U+0085', text = '\194\133' },
+  { name = 'U+2028', text = '\226\128\168' },
+  { name = 'U+2029', text = '\226\128\169' },
+}
+
 local function find_eol(sql, i)
-  return (sql:find('\n', i, true) or #sql + 1) - 1
+  local at = sql:find(EOL_BYTE, i)
+  for _, sep in ipairs(EOL_SEQUENCE) do
+    local found = sql:find(sep.text, i, true)
+    if found and (not at or found < at) then
+      at = found
+    end
+  end
+  return (at or #sql + 1) - 1
+end
+
+--- Names for the control bytes a user is most likely to have pasted in by accident, so the
+--- refusal reads as something they can fix.
+local CONTROL_NAME = {
+  [0] = 'a NUL byte',
+  [11] = 'a vertical tab',
+  [12] = 'a form feed',
+  [13] = 'a carriage return',
+}
+
+--- Why `text` is not provably EXACTLY ONE statement, whatever client reads it.
+---
+--- Deliberately NOT a lexer: a lexer is what four adversarial reviews defeated, because dblens's
+--- and the server's disagree about where a statement ends and the gap is a bypass. This is a byte
+--- scan for the only framing that can start a second top-level statement in psql, mysql or
+--- sqlite3 — a `;` that is not the final character, a control byte a client may read as a line
+--- break, or a Unicode line separator. Unknown framing counts as multiple.
+---@param text string
+---@return string? problem  -- nil when the input is provably one statement
+function M.single_statement_problem(text)
+  assert(type(text) == 'string', 'sql.single_statement_problem: expected string')
+  -- Only space, tab and newline are trimmed: no client we drive treats one as a statement
+  -- terminator, so trimming them cannot hide one. Every other framing byte stays and is reported.
+  local body = text:gsub('^[ \t\n]+', ''):gsub('[ \t\n]+$', '')
+  local control = body:find('[%z\1-\8\11-\31\127]')
+  if control then
+    local byte = body:byte(control)
+    return ('%s (0x%02X), which a client may read as a line break'):format(
+      CONTROL_NAME[byte] or 'a control character',
+      byte
+    )
+  end
+  for _, sep in ipairs(EOL_SEQUENCE) do
+    if body:find(sep.text, 1, true) then
+      return ('a Unicode line separator (%s)'):format(sep.name)
+    end
+  end
+  local semicolon = body:find(';', 1, true)
+  if semicolon and semicolon < #body then
+    return 'a `;` that is not the final character, so a second statement can follow it'
+  end
+  return nil
 end
 
 --- End offset of the block comment opened at `i`.
