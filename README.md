@@ -67,7 +67,8 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 **Safety**
 
-- Per-connection `read_only`, refused at the session, not in the UI.
+- Per-connection `read_only`, enforced by the server: the connection is opened read-only
+  (`sqlite3 -readonly`, `default_transaction_read_only`, `SET SESSION TRANSACTION READ ONLY`).
 - Confirmation gate for destructive statements (on by default), optionally for all writes.
 - Row-targeted edits carry a `count(*)` guard that must return exactly 1.
 - Planner row estimate shown before a single destructive ad-hoc statement, where the adapter
@@ -327,33 +328,59 @@ Every binding is declared in one table and can be remapped or disabled per scope
 
 ## Safety model
 
-**One gate.** Every statement dblens sends — a browsed page, a filter, ad-hoc editor SQL,
-`EXPLAIN`, a cell edit, a committed batch — goes through `Session:run`, which puts it through
-`Session:gate` before a client process exists. Read-only, the confirmation requirement and the
-refusal of client meta-commands are enforced there, not in whichever part of the UI asked.
+**Read-only is enforced by the database server, not by dblens.** A connection with
+`read_only = true` (or every connection, with `safety.read_only_default = true`) is *opened*
+read-only, so the engine itself refuses every write, however the statement is spelled:
 
-**The read proof fails closed.** A statement counts as a read only when dblens can *prove* it
-is one: a single statement led by `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `DESCRIBE`, a
-reporting `PRAGMA`, or an `EXPLAIN` that does not `ANALYZE`; with no write verb anywhere in it,
-no `INTO`/`OUTFILE` redirect, no stacked second statement and no punctuation outside the set
-that appears in real SQL operators. **Everything else is treated as a write**, including verbs
-dblens does not recognise. So `WITH d AS (DELETE …) SELECT …`, `COPY … FROM PROGRAM`,
-`DO $$ … $$`, `CALL`, `SELECT … INTO`, `PRAGMA user_version = 42` and `SELECT 1; DROP TABLE t`
-are all writes, and all refused on a read-only connection.
+| | how the connection is opened |
+| --- | --- |
+| SQLite | `sqlite3 -readonly` — the file handle is read-only, so a write answers `attempt to write a readonly database` |
+| PostgreSQL | `PGOPTIONS=-c default_transaction_read_only=on` — a write answers `cannot execute … in a read-only transaction` |
+| MySQL / MariaDB | `--init-command=SET SESSION TRANSACTION READ ONLY` — a write answers `ERROR 1792 … Cannot execute statement in a READ ONLY transaction` |
+
+This is the guarantee because the alternative is not one. dblens used to decide read-only by
+lexing the SQL itself, and three independent reviews broke it — nested block comments (`/* /* */`
+closes the comment everywhere except PostgreSQL), MySQL's executable `/*!…*/` comments, and
+backslash escaping, which depends on the server's `sql_mode` rather than on the dialect. A Lua
+reimplementation of five dialects' lexers will always disagree with the real parser somewhere,
+and every disagreement is a bypass. The server's own parser cannot disagree with itself.
+
+Reads are unaffected: `SELECT`, `EXPLAIN`, catalog queries and paging all work normally on a
+read-only connection.
+
+**The classifier decides whether you are asked, not whether it is allowed.** dblens still reads
+the statement to work out whether it is a write and whether it is destructive, and that is what
+drives the confirmation prompt and the early "connection X is read-only" message. It is
+best-effort: a miss now costs a prompt on a writable connection, not a table. It is still biased
+closed — a single statement led by `SELECT`, `WITH`, `VALUES`, `TABLE`, `SHOW`, `DESCRIBE`, a
+reporting `PRAGMA` or a non-`ANALYZE` `EXPLAIN` counts as a read, and anything else is a write —
+so `WITH d AS (DELETE …) SELECT …`, `COPY … FROM PROGRAM`, `DO $$ … $$`, `CALL`, `SELECT … INTO`,
+`PRAGMA user_version = 42` and `SELECT 1; DROP TABLE t` all prompt.
+
+Where a write verb is a *name* it is left alone: `SELECT REPLACE(a,'x','y')`, `SELECT TRUNCATE(x,2)`,
+a column called `comment` and an unquoted non-ASCII identifier are ordinary reads. A write verb
+only counts when it sits where a nested statement could begin.
 
 `EXPLAIN ANALYZE` is classified by the statement *inside* it, because on PostgreSQL and MySQL it
-**runs** that statement. `EXPLAIN ANALYZE DELETE …` is therefore a destructive write: refused on
-a read-only connection, and gated by the destructive confirmation elsewhere, with the float
-saying plainly that it will run. Plain `EXPLAIN` only plans, and stays a read.
+**runs** that statement — as are `DESCRIBE ANALYZE` and `DESC ANALYZE`, which are MySQL synonyms
+for it. `EXPLAIN ANALYZE DELETE …` is therefore a destructive write, with the float saying
+plainly that it will run. Plain `EXPLAIN` only plans, and stays a read.
 
 **Client meta-commands never reach a client.** `psql` runs `\!` as a shell command in the middle
-of a statement, and `sqlite3 -batch` still honours `.shell`. Neither is SQL, so no connection
-flag covers them; the gate refuses any statement starting with `.` or containing an unquoted
-`\`, on every connection. sqlite3 is additionally run with `-safe`, which refuses `.shell`,
-`.load`, `.import` and `ATTACH` at the client.
+of a statement, `sqlite3 -batch` honours `.shell`, and the `mysql` client honours a bare `system`
+or `source` at the head of a line even in batch mode — `system` shells out and `source` reads and
+executes a file on *your* machine. None of these is SQL, so a read-only connection does not touch
+them and no client flag turns them off (`--skip-named-commands` still honours them at the head of
+a line). dblens refuses them itself, on every connection: a statement starting with `.`, an
+unquoted `\`, or a line beginning `system`/`source`/`tee`/`pager`/`edit`/`connect`/`delimiter`.
+A column with one of those names can still be used by quoting it. sqlite3 is additionally run
+with `-safe`, MySQL with `--local-infile=0`.
 
-**Read-only connections.** A connection with `read_only = true` (or every connection, with
-`safety.read_only_default = true`) refuses every write and every commit, naming the connection.
+**What server-side read-only does not cover.** A statement that explicitly turns the setting off
+(`SET default_transaction_read_only = off`, `SET SESSION TRANSACTION READ WRITE`) would restore
+write access — `SET` is classified as a write, so it is refused on a read-only connection before
+it is sent. That pairing is the point: the classifier catches the statement that names the
+setting, the server catches the statement that outwitted the classifier.
 
 **The confirm gate.** `UPDATE`, `DELETE`, `REPLACE`, `MERGE`, `DROP`, `TRUNCATE`, `ALTER`,
 `RENAME`, `GRANT` and `REVOKE` are destructive; other writes are not. With
@@ -383,15 +410,19 @@ batch. Outside a transaction the guard and the write are still two separate clie
 so a concurrent writer between them is not excluded — the guard bounds mistakes, not races.
 
 **Connection paths are never shell-evaluated.** A `path` is expanded with `~` and `$VAR`
-substitution only. A backtick, a wildcard or a leading `-` is rejected when the connection is
-validated, so a hostile shared `connections.json` cannot run a command by being opened.
+substitution only. A backtick, a wildcard, `$(`, a `~user` form dblens cannot expand correctly,
+or a leading `-` is rejected when the connection is validated, and always as a reported error
+rather than a raise, so a bad `connections.json` names its problem instead of taking `:DbLens`
+down. `password_cmd` is the one field of a connection that is a command by declaration: it is
+argv run with no shell, and it is checked only for being a runnable argv.
 
 **Filters are vetted by an allow-list.** A `WHERE` typed into the results filter is checked
-before it is spliced into a statement. Rejected: any write verb, a comment (which would comment
-out the `LIMIT`/`OFFSET` appended after it), a backslash, an unclosed quote, and any punctuation
-outside the SQL operator set — which drops `;` and `\` together. A column named after a SQL verb
-can still be filtered on by quoting it. The filter bar is still raw SQL: the check stops it
-escaping the statement, it does not stop an expensive or volatile function call.
+before it is spliced into a statement. Rejected: a comment (which would comment out the
+`LIMIT`/`OFFSET` appended after it), a backslash, an unclosed quote, any punctuation outside the
+SQL operator set — which drops `;` and `\` together — and a write verb where a nested statement
+could begin. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
+column named after a SQL verb can also be quoted. The filter bar is still raw SQL: the check
+stops it escaping the statement, it does not stop an expensive or volatile function call.
 
 ## Transactions
 
