@@ -67,10 +67,20 @@ function M.fit(segments, width)
   return out
 end
 
+--- Draw the winbar, or clear it when `ui.winbar` is off.
+---
+--- The option has to be honoured HERE: clearing it once at window setup was undone by the next
+--- render, so switching it off did nothing.
 ---@param win integer
 ---@param segments dblens.Segment[]
-function M.set(win, segments)
+---@param options table  resolved config
+function M.set(win, segments, options)
+  assert(type(options) == 'table' and options.ui, 'status.set: needs resolved options')
   if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  if not options.ui.winbar then
+    vim.wo[win].winbar = ''
     return
   end
   local width = vim.api.nvim_win_get_width(win)

@@ -223,11 +223,16 @@ M.specs = {
 --- An override of `false` disables the binding. An unknown action name is an error rather than a
 --- silent no-op, because a typo there is otherwise invisible.
 ---@param scope string
----@param overrides table<string, string|string[]|false>?
+---@param overrides table<string, string|string[]|false>|false|nil  -- false disables the scope
 ---@return { spec: dblens.KeySpec, lhs: string[] }[]
 function M.resolve(scope, overrides)
   local specs = M.specs[scope]
   assert(specs, ('keymaps.resolve: unknown scope `%s`'):format(tostring(scope)))
+  if overrides == false then
+    -- Whole-scope opt-out. `<leader>d` in particular is contended, and turning the ten global
+    -- maps off one action at a time is not a real escape hatch.
+    return {}
+  end
   overrides = overrides or {}
 
   local known = {}

@@ -33,11 +33,12 @@ function M.blocks(scope, options)
 end
 
 --- Render blocks into lines, recording which lines are headings.
+---@param spacer boolean  -- keep the blank line between blocks
 ---@return string[] lines, table<integer, boolean> heading_lines (0-based)
-local function render_column(blocks)
+local function render_column(blocks, spacer)
   local lines, headings = {}, {}
   for _, block in ipairs(blocks) do
-    if #lines > 0 then
+    if spacer and #lines > 0 then
       lines[#lines + 1] = ''
     end
     headings[#lines] = true
@@ -49,48 +50,35 @@ local function render_column(blocks)
   return lines, headings
 end
 
-local function height_of(blocks)
-  local total = 0
-  for index, block in ipairs(blocks) do
-    total = total + #block.rows + 1 + (index > 1 and 1 or 0)
-  end
-  return total
-end
-
---- Split blocks into two balanced columns, keeping declaration order down each column.
-local function split_blocks(blocks)
-  local target, running, at = height_of(blocks) / 2, 0, #blocks
-  for index, block in ipairs(blocks) do
-    running = running + #block.rows + 2
-    if running >= target then
-      at = index
-      break
+--- The cut that leaves the two columns as even as possible. The previous rule walked to the
+--- first block past half the total height, which for six blocks left one column two rows longer
+--- than the screen even though a better cut fitted.
+---@return dblens.HelpBlock[] left, dblens.HelpBlock[] right
+local function split_blocks(blocks, spacer)
+  local best, best_cost = 1, math.huge
+  for at = 1, #blocks - 1 do
+    local left, right = {}, {}
+    for index, block in ipairs(blocks) do
+      table.insert(index <= at and left or right, block)
+    end
+    local cost = math.max(#render_column(left, spacer), #render_column(right, spacer))
+    if cost < best_cost then
+      best, best_cost = at, cost
     end
   end
   local left, right = {}, {}
   for index, block in ipairs(blocks) do
-    table.insert(index <= at and left or right, block)
+    table.insert(index <= best and left or right, block)
   end
   return left, right
 end
 
---- Lay blocks out in one or two columns depending on the space available.
----@return string[] lines, table<integer, boolean> heading_lines
-function M.layout(blocks, available_height)
-  local single, headings = render_column(blocks)
-  if #single <= available_height or #blocks < 4 then
-    return single, headings
-  end
-
-  local left_blocks, right_blocks = split_blocks(blocks)
-  local left, left_headings = render_column(left_blocks)
-  local right, right_headings = render_column(right_blocks)
-
+--- Merge two rendered columns side by side.
+local function join_columns(left, left_headings, right, right_headings)
   local width = 0
   for _, line in ipairs(left) do
     width = math.max(width, vim.fn.strdisplaywidth(line))
   end
-
   local lines, merged = {}, {}
   for index = 1, math.max(#left, #right) do
     local a, b = left[index] or '', right[index] or ''
@@ -103,16 +91,68 @@ function M.layout(blocks, available_height)
   return lines, merged
 end
 
+local function two_columns(blocks, spacer)
+  local left_blocks, right_blocks = split_blocks(blocks, spacer)
+  local left, left_headings = render_column(left_blocks, spacer)
+  local right, right_headings = render_column(right_blocks, spacer)
+  return join_columns(left, left_headings, right, right_headings)
+end
+
+local function widest(lines)
+  local width = 0
+  for _, line in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(line))
+  end
+  return width
+end
+
+--- Lay blocks out in the space available, tightening until they fit.
+---
+--- A help panel whose last section is below the fold is worse than no help panel — and one whose
+--- descriptions are cut off at the right edge is no better, which is what two columns do on an
+--- 80-column terminal. So each candidate is checked against BOTH dimensions and the first that
+--- fits wins; when none does, the single narrow column is chosen, because a panel that scrolls
+--- down still shows every binding in full.
+---@param available_height integer
+---@param available_width integer?  -- unlimited when omitted
+---@return string[] lines, table<integer, boolean> heading_lines, boolean fits
+function M.layout(blocks, available_height, available_width)
+  assert(vim.islist(blocks), 'help.layout: expected a block list')
+  assert(type(available_height) == 'number', 'help.layout: needs the rows available')
+  local width_budget = available_width or math.huge
+
+  local candidates = {}
+  local function add(lines, headings)
+    candidates[#candidates + 1] = { lines = lines, headings = headings }
+  end
+  add(render_column(blocks, true))
+  if #blocks >= 2 then
+    add(two_columns(blocks, true))
+    add(two_columns(blocks, false))
+  end
+  add(render_column(blocks, false))
+
+  for _, candidate in ipairs(candidates) do
+    if #candidate.lines <= available_height and widest(candidate.lines) <= width_budget then
+      return candidate.lines, candidate.headings, true
+    end
+  end
+  local narrowest = candidates[#candidates]
+  return narrowest.lines, narrowest.headings, false
+end
+
 --- Show the overlay for the pane the user is in.
 ---@param state dblens.State
 ---@param scope 'sidebar'|'results'|'editor'
 function M.show(state, scope)
-  local available = math.floor(vim.o.lines * state.options.ui.float.max_height) - 2
-  local lines, headings = M.layout(M.blocks(scope, state.options), available)
+  local float_opts = state.options.ui.float
+  local rows = math.floor(vim.o.lines * float_opts.max_height) - 2
+  local columns = math.floor(vim.o.columns * float_opts.max_width) - 2
+  local lines, headings, fits = M.layout(M.blocks(scope, state.options), rows, columns)
 
   local popup = float.open(lines, state.options, {
     title = ('dblens - %s'):format(TITLE[scope] or scope),
-    footer = 'q close',
+    footer = fits and 'q close' or 'j/k scroll · q close',
     min_width = 46,
   })
 

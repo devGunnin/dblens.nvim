@@ -130,7 +130,7 @@ function M.render(state)
         text = session and session:is_read_only() and (icons.lock .. ' read-only') or '',
         hl = 'DbLensReadOnly',
       },
-    })
+    }, state.options)
   end
 end
 

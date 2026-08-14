@@ -131,6 +131,40 @@ local function default_paths(options)
   options.state_file = options.state_file or (data .. '/session.json')
 end
 
+--- A keymap scope is a table of action -> lhs overrides, or `false` to bind nothing in it.
+---
+--- `OPEN_PATHS` exempts these subtrees from the generic type check, so without this a
+--- `keymaps.global = false` passed validation and was then silently coerced back to the full
+--- default set, and `keymaps.results = 'x'` only failed much later inside a pane.
+local function validate_keymaps(keymaps)
+  for scope, overrides in pairs(keymaps) do
+    if overrides ~= false and type(overrides) ~= 'table' then
+      error(
+        ('dblens: option `keymaps.%s` expects a table or false, got %s'):format(
+          scope,
+          type(overrides)
+        ),
+        0
+      )
+    end
+    for action, lhs in pairs(type(overrides) == 'table' and overrides or {}) do
+      local shape = type(lhs)
+      if lhs ~= false and shape ~= 'string' and shape ~= 'table' then
+        error(
+          ('dblens: option `keymaps.%s.%s` expects a key, a list of keys or false, got %s'):format(
+            scope,
+            action,
+            shape
+          ),
+          0
+        )
+      end
+    end
+    -- Names the unknown action now rather than when the pane it belongs to is first opened.
+    require('dblens.keymaps').resolve(scope, overrides)
+  end
+end
+
 local function validate(options)
   positive_int(options, 'page_size')
   positive_int(options, 'max_rows')
@@ -150,6 +184,7 @@ local function validate(options)
   if options.ui.grid.max_col_width < 4 then
     error('dblens: option `ui.grid.max_col_width` must be at least 4', 0)
   end
+  validate_keymaps(options.keymaps)
 end
 
 --- Resolved options. Replaced wholesale by `setup`; never mutated in place, so a reader of

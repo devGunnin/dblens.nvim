@@ -130,7 +130,24 @@ function M.focus(layout, pane)
   return true
 end
 
+--- Drop every dblens window but one, for the case where closing the tabpage is not possible.
+local function collapse_windows(layout)
+  local wins = {}
+  for _, pane in ipairs(PANES) do
+    local win = layout.wins[pane]
+    if api.nvim_win_is_valid(win) then
+      wins[#wins + 1] = win
+    end
+  end
+  for index = 2, #wins do
+    pcall(api.nvim_win_close, wins[index], true)
+  end
+end
+
 --- Close the layout, restoring the user's windows by simply dropping the tabpage.
+---
+--- When dblens owns the only tabpage there is nothing to close back to, so the panes are
+--- collapsed to one window instead of leaving a three-way split of dead scratch buffers.
 function M.close(layout)
   if not layout then
     return
@@ -138,11 +155,12 @@ function M.close(layout)
   if api.nvim_tabpage_is_valid(layout.tabpage) then
     -- Leaving the tab first avoids a redraw into a half-closed layout.
     pcall(function()
-      local count = #api.nvim_list_tabpages()
-      if count > 1 then
+      if #api.nvim_list_tabpages() > 1 then
         api.nvim_set_current_tabpage(layout.tabpage)
         vim.cmd('tabclose')
+        return
       end
+      collapse_windows(layout)
     end)
   end
   for _, buf in pairs(layout.bufs) do

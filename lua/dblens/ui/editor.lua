@@ -88,7 +88,7 @@ function M.render(state)
   if state.busy then
     segments[#segments + 1] = { text = state.busy, hl = 'DbLensSpinner' }
   end
-  status.set(win, segments)
+  status.set(win, segments, state.options)
 end
 
 local function handlers(state, app)

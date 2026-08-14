@@ -150,7 +150,7 @@ function M.render_winbar(state)
   if state.spinner and state.spinner:is_running() then
     segments[#segments + 1] = { text = state.spinner:label(), hl = 'DbLensSpinner' }
   end
-  status.set(win, segments)
+  status.set(win, segments, state.options)
 end
 
 ---@class dblens.Cell

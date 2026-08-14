@@ -257,14 +257,18 @@ function M.confirm_script(state, statements, writes, on_confirm)
     return
   end
 
-  local destructive = {}
+  local destructive, analyzed = {}, false
   for _, info in ipairs(writes) do
     if info.destructive then
       destructive[#destructive + 1] = info
     end
+    analyzed = analyzed or info.explain_analyze == true
   end
-  local gate = #destructive > 0 and state.options.safety.confirm_destructive
-    or (#destructive == 0 and state.options.safety.confirm_write)
+  -- Per class, not per script: a script holding both an INSERT and a DROP used to take the
+  -- destructive branch alone, so switching confirm_destructive off skipped the INSERT's gate too.
+  local safety = state.options.safety
+  local gate = (#destructive > 0 and safety.confirm_destructive)
+    or (#writes > #destructive and safety.confirm_write)
   if not gate then
     on_confirm()
     return
@@ -288,6 +292,13 @@ function M.confirm_script(state, statements, writes, on_confirm)
   if #flagged > 0 then
     sections[#sections + 1] = { heading = 'destructive', lines = flagged, hl = 'DbLensError' }
   end
+  if analyzed then
+    sections[#sections + 1] = {
+      heading = 'EXPLAIN ANALYZE',
+      lines = { 'this RUNS the statement to time it - it is not a preview' },
+      hl = 'DbLensError',
+    }
+  end
 
   local function ask()
     confirm.ask(state.options, {
@@ -299,10 +310,12 @@ function M.confirm_script(state, statements, writes, on_confirm)
 
   -- Only a single destructive statement has a meaningful estimate to show.
   if #destructive == 1 and session.adapter.caps.estimate_rows then
-    session:estimate(destructive[1].sql, function(estimate)
+    session:estimate(destructive[1].sql, function(estimate, estimate_err)
+      -- A failed EXPLAIN and an adapter that simply cannot estimate must not read the same at
+      -- the moment the user is deciding whether to run something destructive.
       sections[#sections + 1] = {
         heading = 'estimated rows affected',
-        lines = { estimate and tostring(estimate) or 'unavailable' },
+        lines = { estimate and tostring(estimate) or (estimate_err or 'unavailable') },
         hl = 'DbLensWarn',
       }
       ask()

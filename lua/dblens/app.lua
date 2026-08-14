@@ -50,6 +50,25 @@ function M.render()
   require('dblens.ui.editor').render(state)
 end
 
+--- Bind an async callback to the UI instance that started it.
+---
+--- Client results land after an unknown delay, by which time the user may have closed dblens,
+--- reopened it, or switched connections. Without this every one of those callbacks indexed a
+--- module upvalue that was already nil, and closing during a query left the UI unclosable.
+---@param fn function
+---@return function
+local function live(fn)
+  local owner = state
+  assert(owner ~= nil, 'app.live: nothing to bind the callback to')
+  assert(type(fn) == 'function', 'app.live: expected a callback')
+  return function(...)
+    if state ~= owner then
+      return
+    end
+    return fn(...)
+  end
+end
+
 --- Mark work as in flight, driving the spinner and the winbar.
 local function set_busy(label, job)
   state.busy = label
@@ -62,14 +81,41 @@ local function set_busy(label, job)
   M.render()
 end
 
+--- Record the work the cancel action should reach, unless it already finished.
+---@param job dblens.Job
+local function track(job)
+  assert(type(job) == 'table' and job.cancel, 'app.track: expected a job')
+  if state and state.busy and not job.is_done() then
+    state.job = job
+  end
+end
+
+--- Bump the identity of what the grid is showing, so results for the previous view are dropped.
+---
+--- Sorting and paging keep the epoch: they change the page, not the row set, so a total already
+--- in flight is still the right one.
+local function new_epoch()
+  state.grid.epoch = (state.grid.epoch or 0) + 1
+  return state.grid.epoch
+end
+
 --- Cancel whatever is running, if anything.
 function M.cancel()
-  if not state or not state.job then
+  if not state then
     M.notify('nothing is running')
     return
   end
-  state.job.cancel()
-  M.notify('cancelled')
+  if state.job then
+    state.job.cancel()
+    M.notify('cancelled')
+    return
+  end
+  if state.session and state.session:is_busy() then
+    state.session:cancel_all()
+    M.notify('cancelled')
+    return
+  end
+  M.notify('nothing is running')
 end
 
 -- ---------------------------------------------------------------------------
@@ -99,6 +145,10 @@ local function build_state(options)
       error = nil,
       truncated = false,
       elapsed_ms = nil,
+      --- Identity of the current view, and of the current page fetch, so a result that belongs
+      --- to a superseded request is dropped instead of overwriting what is on screen.
+      epoch = 0,
+      fetch = 0,
     },
     history = store or { history = {}, snippets = {} },
     busy = nil,
@@ -127,25 +177,39 @@ function M.open(name, opts)
   state.specs = specs
 
   state.layout = layout_mod.open(options)
-  state.spinner = status.spinner(options, function()
-    require('dblens.ui.results').render_winbar(state)
-  end)
+  state.spinner = status.spinner(
+    options,
+    live(function()
+      require('dblens.ui.results').render_winbar(state)
+    end)
+  )
   require('dblens.ui.sidebar').attach(state)
   require('dblens.ui.results').attach(state)
   require('dblens.ui.editor').attach(state)
 
-  vim.api.nvim_create_autocmd('TabClosed', {
-    group = vim.api.nvim_create_augroup('DbLensLifecycle', { clear = true }),
+  local group = vim.api.nvim_create_augroup('DbLensLifecycle', { clear = true })
+  --- `:q` on one dblens window leaves the rest of the layout stranded and the session, its
+  --- resolved secret and any running client alive, so a half-closed layout closes the rest.
+  vim.api.nvim_create_autocmd({ 'TabClosed', 'WinClosed' }, {
+    group = group,
     callback = function()
-      if state and not layout_mod.is_open(state.layout) then
-        M.close()
-      end
+      vim.schedule(function()
+        if state and not layout_mod.is_open(state.layout) then
+          M.close()
+        end
+      end)
     end,
   })
   vim.api.nvim_create_autocmd('VimLeavePre', {
-    group = 'DbLensLifecycle',
+    group = group,
     callback = function()
       M.save_session()
+      if state and state.session then
+        state.session:close()
+      end
+      if state and state.spinner then
+        state.spinner:stop()
+      end
     end,
   })
 
@@ -230,20 +294,29 @@ function M.save_session()
   end
 end
 
+--- Close the UI, releasing everything it owns.
+---
+--- Order matters: the spinner's frame callback renders from `state`, so it has to be stopped
+--- while `state` is still the live instance. Stopping it afterwards threw, and everything after
+--- the throw — history, the tabpage, the augroup — was skipped, leaving a layout on screen that
+--- `is_open` reported as closed and that no later `:DbLensClose` could reach.
 function M.close()
   if not state then
     return
   end
   M.save_session()
+  if state.spinner then
+    state.spinner:stop()
+  end
   local closing = state
   state = nil
   if closing.session then
     closing.session:close()
   end
-  if closing.spinner then
-    closing.spinner:stop()
+  local saved, err = history.save(closing.history, closing.options)
+  if not saved then
+    M.error(err)
   end
-  history.save(closing.history, closing.options)
   layout_mod.close(closing.layout)
   pcall(vim.api.nvim_del_augroup_by_name, 'DbLensLifecycle')
 end
@@ -287,8 +360,9 @@ function M.connect(name, on_ready)
     return
   end
 
+  new_epoch()
   set_busy('connecting', nil)
-  session:connect(function(ok, connect_err)
+  session:connect(live(function(ok, connect_err)
     if not ok then
       set_busy(nil, nil)
       M.error(connect_err)
@@ -296,15 +370,18 @@ function M.connect(name, on_ready)
     end
     state.session = session
     state.tree.expanded[tree.connection_id()] = true
-    loader.schemas(session, function(schema_err)
-      set_busy(nil, nil)
-      if schema_err then
-        M.error(schema_err)
-        return
-      end
-      M.expand_default_schema(on_ready)
-    end)
-  end)
+    loader.schemas(
+      session,
+      live(function(schema_err)
+        set_busy(nil, nil)
+        if schema_err then
+          M.error(schema_err)
+          return
+        end
+        M.expand_default_schema(on_ready)
+      end)
+    )
+  end))
 end
 
 --- Expand the first schema so the tree is never a single unhelpful row.
@@ -339,16 +416,20 @@ function M.load_relations(schema, on_done)
   local id = session.catalog.has_schemas and tree.schema_id(schema) or tree.connection_id()
   state.tree.loading[id] = true
   M.render()
-  loader.relations(session, schema, function(err)
-    state.tree.loading[id] = nil
-    if err then
-      M.error(err)
-    end
-    M.render()
-    if on_done then
-      on_done()
-    end
-  end)
+  loader.relations(
+    session,
+    schema,
+    live(function(err)
+      state.tree.loading[id] = nil
+      if err then
+        M.error(err)
+      end
+      M.render()
+      if on_done then
+        on_done()
+      end
+    end)
+  )
 end
 
 ---@param relation dblens.Relation
@@ -361,16 +442,20 @@ function M.load_relation_details(relation, on_done)
   local id = tree.relation_id(relation)
   state.tree.loading[id] = true
   M.render()
-  loader.relation_details(session, relation, function(err)
-    state.tree.loading[id] = nil
-    if err then
-      M.error(err)
-    end
-    M.render()
-    if on_done then
-      on_done()
-    end
-  end)
+  loader.relation_details(
+    session,
+    relation,
+    live(function(err)
+      state.tree.loading[id] = nil
+      if err then
+        M.error(err)
+      end
+      M.render()
+      if on_done then
+        on_done()
+      end
+    end)
+  )
 end
 
 -- ---------------------------------------------------------------------------
@@ -435,6 +520,9 @@ local function present(result, source, extra)
 end
 
 --- Fetch the current page of the current relation source.
+---
+--- A fetch already in flight is cancelled first: two racing page queries used to be resolved by
+--- whichever client happened to exit last, which could show page 1 while the pager said page 3.
 function M.fetch_page()
   local source = state.grid.source
   if not source or source.kind ~= 'relation' then
@@ -452,17 +540,30 @@ function M.fetch_page()
     columns[#columns + 1] = column.name
   end
 
-  local job = session:run(statement, { columns = columns }, function(result, err)
-    set_busy(nil, nil)
-    if err then
-      state.grid.error = err
+  if state.job and not state.job.is_done() then
+    state.job.cancel()
+  end
+  state.grid.fetch = state.grid.fetch + 1
+  local fetch = state.grid.fetch
+  set_busy('query', nil)
+  local job = session:run(
+    statement,
+    { columns = columns },
+    live(function(result, err)
+      if state.grid.fetch ~= fetch then
+        return
+      end
+      set_busy(nil, nil)
+      if err then
+        state.grid.error = err
+        M.render()
+        return
+      end
+      present(result, source)
       M.render()
-      return
-    end
-    present(result, source)
-    M.render()
-  end)
-  set_busy('query', job)
+    end)
+  )
+  track(job)
 end
 
 --- Open a relation in the grid: load its columns, count it, then show page 1.
@@ -474,12 +575,19 @@ function M.open_relation(relation)
   state.grid.paging = paging.new(state.options.page_size)
   state.grid.sort = nil
   state.grid.filter = nil
+  new_epoch()
   M.load_relation_details(relation, function()
     state.grid.source = { kind = 'relation', relation = relation, label = relation.name }
     M.fetch_page()
     M.count_rows(relation)
   end)
   layout_mod.focus(state.layout, 'results')
+end
+
+--- Whether two relations are the same object. Name alone crosses schemas: on postgres and mysql
+--- `public.users` and `staging.users` would share a row count.
+local function same_relation(a, b)
+  return a ~= nil and b ~= nil and a.name == b.name and (a.schema or '') == (b.schema or '')
 end
 
 --- Count a relation, updating the pager once the answer arrives.
@@ -489,18 +597,29 @@ function M.count_rows(relation)
   if not session then
     return
   end
-  session:run(session.adapter.sql.count(relation, state.grid.filter), {}, function(result, err)
-    if err or not result.rows[1] then
-      return
-    end
-    local count = tonumber(result.rows[1][1])
-    session.catalog:set_row_count(relation, count)
-    local source = state.grid.source
-    if source and source.kind == 'relation' and source.relation.name == relation.name then
-      state.grid.paging.total = count
-    end
-    M.render()
-  end)
+  local epoch = state.grid.epoch
+  session:run(
+    session.adapter.sql.count(relation, state.grid.filter),
+    {},
+    live(function(result, err)
+      if err or not result.rows[1] then
+        return
+      end
+      local count = tonumber(result.rows[1][1])
+      session.catalog:set_row_count(relation, count)
+      local source = state.grid.source
+      -- A count issued before the user filtered or opened something else is not this view's.
+      if
+        state.grid.epoch == epoch
+        and source
+        and source.kind == 'relation'
+        and same_relation(source.relation, relation)
+      then
+        state.grid.paging.total = count
+      end
+      M.render()
+    end)
+  )
 end
 
 ---@param delta integer
@@ -555,6 +674,7 @@ function M.set_filter(where)
   end
   state.grid.filter = trimmed ~= '' and trimmed or nil
   state.grid.paging = paging.new(state.options.page_size)
+  new_epoch()
   M.fetch_page()
   M.count_rows(source.relation)
 end
@@ -607,6 +727,9 @@ function M.run_sql(text, opts)
     statements = { session.adapter.sql.explain(statements[1], opts.analyze == true) }
   end
 
+  -- Classification runs on the text that will actually be SENT, EXPLAIN wrapper included: an
+  -- `EXPLAIN ANALYZE` of a DELETE executes the DELETE, and classifying before the wrap made it
+  -- look like a read.
   local writes = {}
   for _, statement in ipairs(statements) do
     local info = sqlmod.classify(statement, session.adapter.dialect)
@@ -616,53 +739,61 @@ function M.run_sql(text, opts)
   end
   if #writes > 0 then
     require('dblens.ui.crud').confirm_script(state, statements, writes, function()
-      M.execute_statements(statements, trimmed, opts)
+      M.execute_statements(statements, trimmed, opts, { confirmed = true })
     end)
     return
   end
   M.execute_statements(statements, trimmed, opts)
 end
 
---- Execute already-vetted statements and present the last result that has columns.
-function M.execute_statements(statements, original, opts)
+--- Execute statements that have been through the confirmation gate, and present the last result
+--- that has columns. The session gate still re-checks each statement.
+---@param approval dblens.WriteApproval?
+function M.execute_statements(statements, original, opts, approval)
   local session = state.session
   set_busy('query', nil)
-  session:run_script(statements, function(outcomes)
-    set_busy(nil, nil)
-    local last = outcomes[#outcomes]
-    if last and last.err then
-      state.grid.error = last.err
-      state.grid.source = { kind = 'query', sql = original, label = opts.label or 'query' }
-      state.grid.result = nil
-      M.render()
-      return
-    end
-    if state.options.history.enabled then
-      history.record(state.history, session.spec.name, original)
-    end
-
-    local shown, total_ms = nil, 0
-    for _, outcome in ipairs(outcomes) do
-      total_ms = total_ms + (outcome.result and outcome.result.elapsed_ms or 0)
-      if outcome.result and #outcome.result.columns > 0 then
-        shown = outcome.result
+  local job = session:run_script(
+    statements,
+    { approval = approval },
+    live(function(outcomes)
+      set_busy(nil, nil)
+      local last = outcomes[#outcomes]
+      if last and last.err then
+        state.grid.error = last.err
+        state.grid.source = { kind = 'query', sql = original, label = opts.label or 'query' }
+        state.grid.result = nil
+        M.render()
+        return
       end
-    end
-    if not shown then
-      state.grid.source = { kind = 'query', sql = original, label = opts.label or 'query' }
-      state.grid.result = { columns = {}, rows = {}, malformed = 0 }
-      state.grid.error = nil
-      state.grid.elapsed_ms = total_ms
-      state.grid.message = ('%d statement(s) ran, no rows returned'):format(#outcomes)
+      if state.options.history.enabled then
+        history.record(state.history, session.spec.name, original)
+      end
+
+      local shown, total_ms = nil, 0
+      for _, outcome in ipairs(outcomes) do
+        total_ms = total_ms + (outcome.result and outcome.result.elapsed_ms or 0)
+        if outcome.result and #outcome.result.columns > 0 then
+          shown = outcome.result
+        end
+      end
+      new_epoch()
+      if not shown then
+        state.grid.source = { kind = 'query', sql = original, label = opts.label or 'query' }
+        state.grid.result = { columns = {}, rows = {}, malformed = 0 }
+        state.grid.error = nil
+        state.grid.elapsed_ms = total_ms
+        state.grid.message = ('%d statement(s) ran, no rows returned'):format(#outcomes)
+        M.render()
+        M.refresh_after_write(statements)
+        return
+      end
+      shown.elapsed_ms = total_ms
+      present(shown, { kind = 'query', sql = original, label = opts.label or 'query' })
       M.render()
       M.refresh_after_write(statements)
-      return
-    end
-    shown.elapsed_ms = total_ms
-    present(shown, { kind = 'query', sql = original, label = opts.label or 'query' })
-    M.render()
-    M.refresh_after_write(statements)
-  end)
+    end)
+  )
+  track(job)
 end
 
 --- After an ad-hoc write, the schema and any open table may be stale.
@@ -679,9 +810,12 @@ function M.refresh_after_write(statements)
   end
   session.catalog:clear()
   state.tree.expanded[tree.connection_id()] = true
-  loader.schemas(session, function()
-    M.expand_default_schema()
-  end)
+  loader.schemas(
+    session,
+    live(function()
+      M.expand_default_schema()
+    end)
+  )
 end
 
 -- ---------------------------------------------------------------------------
@@ -713,16 +847,21 @@ function M.txn_commit()
   end
   local count = session.txn:count()
   set_busy('commit', nil)
-  session:commit(function(ok, err)
+  session:commit(live(function(ok, err, queue_kept)
     set_busy(nil, nil)
     if not ok then
+      -- A discarded queue must not leave the grid showing changes as still pending.
+      if not queue_kept then
+        state.grid.dirty = {}
+      end
       M.error(err)
+      M.refresh_grid()
       return
     end
     M.notify(('committed %d change(s)'):format(count))
     state.grid.dirty = {}
     M.refresh_grid()
-  end)
+  end))
 end
 
 function M.txn_rollback()
