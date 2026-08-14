@@ -70,6 +70,11 @@ end
 --- grid. CSV quotes anything ambiguous, so only the NULL marker stays a convention.
 --- `-f -` makes psql prefix an error with `psql:<stdin>:LINE:`, which is how a failed statement
 --- in a committed batch is traced back to the change that produced it.
+---
+--- A read-only connection sets `default_transaction_read_only` as a STARTUP option, so the
+--- server refuses every write itself: `nextval()`, `setval()`, writable CTEs, DO blocks and DDL
+--- all come back `cannot execute ... in a read-only transaction`, whatever the statement text
+--- looked like to this plugin's lexer.
 function M.command(spec, secret, mode, clients)
   local argv = {
     clients.postgres,
@@ -99,6 +104,9 @@ function M.command(spec, secret, mode, clients)
   vim.list_extend(argv, { '-d', spec.database, '-f', '-' })
 
   local env = { PGCONNECT_TIMEOUT = '10' }
+  if spec.read_only == true then
+    env.PGOPTIONS = '-c default_transaction_read_only=on'
+  end
   if secret then
     env.PGPASSWORD = secret
   end

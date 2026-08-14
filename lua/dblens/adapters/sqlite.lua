@@ -2,6 +2,11 @@
 ---
 --- Requires sqlite3 >= 3.34 for `-safe`, which is what stops `.shell`, `.load`, `.import` and
 --- ATTACH from reaching the host if one ever slips past the statement gate.
+---
+--- A read-only connection is opened `-readonly`, so the ENGINE refuses every write however the
+--- statement is spelled. `PRAGMA query_only` is deliberately not used as well: it is session
+--- state that a smuggled `PRAGMA query_only=OFF` can turn back off, the open mode cannot be, and
+--- the only way to run a pragma ahead of stdin (`-cmd`) makes the client skip stdin entirely.
 local common = require('dblens.adapters.common')
 local path_mod = require('dblens.path')
 local protocol = require('dblens.protocol')
@@ -37,8 +42,9 @@ function M.validate(spec)
   if type(spec.path) ~= 'string' or spec.path == '' then
     return 'sqlite connection needs a `path`'
   end
-  -- The boundary for a hostile connections file: a path that cannot be expanded safely never
-  -- becomes a usable spec, so nothing downstream has to defend against it.
+  -- A path is data, never a command: expansion that cannot be done without evaluating something
+  -- fails here, so nothing downstream has to defend against it. (`password_cmd` is the one field
+  -- of a connection that IS a command, by the user's own declaration.)
   local _, err = path_mod.expand(spec.path)
   if err then
     return ('sqlite connection `%s`: %s'):format(spec.name or '?', err)
@@ -63,9 +69,13 @@ end
 ---@param clients table<string, string>
 --- `-bail` is load-bearing, not tidiness: without it the shell prints the error, skips the
 --- failing statement and runs the trailing COMMIT, so a batch commits in part while the UI
---- reports that nothing landed. `-safe` refuses `.shell`/`.load`/`.import`/ATTACH.
+--- reports that nothing landed. `-safe` refuses `.shell`/`.load`/`.import`/ATTACH, and
+--- `-readonly` is what actually enforces a read-only connection.
 function M.command(spec, _secret, mode, clients)
   local argv = { clients.sqlite, '-batch', '-bail', '-safe' }
+  if spec.read_only == true then
+    argv[#argv + 1] = '-readonly'
+  end
   if mode == 'records' then
     vim.list_extend(argv, { '-ascii', '-header', '-nullvalue', protocol.NULL_SENTINEL })
   end

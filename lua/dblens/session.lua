@@ -2,13 +2,21 @@
 ---
 --- EVERY statement dblens sends — a browsed page, a filter, ad-hoc editor SQL, EXPLAIN, a CRUD
 --- write, a committed batch — goes through `Session:run`, and `run` puts every one of them
---- through `Session:gate` first. That is the whole safety model: read-only, the destructive
---- confirmation and the refusal of client meta-commands are enforced at one choke point, not in
---- whichever part of the UI happened to ask.
+--- through `Session:gate` first.
 ---
---- The gate fails CLOSED. `sql.classify` only reports a read when it can prove one, so an
---- unrecognised verb, a stacked script or an EXPLAIN ANALYZE is treated as a write and refused
---- on a read-only connection rather than waved through.
+--- The gate is NOT what makes a read-only connection read-only. That is enforced by the SERVER:
+--- `adapter.command` opens a read-only connection (sqlite `-readonly`, postgres
+--- `default_transaction_read_only`, mysql `SET SESSION TRANSACTION READ ONLY`) whenever
+--- `spec.read_only` is set, so the engine refuses writes however the statement is spelled. Three
+--- adversarial reviews defeated a Lua reimplementation of five dialects' lexers; the server's own
+--- parser is the only one that cannot disagree with itself.
+---
+--- What the gate does own:
+---  * client meta-commands (`.shell`, `\!`, mysql `system`/`source`) — these run on THIS machine,
+---    so no connection setting covers them and the refusal is unconditional;
+---  * the destructive-change confirmation, and refusing a write on a read-only connection early
+---    so the user gets "connection X is read-only" instead of a server error.
+--- Classification is best-effort for those two jobs: a miss costs a prompt, not a table.
 local adapters = require('dblens.adapters')
 local catalog = require('dblens.catalog')
 local connections = require('dblens.connections')
@@ -131,27 +139,29 @@ end
 --- The one gate. Returns a refusal message, or nil when the statement may be sent.
 ---
 --- `approval` is produced only by a caller that has already been through `refuse_write`
---- (`execute_write`, `commit`) or by the confirmation UI; without it, a statement that is not
---- provably a read is judged by the connection's own rules.
+--- (`execute_write`, `commit`) or by the confirmation UI; without it, a statement that does not
+--- classify as a read is judged by the connection's own rules.
 ---@param statement string
 ---@param approval dblens.WriteApproval?
----@return string? refusal
+---@return string? refusal, dblens.Statement classification
 function Session:gate(statement, approval)
   assert(type(statement) == 'string', 'session:gate: expected a statement')
   local dialect = self.adapter.dialect
+  local info = sqlmod.classify(statement, dialect)
   local meta = sqlmod.client_meta_problem(statement, dialect)
   if meta then
-    -- Not SQL at all, so no connection flag covers it: `\!` and `.shell` run on this machine.
-    return meta
+    -- Not SQL at all, so no connection setting covers it: `\!`, `.shell` and mysql's `system`
+    -- run on this machine, whatever the server would have refused.
+    return meta, info
   end
-  local info = sqlmod.classify(statement, dialect)
   if not info.write then
-    return nil
+    return nil, info
   end
-  return self:refuse_write({
+  local refusal = self:refuse_write({
     destructive = info.destructive,
     confirmed = approval ~= nil and approval.confirmed == true,
   })
+  return refusal, info
 end
 
 --- Run one statement, through the gate.
@@ -167,10 +177,12 @@ function Session:run(statement, opts, on_done)
   assert(type(statement) == 'string' and statement ~= '', 'session:run: needs a statement')
   assert(type(on_done) == 'function', 'session:run: on_done must be a function')
   opts = opts or {}
-  local refusal = self:gate(statement, opts.approval)
+  local refusal, info = self:gate(statement, opts.approval)
   if refusal then
     return refused(refusal, on_done)
   end
+  assert(type(info) == 'table', 'session:run: the gate must report a classification')
+  local is_write = info.write
 
   local mode = opts.mode or 'records'
   local command = self.adapter.command(self.spec, self.secret, mode, self.options.clients)
@@ -193,7 +205,11 @@ function Session:run(statement, opts, on_done)
     max_bytes = self.options.max_bytes,
   }, function(result)
     self.jobs[handle] = nil
-    if not result.ok and not result.truncated then
+    -- A truncated READ still renders what arrived. A truncated WRITE does not: hitting the byte
+    -- cap means the client was SIGTERM'd mid-batch, so the change's fate is unknown and calling
+    -- that a success reported "committed" for a batch the server had rolled back.
+    local partial_read = result.truncated and not is_write
+    if not result.ok and not partial_read then
       on_done(nil, exec.format_error(result, self.adapter.label), {
         reason = result.reason,
         code = result.code,
@@ -429,11 +445,8 @@ function Session:commit(on_done)
 
   local total = self.txn:count()
   self:run(script, { approval = { confirmed = true } }, function(_, run_err, info)
-    if not run_err then
-      self.txn:reset()
-      on_done(true, nil, false)
-      return
-    end
+    -- Checked BEFORE success: a killed client can exit 0 on its own, and treating that as a
+    -- landed commit both lied to the user and cleared changes the server had rolled back.
     if info and KILLED[info.reason] then
       self.txn:reset()
       on_done(
@@ -444,6 +457,11 @@ function Session:commit(on_done)
         ):format(info.reason),
         false
       )
+      return
+    end
+    if not run_err then
+      self.txn:reset()
+      on_done(true, nil, false)
       return
     end
     on_done(false, describe_failure(owners, info, total, run_err), true)

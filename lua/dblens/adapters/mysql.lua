@@ -1,7 +1,7 @@
 --- MySQL / MariaDB adapter, driven through the `mysql` client.
 ---
---- UNTESTED LIVE: no mysql client or server was available during development. Every statement
---- builder and the XML decoder are unit-tested against the documented output format.
+--- Verified live against MySQL 8.4: the read-only session, the row guard, batch atomicity, XML
+--- decoding, and that `system`/`source` are honoured from stdin in batch mode (see `command`).
 ---
 --- Output uses `--xml` rather than the default tab format on purpose: the tab format prints SQL
 --- NULL as the literal text `NULL`, which is indistinguishable from the four-character string
@@ -56,8 +56,20 @@ function M.describe(spec)
 end
 
 --- The password goes through MYSQL_PWD, never argv, which would expose it in the process list.
+---
+--- A read-only connection starts every statement in a read-only transaction, so the server
+--- itself answers ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION to writes and DDL alike — including
+--- ones smuggled past this plugin's lexer through `/*!…*/` or a backslash-escaped literal.
+---
+--- `--local-infile=0` blocks `LOAD DATA LOCAL INFILE`, which reads a file on THIS machine. There
+--- is no client flag that disables `system`/`source` (`--skip-named-commands` still honours them
+--- at the head of a line, verified on 8.4), so `sql.client_meta_problem` refuses those instead.
 function M.command(spec, secret, mode, clients)
-  local argv = { clients.mysql, '--default-character-set=utf8mb4', '--connect-timeout=10' }
+  local argv =
+    { clients.mysql, '--default-character-set=utf8mb4', '--connect-timeout=10', '--local-infile=0' }
+  if spec.read_only == true then
+    argv[#argv + 1] = '--init-command=SET SESSION TRANSACTION READ ONLY'
+  end
   argv[#argv + 1] = mode == 'records' and '--xml' or '--batch'
   if spec.host then
     vim.list_extend(argv, { '-h', spec.host })
@@ -267,7 +279,8 @@ end
 ---
 --- MySQL has no statement-level RAISE outside a routine; a scalar subquery forced to return two
 --- rows aborts with ER_SUBQUERY_NO_1_ROW, and CASE only evaluates the branch it takes.
---- REASONED, NOT EXECUTED: no mysql client or server was available.
+--- Executed against MySQL 8.4: guard satisfied returns 1 and the batch continues; guard violated
+--- fails with ER_SUBQUERY_NO_1_ROW at a line `exec.error_line` can read, and nothing is applied.
 function M.sql.assert_one(count_sql)
   assert(type(count_sql) == 'string' and count_sql ~= '', 'mysql.assert_one: needs a count')
   return ('SELECT CASE WHEN (%s) = 1 THEN 1 ELSE (SELECT 1 UNION ALL SELECT 2) END'):format(

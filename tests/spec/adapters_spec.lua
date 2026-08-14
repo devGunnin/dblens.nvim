@@ -199,15 +199,23 @@ describe('mysql.command', function()
 
   it('builds the documented argv for both modes', function()
     local records = mysql.command({ database = 'app' }, nil, 'records', CLIENTS)
-    eq(
-      records.argv,
-      { 'mysql', '--default-character-set=utf8mb4', '--connect-timeout=10', '--xml', 'app' }
-    )
+    eq(records.argv, {
+      'mysql',
+      '--default-character-set=utf8mb4',
+      '--connect-timeout=10',
+      '--local-infile=0',
+      '--xml',
+      'app',
+    })
     local raw = mysql.command({ database = 'app' }, nil, 'raw', CLIENTS)
-    eq(
-      raw.argv,
-      { 'mysql', '--default-character-set=utf8mb4', '--connect-timeout=10', '--batch', 'app' }
-    )
+    eq(raw.argv, {
+      'mysql',
+      '--default-character-set=utf8mb4',
+      '--connect-timeout=10',
+      '--local-infile=0',
+      '--batch',
+      'app',
+    })
     eq(raw.env, nil)
   end)
 
@@ -385,17 +393,21 @@ describe('common.check_predicate', function()
     eq(common.check_predicate('id = 1; DELETE FROM t'), 'filter must not contain `;`')
   end)
 
-  it('rejects a predicate that is really a write statement', function()
-    eq(common.check_predicate('DELETE FROM t'), 'filter must not contain `DELETE`')
-    eq(common.check_predicate('DROP TABLE t'), 'filter must not contain `DROP`')
-    eq(common.check_predicate('UPDATE t SET a = 1'), 'filter must not contain `UPDATE`')
-  end)
-
-  it('rejects a write verb anywhere in the predicate, not just at the front', function()
+  it('rejects a write verb where a nested statement could begin', function()
     eq(common.check_predicate('id=1 AND (DELETE FROM t)'), 'filter must not contain `DELETE`')
+    eq(common.check_predicate('x IN (TRUNCATE TABLE t)'), 'filter must not contain `TRUNCATE`')
     eq(common.check_predicate('x = 1; '), 'filter must not contain `;`')
     eq(common.check_predicate("id > 5 AND name = 'a;b'"), nil)
     eq(common.check_predicate('"update" > 5'), nil)
+  end)
+
+  --- The predicate is spliced into a WHERE clause, so with no `;`, comment or backslash it
+  --- cannot become a second statement. A verb at the head is a typo, not a threat: it reaches
+  --- the server and comes back as a syntax error, which is a clearer message than a guess here.
+  it('leaves a bare write statement to the server rather than guessing at the head word', function()
+    eq(common.check_predicate('DELETE FROM t'), nil)
+    eq(common.check_predicate('comment IS NOT NULL'), nil)
+    eq(common.check_predicate("REPLACE(a, 'x', 'y') = 'z'"), nil)
   end)
 end)
 
