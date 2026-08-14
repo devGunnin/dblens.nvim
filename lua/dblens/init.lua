@@ -7,6 +7,9 @@ local keymaps = require('dblens.keymaps')
 
 local M = {}
 
+--- Release version. Bumped on tag; see CHANGELOG.md.
+M.VERSION = '1.0.0'
+
 local configured = false
 
 --- Global keymaps currently bound, so a second `setup` can take them back down.

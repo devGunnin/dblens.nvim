@@ -1,12 +1,61 @@
 # dblens.nvim
 
-A database viewer for Neovim. dblens gives you a schema tree, a paged result grid and a SQL
-scratch buffer in one tab page, and drives six engines through the command-line clients you
-already have installed. There is no compiled component and no server: every query is a one-shot
-client process, decoded through a record protocol chosen so that a SQL `NULL` is never confused
-with the text `NULL`. Every statement goes through a single gate that enforces read-only
-connections, a confirmation preview, and a `count(*)` guard proving a row-targeted edit matches
-exactly one row — and that treats anything it cannot prove is a read as a write.
+**A fast, safe database viewer for Neovim — SQLite, PostgreSQL, MySQL, MariaDB, DuckDB and SQL
+Server, browsed and queried with the CLI clients you already have.**
+
+dblens gives you a schema tree, a paged result grid and a SQL scratch buffer in one tab page, and
+drives six engines through the command-line clients you already have installed. There is no
+compiled component and no server: every query is a one-shot client process, decoded through a
+record protocol chosen so that a SQL `NULL` is never confused with the text `NULL`. Every
+statement goes through a single gate that enforces read-only connections, a confirmation preview,
+and a `count(*)` guard proving a row-targeted edit matches exactly one row — and that treats
+anything it cannot prove is a read as a write.
+
+## Contents
+
+- [Showcase](#showcase)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Supported databases](#supported-databases)
+- [Connections](#connections)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Keymaps](#keymaps)
+- [Safety model](#safety-model)
+- [Transactions](#transactions)
+- [Completion](#completion)
+- [Health](#health)
+- [Highlight groups](#highlight-groups)
+- [API](#api)
+- [Status](#status)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Showcase
+
+```text
+┌─ dblens ────────────────────────────────────────────────────────────────────┐
+│ schema              │ SELECT id, sku, qty FROM inventory WHERE qty < 10     │
+│ ▾ public            │───────────────────────────────────────────────────────│
+│   ▸ customers       │ id │ sku      │ qty │ warehouse                       │
+│   ▾ inventory   PK  │────┼──────────┼─────┼─────────────────────────────────│
+│     • id      int   │  4 │ SKU-2201 │   3 │ EU-WEST                         │
+│     • sku     text  │ 11 │ SKU-0087 │   7 │ US-EAST                         │
+│     • qty     int   │ 19 │ SKU-3340 │   2 │ APAC                            │
+│   ▸ orders          │                                                       │
+│ ▸ analytics         │                                                       │
+├──────────────────────┴───────────────────────────────────────────────────────┤
+│ prod · LOCKED · query ok (3 rows, 42ms)                                      │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Schema tree, paged grid and SQL editor in one tab. `LOCKED` in the status line means every
+statement above ran inside a read-only transaction, refused by the database itself if it tried to
+write — see [Safety model](#safety-model).
 
 ## Supported databases
 
@@ -52,7 +101,9 @@ default configuration are all applied on load. Call `setup{}` only to change som
 **lazy.nvim**
 
 ```lua
-{ 'dblens/dblens.nvim' }
+require('lazy').setup({
+  { 'dblens/dblens.nvim' },
+})
 ```
 
 **packer**
@@ -62,6 +113,20 @@ use 'dblens/dblens.nvim'
 ```
 
 Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
+
+## Quickstart
+
+1. `:DbLensAdd` — pick a kind, name the connection, and fill in its fields. A `sqlite` or `duckdb`
+   connection needs only a file path.
+2. `:DbLens` — opens on that connection (or asks, with more than one configured). The schema tree
+   is on the left; `:DbLensTables` jumps straight to a table by name.
+3. `<CR>` on a table in the tree opens it in the grid (`o` does the same). To run your own SQL,
+   `:DbLensQuery` (`<leader>dq`) focuses the editor; `<CR>` runs the statement under the cursor.
+4. Every connection opens **LOCKED**: reads work, writes are refused by the database itself.
+   `:DbLensWrite` (`<leader>dw`) unlocks it to edit a cell (`e`) or run your own write — every
+   write still shows its exact SQL and asks first. `:DbLensLock` locks it again.
+
+`:checkhealth dblens` any time something looks wrong — see [Troubleshooting](#troubleshooting).
 
 ## Features
 
@@ -552,7 +617,8 @@ Two more things differ on `mssql` and are worth knowing before you trust a cell:
   with a space. That is deliberate: without it a value holding a newline split the record and a
   value holding `0x1F` split the row. A flattened cell beats a corrupted grid.
 - **no EXPLAIN.** A SQL Server plan needs `SET SHOWPLAN_ALL ON` as its own batch, and dblens sends
-  one statement per client invocation. `:DbLensExplain` says so rather than sending something else.
+  one statement per client invocation. Running EXPLAIN (`<localleader>e`) on an `mssql` connection
+  says so rather than sending something else.
 
 **Unlocking is a deliberate act, and the only way to write.** `:DbLensWrite` (`<leader>dw`) puts
 the active connection in EDIT mode: the next run spawns without the read-only switch and without
@@ -914,10 +980,48 @@ error reporting have much thinner live coverage on those two — please report w
   [read-only role](#a-database-read-only-role-the-hard-boundary) is the hard boundary. Both are
   spelled out, with what each does and does not cover, in the safety model above.
 
-## Development
+## Troubleshooting
+
+Start with `:checkhealth dblens` — it reports the Neovim version, every database client it found
+(and its version), each connection's kind and access, and which optional integrations are
+installed. Most of the below shows up there first.
+
+- **"unknown database kind"** — a `kind` in `setup{}` or the connections file is misspelled, or
+  not one of the six; see the [Connections](#connections) table for the accepted spellings.
+- **A client is not found** — `:checkhealth dblens` names the binary it looked for. Install it, or
+  point `clients.<kind>` at it in `setup{}` if it is not on your `PATH`.
+- **A "connection `X` is read-only" message on a run that looks like a read** — that message comes
+  from a best-effort classifier that decides whether to prompt, not whether a write is allowed; see
+  [Safety model](#safety-model). It should never refuse a genuine `SELECT` — if it does, that is
+  worth reporting.
+- **A write is refused with a database error, not a dblens prompt** — that is the read-only
+  transaction or file mode doing its job on a LOCKED connection, working as intended. Unlock with
+  `:DbLensWrite` (`<leader>dw`) to write.
+- **A `password_cmd` fails silently** — dblens never shows a `password_cmd`'s output, because that
+  output is the secret; check the command runs and prints the password as its first line outside
+  dblens.
+- **Keymaps do not match what is documented** — `?` (`<localleader>?` in the SQL editor) always
+  shows the live bindings for the current pane, generated from your actual `keymaps` overrides.
+- **which-key does not label `<leader>d`** — that only happens with
+  [which-key](https://github.com/folke/which-key.nvim) installed; dblens does nothing without it.
+
+Still stuck? Open an issue with the output of `:checkhealth dblens` and your Neovim version.
+
+## Contributing
+
+Issues and pull requests are welcome. A change to plugin behaviour needs a MiniTest case under
+`tests/spec/`; a change to a keymap or a config option needs the README and vimdoc tables kept in
+sync — `tests/spec/keymaps_spec.lua` and `tests/spec/commands_spec.lua` fail the suite when they
+drift from `lua/dblens/keymaps.lua`, the single source of truth for bindings.
 
 ```sh
 make test    # MiniTest, headless
 make lint    # stylua --check, luacheck
 make format  # stylua
 ```
+
+CI runs both against Neovim stable and nightly; see `.github/workflows/ci.yml`.
+
+## License
+
+[MIT](LICENSE).

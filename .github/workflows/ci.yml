@@ -6,14 +6,23 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # One job, matrixed on Neovim stable + nightly, running both lint and test. sqlite3 and the
+  # duckdb static binary are installed so tests/spec/engines_spec.lua's live sqlite/duckdb groups
+  # actually run here; the postgres/mysql/mariadb/mssql live groups need
+  # `DBLENS_TEST_<KIND>_PORT` (unset in CI) and skip cleanly with a MiniTest note, which is not a
+  # failure. A service-container job to stand up postgres + mysql/mariadb and run those groups too
+  # was judged not worth the cost for this repo: it would need throwaway credentials wired through
+  # Actions secrets/services and roughly doubles the job's runtime for coverage `readonly_spec.lua`
+  # already gets from local verification (see `.dm-knowledge/dblens-mvp.md`). Left to local
+  # verification for now; revisit if CI-only regressions on those two engines start showing up.
+  ci:
     runs-on: ubuntu-latest
     strategy:
       # Both Neovim versions always report; nightly breaking does not hide a stable failure.
       fail-fast: false
       matrix:
         neovim: [stable, nightly]
-    name: test (${{ matrix.neovim }})
+    name: ci (${{ matrix.neovim }})
     steps:
       - uses: actions/checkout@v4
 
@@ -22,23 +31,25 @@ jobs:
           neovim: true
           version: ${{ matrix.neovim }}
 
-      - name: Install sqlite3
+      - name: Install sqlite3 and duckdb
         run: |
           sudo apt-get update
-          sudo apt-get install -y sqlite3
+          sudo apt-get install -y sqlite3 unzip
+          curl -fsSL -o /tmp/duckdb.zip \
+            https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip
+          sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/duckdb
+
+      - name: Install luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua-check
 
       - name: Versions
         run: |
           nvim --version
           sqlite3 --version
-
-      - name: Test
-        run: make test
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+          duckdb --version
 
       - uses: JohnnyMorganz/stylua-action@v4
         with:
@@ -46,10 +57,8 @@ jobs:
           version: latest
           args: --check .
 
-      - name: Install luacheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lua-check
-
       - name: Luacheck
         run: luacheck lua tests
+
+      - name: Test
+        run: make test

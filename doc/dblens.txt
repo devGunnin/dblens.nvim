@@ -77,7 +77,9 @@ and the default configuration are applied on load. Call `setup()` only to
 change something.
 
 lazy.nvim: >lua
-    { 'dblens/dblens.nvim' }
+    require('lazy').setup({
+      { 'dblens/dblens.nvim' },
+    })
 <
 packer: >lua
     use 'dblens/dblens.nvim'
