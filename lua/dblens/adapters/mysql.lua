@@ -134,6 +134,18 @@ local function parse_row(block)
   end
 end
 
+--- The first `<resultset>` only. A statement can produce several (a CALL, some SHOW variants),
+--- and their columns differ, so concatenating them would align later rows to the wrong headers.
+---@return string
+local function first_resultset(stdout)
+  local from = stdout:find('<resultset', 1, true)
+  if not from then
+    return stdout
+  end
+  local to = stdout:find('</resultset>', from, true)
+  return stdout:sub(from, to and (to - 1) or #stdout)
+end
+
 --- Decode `mysql --xml` output into a result set.
 ---
 --- Field order within a row follows the document, and every row of a MySQL result carries the
@@ -146,7 +158,7 @@ function M.decode(stdout, opts)
   opts = opts or {}
   local columns, rows, malformed = opts.columns and vim.deepcopy(opts.columns) or {}, {}, 0
 
-  for block in stdout:gmatch('<row>(.-)</row>') do
+  for block in first_resultset(stdout):gmatch('<row>(.-)</row>') do
     local names, values = parse_row(block)
     if #rows == 0 and #names > 0 then
       columns = names
@@ -248,6 +260,19 @@ end
 
 function M.sql.affected()
   return 'SELECT ROW_COUNT() AS affected'
+end
+
+--- A statement that fails unless `count_sql` yields exactly 1, re-checking a queued change's
+--- guard inside the committed transaction.
+---
+--- MySQL has no statement-level RAISE outside a routine; a scalar subquery forced to return two
+--- rows aborts with ER_SUBQUERY_NO_1_ROW, and CASE only evaluates the branch it takes.
+--- REASONED, NOT EXECUTED: no mysql client or server was available.
+function M.sql.assert_one(count_sql)
+  assert(type(count_sql) == 'string' and count_sql ~= '', 'mysql.assert_one: needs a count')
+  return ('SELECT CASE WHEN (%s) = 1 THEN 1 ELSE (SELECT 1 UNION ALL SELECT 2) END'):format(
+    count_sql
+  )
 end
 
 return M

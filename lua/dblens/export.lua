@@ -94,7 +94,11 @@ function M.write(result, path, format)
   if not encode then
     return false, ('unknown export format `%s` (csv, json)'):format(tostring(format))
   end
-  local expanded = vim.fn.expand(path)
+  -- `vim.fn.expand` would run backticks in the path through the shell.
+  local expanded, path_err = require('dblens.path').expand(path)
+  if not expanded then
+    return false, path_err
+  end
   local dir = vim.fn.fnamemodify(expanded, ':h')
   if vim.fn.isdirectory(dir) == 0 then
     return false, ('directory does not exist: %s'):format(dir)

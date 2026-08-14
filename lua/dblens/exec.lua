@@ -90,13 +90,24 @@ function M.run(spec, on_done)
   end
 
   local started = uv.hrtime()
-  local handle, timer, finished, reason
+  local handle, timer, kill_timer, finished, reason
+  --- SIGTERM, then SIGKILL if the client ignores it: without the escalation a stuck client
+  --- leaves the UI busy forever with no way back, because `complete` never runs.
   local function stop(why)
     if finished or not handle then
       return
     end
     reason = reason or why
     handle:kill('sigterm')
+    if kill_timer then
+      return
+    end
+    kill_timer = uv.new_timer()
+    kill_timer:start(2000, 0, function()
+      if not finished and handle then
+        pcall(handle.kill, handle, 'sigkill')
+      end
+    end)
   end
 
   -- stderr is capped too: a client stuck in a message loop must not grow without bound.
@@ -117,6 +128,16 @@ function M.run(spec, on_done)
       timer:close()
       timer = nil
     end
+    if kill_timer then
+      kill_timer:stop()
+      kill_timer:close()
+      kill_timer = nil
+    end
+    -- A timeout that fires while the exit callback is already queued must not turn a finished,
+    -- successful run into "timed out": the output is complete and the exit code is real.
+    if reason == 'timeout' and res.code == 0 then
+      reason = nil
+    end
     local elapsed_ms = (uv.hrtime() - started) / 1e6
     on_done({
       ok = res.code == 0 and reason == nil,
@@ -130,10 +151,12 @@ function M.run(spec, on_done)
   end
 
   local spawned, err = pcall(function()
+    -- `text = false`: text mode rewrites CRLF to LF in the collected output, and that lands on
+    -- the raw record stream, so any cell holding a CRLF came back altered.
     handle = vim.system(spec.argv, {
       env = spec.env,
       stdin = spec.stdin,
-      text = true,
+      text = false,
       stdout = function(_, data)
         stdout.push(data)
       end,
@@ -187,8 +210,23 @@ function M.format_error(result, label)
     message = ('exited with code %d'):format(result.code)
   end
   -- Clients prefix their own name and repeat it per line; keep the first meaningful line.
-  local first = message:gmatch('[^\n]+')()
-  return ('%s: %s'):format(label, first or message)
+  local first = message:gmatch('[^\r\n]+')()
+  return ('%s: %s'):format(label, vim.trim(first or message))
+end
+
+--- The script line a client blamed for a failure, or nil.
+---
+--- Each client says it differently, and this is the only way to trace a failure inside a batch
+--- back to the statement that caused it: `sqlite3` "near line 3", `psql:<stdin>:3:`, mysql
+--- "at line 3".
+---@param stderr string
+---@return integer?
+function M.error_line(stderr)
+  assert(type(stderr) == 'string', 'exec.error_line: expected a string')
+  local line = stderr:match('near line (%d+)')
+    or stderr:match('psql:[^:\n]*:(%d+):')
+    or stderr:match(' at line (%d+)')
+  return line and tonumber(line) or nil
 end
 
 return M

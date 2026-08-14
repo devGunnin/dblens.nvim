@@ -1,5 +1,9 @@
 --- sqlite3 adapter. The reference implementation of the adapter contract.
+---
+--- Requires sqlite3 >= 3.34 for `-safe`, which is what stops `.shell`, `.load`, `.import` and
+--- ATTACH from reaching the host if one ever slips past the statement gate.
 local common = require('dblens.adapters.common')
+local path_mod = require('dblens.path')
 local protocol = require('dblens.protocol')
 local sql = require('dblens.sql')
 
@@ -33,6 +37,12 @@ function M.validate(spec)
   if type(spec.path) ~= 'string' or spec.path == '' then
     return 'sqlite connection needs a `path`'
   end
+  -- The boundary for a hostile connections file: a path that cannot be expanded safely never
+  -- becomes a usable spec, so nothing downstream has to defend against it.
+  local _, err = path_mod.expand(spec.path)
+  if err then
+    return ('sqlite connection `%s`: %s'):format(spec.name or '?', err)
+  end
   return nil
 end
 
@@ -41,16 +51,25 @@ function M.describe(spec)
   return vim.fn.fnamemodify(spec.path, ':~')
 end
 
+--- Resolved database file for a validated spec.
+---@return string
+function M.file(spec)
+  return path_mod.expand_validated(spec.path, 'sqlite.file')
+end
+
 ---@param spec dblens.ConnectionSpec
 ---@param _secret string?  -- sqlite has no authentication
 ---@param mode 'records'|'raw'
 ---@param clients table<string, string>
+--- `-bail` is load-bearing, not tidiness: without it the shell prints the error, skips the
+--- failing statement and runs the trailing COMMIT, so a batch commits in part while the UI
+--- reports that nothing landed. `-safe` refuses `.shell`/`.load`/`.import`/ATTACH.
 function M.command(spec, _secret, mode, clients)
-  local argv = { clients.sqlite, '-batch' }
+  local argv = { clients.sqlite, '-batch', '-bail', '-safe' }
   if mode == 'records' then
     vim.list_extend(argv, { '-ascii', '-header', '-nullvalue', protocol.NULL_SENTINEL })
   end
-  argv[#argv + 1] = vim.fn.expand(spec.path)
+  argv[#argv + 1] = M.file(spec)
   return { argv = argv, env = nil }
 end
 
@@ -112,6 +131,18 @@ end
 --- Rows touched by the statement that just ran, in the same client invocation.
 function M.sql.affected()
   return 'SELECT changes() AS affected'
+end
+
+--- A statement that fails unless `count_sql` yields exactly 1, so a queued change is re-guarded
+--- inside the committed transaction rather than only at queue time.
+---
+--- sqlite has no RAISE outside a trigger and returns NULL for `1/0`; `json()` over invalid text
+--- is the portable way to make the shell abort, and with `-bail` that rolls the batch back.
+function M.sql.assert_one(count_sql)
+  assert(type(count_sql) == 'string' and count_sql ~= '', 'sqlite.assert_one: needs a count')
+  return ("SELECT CASE WHEN (%s) = 1 THEN 1 ELSE json('dblens row guard failed') END"):format(
+    count_sql
+  )
 end
 
 return M

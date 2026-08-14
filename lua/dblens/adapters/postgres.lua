@@ -1,7 +1,7 @@
 --- PostgreSQL adapter, driven through `psql`.
 ---
---- UNTESTED LIVE: developed against psql's documented flags and catalog views; no server was
---- reachable during development. The record framing and every statement builder are unit-tested.
+--- Verified live against PostgreSQL 18.4: the safety gate, CSV decoding of values holding
+--- control bytes, plain EXPLAIN, batch atomicity and the transaction row guard.
 local common = require('dblens.adapters.common')
 local protocol = require('dblens.protocol')
 local sql = require('dblens.sql')
@@ -30,6 +30,9 @@ local M = {
     { name = 'port', label = 'Port', default = 5432 },
     { name = 'user', label = 'User' },
     { name = 'database', label = 'Database', required = true },
+    --- libpq's default is `prefer`, which silently falls back to plaintext; set this to
+    --- `require` or better when the password travels over a network.
+    { name = 'sslmode', label = 'SSL mode' },
   },
 }
 
@@ -37,8 +40,16 @@ function M.validate(spec)
   if type(spec.database) ~= 'string' or spec.database == '' then
     return 'postgres connection needs a `database`'
   end
+  -- `psql -d` accepts a whole conninfo string, so a stored spec could redirect the connection
+  -- (and the password) to a host the UI never shows. A database is a bare name.
+  if spec.database:find('[%s=/:]') then
+    return 'postgres `database` must be a bare database name, not a connection string'
+  end
   if spec.port ~= nil and type(spec.port) ~= 'number' then
     return 'postgres `port` must be a number'
+  end
+  if spec.sslmode ~= nil and type(spec.sslmode) ~= 'string' then
+    return 'postgres `sslmode` must be a string'
   end
   return nil
 end
@@ -53,19 +64,26 @@ function M.describe(spec)
 end
 
 --- Build the psql invocation. The password never touches argv: psql reads PGPASSWORD.
+---
+--- `--csv` rather than the control-character framing: psql's unaligned output does not escape
+--- control bytes, so a value holding one split a row (or a record) and silently corrupted the
+--- grid. CSV quotes anything ambiguous, so only the NULL marker stays a convention.
+--- `-f -` makes psql prefix an error with `psql:<stdin>:LINE:`, which is how a failed statement
+--- in a committed batch is traced back to the change that produced it.
 function M.command(spec, secret, mode, clients)
-  local argv =
-    { clients.postgres, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-P', 'pager=off', '-P', 'footer=off' }
+  local argv = {
+    clients.postgres,
+    '-X',
+    '-q',
+    '-v',
+    'ON_ERROR_STOP=1',
+    '-P',
+    'pager=off',
+    '-P',
+    'footer=off',
+  }
   if mode == 'records' then
-    vim.list_extend(argv, {
-      '-A',
-      '-F',
-      protocol.FIELD_SEP,
-      '-R',
-      protocol.RECORD_SEP,
-      '-P',
-      'null=' .. protocol.NULL_SENTINEL,
-    })
+    vim.list_extend(argv, { '--csv', '-P', 'null=' .. protocol.NULL_SENTINEL })
   else
     vim.list_extend(argv, { '-A', '-t' })
   end
@@ -78,7 +96,7 @@ function M.command(spec, secret, mode, clients)
   if spec.user then
     vim.list_extend(argv, { '-U', spec.user })
   end
-  vim.list_extend(argv, { '-d', spec.database })
+  vim.list_extend(argv, { '-d', spec.database, '-f', '-' })
 
   local env = { PGCONNECT_TIMEOUT = '10' }
   if secret then
@@ -90,7 +108,7 @@ function M.command(spec, secret, mode, clients)
   return { argv = argv, env = env }
 end
 
-M.decode = protocol.decode
+M.decode = protocol.decode_csv
 
 M.sql = {}
 
@@ -205,6 +223,14 @@ end
 
 function M.sql.affected()
   return nil
+end
+
+--- A statement that fails unless `count_sql` yields exactly 1, re-checking a queued change's
+--- guard inside the committed transaction. RAISE aborts the batch under ON_ERROR_STOP=1.
+function M.sql.assert_one(count_sql)
+  assert(type(count_sql) == 'string' and count_sql ~= '', 'postgres.assert_one: needs a count')
+  return ([[DO $dblens$ BEGIN IF (%s) <> 1 THEN
+  RAISE EXCEPTION 'dblens row guard failed'; END IF; END $dblens$]]):format(count_sql)
 end
 
 return M

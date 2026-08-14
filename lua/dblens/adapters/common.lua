@@ -32,10 +32,12 @@ end
 
 --- Check a user-typed filter predicate before it is spliced into generated SQL.
 ---
---- The filter bar takes raw SQL by design, but a predicate must stay one read-only expression:
---- a client fed `1=1; DROP TABLE t` runs both statements, and even a trailing `;` would sever the
---- LIMIT/OFFSET we append. Classifying the fragment is not enough — a verb can sit anywhere in it
---- — so every bare word is checked.
+--- The filter bar takes raw SQL by design, but a predicate must stay one read-only expression
+--- that cannot detach the `LIMIT`/`OFFSET` appended after it. This is an ALLOW-list, because the
+--- deny-list version of it let through `\!` (psql runs it as a shell command mid-statement),
+--- `--` and `/*` (which comment the pagination out), and a backslash inside a literal (whose
+--- meaning depends on a server setting, so the lexer and the server can disagree about where
+--- the string ends and a stacked statement becomes invisible).
 ---
 --- A column genuinely named after a SQL verb can still be filtered on by quoting it, which makes
 --- it an identifier token rather than a bare word.
@@ -46,12 +48,21 @@ function M.check_predicate(where, dialect)
   if not where or vim.trim(where) == '' then
     return nil
   end
-  for _, token in ipairs(sql.tokens(where, dialect)) do
-    if token.type == 'punct' and token.text == ';' then
-      return 'filter must be a single expression (remove the `;`)'
+  if where:find('\\', 1, true) then
+    return 'filter must not contain a backslash'
+  end
+  for _, token in ipairs(sql.scan(where, dialect)) do
+    if token.type == 'comment' then
+      return 'filter must not contain a comment'
+    end
+    if token.type == 'punct' and not sql.SAFE_PUNCT[token.text] then
+      return ('filter must not contain `%s`'):format(token.text)
     end
     if token.type == 'word' and sql.is_write_verb(token.text) then
       return ('filter must not contain `%s`'):format(token.text:upper())
+    end
+    if (token.type == 'string' or token.type == 'ident') and token.closed == false then
+      return 'filter has an unclosed quote'
     end
   end
   return nil
