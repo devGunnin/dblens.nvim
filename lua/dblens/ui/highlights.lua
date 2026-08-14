@@ -16,7 +16,11 @@ local LINKS = {
   DbLensMatch = 'Search',
   DbLensError = 'DiagnosticError',
   DbLensWarn = 'DiagnosticWarn',
-  DbLensOk = 'DiagnosticOk',
+  -- Window chrome, so a user can restyle a dblens pane without touching their own windows.
+  DbLensCursorLine = 'CursorLine',
+  -- Normal, not WinBar: the segment groups link to fg-only groups, so they take Normal's
+  -- background, and a WinBar background behind them showed as a bar that started mid-line.
+  DbLensWinBar = 'Normal',
 
   -- tree
   DbLensSchema = 'Directory',
@@ -44,9 +48,12 @@ local LINKS = {
   DbLensSortKey = 'Search',
 
   -- status
-  DbLensStatus = 'StatusLine',
   DbLensSpinner = 'DiagnosticInfo',
-  DbLensReadOnly = 'DiagnosticWarn',
+  --- The two connection modes must never look alike: LOCKED is the calm resting state, EDIT is
+  --- the one where a keystroke can change the database. Different hue AND different weight, so
+  --- they stay apart on a colorscheme that renders one of the two links flat.
+  DbLensLocked = 'DiagnosticOk',
+  DbLensEdit = 'DiagnosticWarn',
   DbLensTxn = 'DiagnosticInfo',
 }
 
@@ -56,6 +63,7 @@ local ATTRS = {
   DbLensTitle = { bold = true },
   DbLensNull = { italic = true },
   DbLensPK = { bold = true },
+  DbLensEdit = { bold = true },
 }
 
 local applied_overrides = {}
@@ -91,6 +99,31 @@ function M.setup(overrides)
       apply(applied_overrides)
     end,
   })
+end
+
+--- `winhighlight` for a dblens pane, so the window chrome is restyleable through the DbLens
+--- groups rather than by overriding Normal/CursorLine globally.
+---
+--- The StatusLine mappings are added only when dblens draws the pane separator itself: a
+--- colorscheme gives StatusLine a contrasting background, which turned the separator rule into a
+--- filled bar. A user who kept their own statusline keeps its colours too.
+---@param own_statusline boolean
+---@return string
+function M.winhighlight(own_statusline)
+  local parts = {
+    'Normal:DbLensNormal',
+    -- The `~` markers are already blanked by fillchars; without this the empty part of a pane
+    -- still carried EndOfBuffer's own background, which on a light theme is a grey block.
+    'EndOfBuffer:DbLensNormal',
+    'CursorLine:DbLensCursorLine',
+    'WinBar:DbLensWinBar',
+    'WinBarNC:DbLensWinBar',
+  }
+  if own_statusline then
+    parts[#parts + 1] = 'StatusLine:DbLensRule'
+    parts[#parts + 1] = 'StatusLineNC:DbLensRule'
+  end
+  return table.concat(parts, ',')
 end
 
 --- Every group dblens defines, for the documentation and `:checkhealth`.

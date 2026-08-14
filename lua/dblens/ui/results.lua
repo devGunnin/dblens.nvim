@@ -3,6 +3,7 @@
 ---
 --- Highlights are applied in scheduled chunks. A wide page can carry tens of thousands of
 --- extmarks, and setting them all in one tick is what makes a grid feel janky.
+local empty = require('dblens.ui.empty')
 local export = require('dblens.export')
 local grid = require('dblens.render.grid')
 local keymaps = require('dblens.keymaps')
@@ -45,21 +46,41 @@ local function apply_marks(buf, marks, chunk_size, token)
   step()
 end
 
-local function placeholder_lines(state)
+--- The failed query, its message readable rather than a wall of red.
+local function error_panel(state, icons)
+  local detail = {}
+  for line in tostring(state.grid.error):gmatch('[^\n]+') do
+    detail[#detail + 1] = { text = line, hl = 'DbLensNormal' }
+  end
+  return empty.panel(icons.error .. '  query failed', detail, 'DbLensError')
+end
+
+--- What the grid shows in place of rows, and the marks that colour it.
+---@return string[] lines, dblens.Mark[] marks
+local function placeholder(state, icons)
+  local options = state.options
   if state.grid.error then
-    local lines = { '', '  query failed', '' }
-    for line in tostring(state.grid.error):gmatch('[^\n]+') do
-      lines[#lines + 1] = '  ' .. line
-    end
-    return lines, 'DbLensError'
+    return error_panel(state, icons)
   end
   if state.grid.message then
-    return { '', '  ' .. state.grid.message }, 'DbLensDim'
+    return empty.panel(icons.table .. '  ' .. state.grid.message, {})
   end
   if not state.session then
-    return { '', '  not connected' }, 'DbLensDim'
+    return empty.panel(icons.database .. '  not connected', {
+      { key = keymaps.lhs_for('global', 'connections', options.keymaps.global), text = 'connect' },
+    })
   end
-  return { '', '  select a table, or run a query above' }, 'DbLensDim'
+  return empty.panel(icons.table .. '  no result yet', {
+    {
+      key = keymaps.lhs_for('sidebar', 'select', options.keymaps.sidebar),
+      text = 'in the tree: open a table',
+    },
+    {
+      key = keymaps.lhs_for('editor', 'run', options.keymaps.editor),
+      text = 'in the editor: run a statement',
+    },
+    { key = keymaps.lhs_for('results', 'help', options.keymaps.results), text = 'every binding' },
+  })
 end
 
 --- Redraw the grid.
@@ -72,34 +93,47 @@ function M.render(state)
   generation = generation + 1
   api.nvim_buf_clear_namespace(buf, NAMESPACE, 0, -1)
 
+  local icons = state.icons
   local output = require('dblens.app').grid_output()
   state.grid.spans = output and output.spans or {}
   state.grid.header_lines = output and output.header_lines or 0
 
   if not output then
-    local lines, hl = placeholder_lines(state)
+    local lines, marks = placeholder(state, icons)
     layout_mod.set_lines(buf, lines)
-    for index = 2, #lines do
+    for _, mark in ipairs(marks) do
       api.nvim_buf_set_extmark(
         buf,
         NAMESPACE,
-        index - 1,
-        0,
-        { end_col = #lines[index], hl_group = hl }
+        mark.line,
+        mark.col,
+        { end_col = mark.end_col, hl_group = mark.hl }
       )
     end
     M.render_winbar(state)
     return
   end
 
+  -- A table with no matching rows keeps its header, and says so rather than ending in blank space.
+  if #state.grid.result.rows == 0 then
+    local at = #output.lines
+    output.lines[at + 1] = '  no rows'
+    output.marks[#output.marks + 1] =
+      { line = at, col = 0, end_col = #output.lines[at + 1], hl = 'DbLensDim' }
+  end
+
   layout_mod.set_lines(buf, output.lines)
   apply_marks(buf, output.marks, state.options.ui.grid.chunk_size, generation)
   if api.nvim_win_is_valid(win) then
-    -- Keep the cursor on a data row after a redraw shortens the page.
+    -- Keep the cursor on a data row: on the header nothing the grid binds works, and a redraw
+    -- that shortens the page can leave it past the end.
     local cursor = api.nvim_win_get_cursor(win)
     local max = math.max(1, #output.lines)
+    local first_row = output.header_lines + 1
     if cursor[1] > max then
       api.nvim_win_set_cursor(win, { max, 0 })
+    elseif cursor[1] < first_row and #state.grid.result.rows > 0 then
+      api.nvim_win_set_cursor(win, { first_row, cursor[2] })
     end
   end
   M.render_winbar(state)
@@ -114,7 +148,7 @@ function M.render_winbar(state)
   end
   local session, source = state.session, state.grid.source
   local segments = {
-    { text = ' ' .. (source and source.label or 'results'), hl = 'DbLensTitle' },
+    { text = ' ' .. (source and source.label or 'results'), hl = 'DbLensTitle', keep = true },
   }
   if state.grid.result then
     -- Only a browsed relation is paged; a query result is just however many rows came back.
@@ -139,17 +173,20 @@ function M.render_winbar(state)
     segments[#segments + 1] = { text = status.duration(state.grid.elapsed_ms), hl = 'DbLensDim' }
   end
   if state.grid.truncated then
-    segments[#segments + 1] = { text = 'truncated', hl = 'DbLensWarn' }
+    -- Kept: the rows on screen are not all of them, and a narrow window must still say so.
+    segments[#segments + 1] = { text = 'truncated', hl = 'DbLensWarn', keep = true }
   end
   if session and session.txn:is_active() then
-    segments[#segments + 1] = { text = session.txn:label(), hl = 'DbLensTxn' }
+    segments[#segments + 1] = { text = session.txn:label(), hl = 'DbLensTxn', keep = true }
   end
   if session then
-    segments[#segments + 1] = session:is_read_only() and { text = 'LOCKED', hl = 'DbLensReadOnly' }
-      or { text = 'EDIT', hl = 'DbLensWarn' }
+    local icons = state.icons
+    segments[#segments + 1] = session:is_read_only()
+        and { text = icons.lock .. ' LOCKED', hl = 'DbLensLocked', keep = true }
+      or { text = icons.edit .. ' EDIT', hl = 'DbLensEdit', keep = true }
   end
   if state.spinner and state.spinner:is_running() then
-    segments[#segments + 1] = { text = state.spinner:label(), hl = 'DbLensSpinner' }
+    segments[#segments + 1] = { text = state.spinner:label(), hl = 'DbLensSpinner', keep = true }
   end
   status.set(win, segments, state.options)
 end

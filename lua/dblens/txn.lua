@@ -67,9 +67,16 @@ end
 --- with none of the other queued changes applied — so a later queued change could make an
 --- earlier one's predicate match two rows and it would apply to both.
 ---@param assert_one fun(count_sql: string): string  -- statement that fails unless the count is 1
+---@param frame { open: string, close: string }  -- how this engine opens and closes a transaction
 ---@return string? script, string? error, table<integer, dblens.ScriptOwner>? owner_of_line
-function Txn:script(assert_one)
+function Txn:script(assert_one, frame)
   assert(type(assert_one) == 'function', 'txn:script: needs the adapter guard builder')
+  -- Supplied, never defaulted: `BEGIN;` opens a transaction in sqlite/postgres/mysql/duckdb and
+  -- a BLOCK in T-SQL, so a default here would silently commit an mssql batch unprotected.
+  assert(
+    type(frame) == 'table' and type(frame.open) == 'string' and type(frame.close) == 'string',
+    'txn:script: needs the adapter transaction frame'
+  )
   if not self.active then
     return nil, 'not in a transaction'
   end
@@ -87,14 +94,14 @@ function Txn:script(assert_one)
     end
   end
 
-  emit('BEGIN;', nil)
+  emit(frame.open, nil)
   for index, change in ipairs(self.pending) do
     if change.guard then
       emit(assert_one(change.guard) .. ';', { index = index, guard = true })
     end
     emit(change.sql .. ';', { index = index, guard = false })
   end
-  emit('COMMIT;', nil)
+  emit(frame.close, nil)
   return table.concat(parts, '\n'), nil, owners
 end
 

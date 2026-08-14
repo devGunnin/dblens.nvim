@@ -23,6 +23,7 @@ local NERD = {
   running = '\239\132\144', -- nf-fa-spinner
   error = '\239\128\141', -- nf-fa-times
   lock = '\239\128\163', -- nf-fa-lock
+  edit = '\239\129\128', -- nf-fa-pencil
   transaction = '\239\131\172', -- nf-fa-exchange
 }
 
@@ -43,6 +44,7 @@ local UNICODE = {
   running = '◌',
   error = '✗',
   lock = '⊘',
+  edit = '✎',
   transaction = '⧗',
 }
 
@@ -62,6 +64,7 @@ local PLAIN = {
   running = '*',
   error = '!',
   lock = 'RO',
+  edit = 'RW',
   transaction = 'TX',
 }
 

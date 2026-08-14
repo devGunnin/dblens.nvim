@@ -13,8 +13,10 @@ local M = {}
 
 local function geometry(lines, options, opts)
   local ui_width, ui_height = vim.o.columns, vim.o.lines
-  local max_width = math.floor(ui_width * options.ui.float.max_width)
-  local max_height = math.floor(ui_height * options.ui.float.max_height)
+  -- A caller that laid its content out against a budget of its own passes that budget here, so
+  -- the window can never be narrower than the text it was told to hold.
+  local max_width = opts.max_width or math.floor(ui_width * options.ui.float.max_width)
+  local max_height = opts.max_height or math.floor(ui_height * options.ui.float.max_height)
 
   local width = opts.min_width or 20
   for _, line in ipairs(lines) do
@@ -43,7 +45,7 @@ end
 --- `opts.on_close` runs exactly once, however the float is dismissed.
 ---@param lines string[]
 ---@param options table  resolved config
----@param opts { title: string?, footer: string?, min_width: integer?, modifiable: boolean?, filetype: string?, enter: boolean?, on_close: function? }
+---@param opts { title: string?, footer: string?, min_width: integer?, max_width: integer?, max_height: integer?, modifiable: boolean?, filetype: string?, enter: boolean?, on_close: function? }
 ---@return dblens.Float
 function M.open(lines, options, opts)
   assert(vim.islist(lines), 'float.open: lines must be a list')

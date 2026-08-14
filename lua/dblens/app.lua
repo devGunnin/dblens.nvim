@@ -128,6 +128,9 @@ local function build_state(options)
   end
   return {
     options = options,
+    --- Resolved once: the winbar redraws on every spinner tick, and re-deriving the set there
+    --- allocated a fresh copy 12 times a second.
+    icons = require('dblens.ui.icons').get(options.ui.icons),
     layout = nil,
     session = nil,
     specs = {},
@@ -198,6 +201,16 @@ function M.open(name, opts)
           M.close()
         end
       end)
+    end,
+  })
+  --- The sidebar width depends on the terminal width, so a resize has to re-derive it or a
+  --- shrunk terminal keeps a sidebar that no longer leaves the grid room to read.
+  vim.api.nvim_create_autocmd('VimResized', {
+    group = group,
+    callback = function()
+      if state then
+        layout_mod.resize(state.layout, state.options)
+      end
     end,
   })
   vim.api.nvim_create_autocmd('VimLeavePre', {
@@ -720,6 +733,10 @@ function M.run_sql(text, opts)
     return
   end
   if opts.explain then
+    if not session.adapter.caps.explain then
+      M.error(('%s has no EXPLAIN dblens can run'):format(session.adapter.label))
+      return
+    end
     if #statements ~= 1 then
       M.error('EXPLAIN needs exactly one statement')
       return

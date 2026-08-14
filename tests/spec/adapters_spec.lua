@@ -22,7 +22,7 @@ end
 
 describe('adapters.normalize', function()
   it('accepts the canonical kinds', function()
-    for _, kind in ipairs({ 'sqlite', 'postgres', 'mysql' }) do
+    for _, kind in ipairs({ 'sqlite', 'postgres', 'mysql', 'mariadb', 'duckdb', 'mssql' }) do
       eq(adapters.normalize(kind), kind)
     end
   end)
@@ -33,16 +33,30 @@ describe('adapters.normalize', function()
       postgresql = 'postgres',
       pg = 'postgres',
       psql = 'postgres',
-      mariadb = 'mysql',
+      maria = 'mariadb',
+      duck = 'duckdb',
+      sqlserver = 'mssql',
+      ['sql-server'] = 'mssql',
+      tsql = 'mssql',
+      sqlcmd = 'mssql',
     }
     for alias, canonical in pairs(ALIASES) do
       eq(adapters.normalize(alias), canonical, { fail_reason = 'alias ' .. alias })
     end
   end)
 
+  --- `mariadb` used to resolve to the mysql adapter. It is its own kind now because the client
+  --- binary differs, and a spec that said `mariadb` must reach the adapter that drives `mariadb`.
+  it('resolves mariadb to its own adapter, not to mysql', function()
+    eq(adapters.normalize('mariadb'), 'mariadb')
+    eq(get('mariadb') == get('mysql'), false)
+    eq(get('mariadb').kind, 'mariadb')
+  end)
+
   it('is case-insensitive', function()
     eq(adapters.normalize('PostgreSQL'), 'postgres')
-    eq(adapters.normalize('MariaDB'), 'mysql')
+    eq(adapters.normalize('MariaDB'), 'mariadb')
+    eq(adapters.normalize('SQLServer'), 'mssql')
   end)
 
   it('returns nil for an unknown kind or a non-string', function()
@@ -79,7 +93,33 @@ describe('adapters.get', function()
   end)
 
   it('lists its kinds in a stable order', function()
-    eq(adapters.kinds(), { 'mysql', 'postgres', 'sqlite' })
+    eq(adapters.kinds(), { 'duckdb', 'mariadb', 'mssql', 'mysql', 'postgres', 'sqlite' })
+  end)
+
+  --- The declaration is what the UI, the docs and `:checkhealth` read to tell a strong LOCKED
+  --- connection from a best-effort one. An adapter that omitted it would be shown as if it were
+  --- strong, so `adapters.get` refuses to load one.
+  it('makes every adapter declare how its read-only mode is enforced', function()
+    local MECHANISMS =
+      { ['file-open'] = true, ['session-and-transaction'] = true, classifier = true }
+    for _, kind in ipairs(adapters.kinds()) do
+      local enforcement = get(kind).read_only_enforcement
+      eq(MECHANISMS[enforcement.mechanism], true, { fail_reason = kind .. ': unknown mechanism' })
+      eq(#enforcement.summary > 0, true, { fail_reason = kind .. ': empty summary' })
+      local strong = enforcement.strength == 'strong'
+      eq(strong, enforcement.mechanism ~= 'classifier', {
+        fail_reason = ('%s: a classifier-only lock must not be called strong'):format(kind),
+      })
+    end
+  end)
+
+  --- Named one at a time rather than derived, so promoting an engine to `strong` is a deliberate
+  --- edit to this list and not a side effect of an adapter change.
+  it('holds mssql, and only mssql, to best-effort', function()
+    eq(get('mssql').read_only_enforcement.strength, 'best-effort')
+    for _, kind in ipairs({ 'sqlite', 'duckdb', 'postgres', 'mysql', 'mariadb' }) do
+      eq(get(kind).read_only_enforcement.strength, 'strong', { fail_reason = kind })
+    end
   end)
 end)
 

@@ -4,11 +4,25 @@
 --- output, and how to phrase the statements dblens needs. Adapters never touch buffers, never
 --- run processes and hold no state, so every one of them is unit-testable without a server.
 ---
+--- What makes a LOCKED connection read-only on this engine, and how strong that is. Every adapter
+--- states it, because they are NOT equal and a UI that showed one word for all of them would be
+--- lying about the weakest:
+---  * `file-open` and `session-and-transaction` are STRONG -- the ENGINE refuses the write, so no
+---    classifier mistake can produce one.
+---  * `classifier` is BEST-EFFORT -- SQL Server has no read-only transaction and no read-only
+---    connection mode, so the refusal is dblens's own and a bug in it is a write. A read-only SQL
+---    login is the only hard boundary there.
+---@class dblens.ReadOnlyEnforcement
+---@field mechanism 'file-open'|'session-and-transaction'|'classifier'
+---@field strength 'strong'|'best-effort'
+---@field summary string  -- one line, shown by `:checkhealth dblens` and the docs
+
 ---@class dblens.Adapter
 ---@field kind string
 ---@field label string
 ---@field dialect dblens.Dialect
 ---@field caps { schemas: boolean, ddl: 'native'|'reconstructed', explain: boolean, explain_analyze: boolean, estimate_rows: boolean }
+---@field read_only_enforcement dblens.ReadOnlyEnforcement
 ---@field fields { name: string, label: string, required: boolean?, default: any }[]
 ---@field validate fun(spec: dblens.ConnectionSpec): string?
 ---@field describe fun(spec: dblens.ConnectionSpec): string
@@ -16,6 +30,7 @@
 ---@field read_only_script fun(statement: string): string  -- what a read_only run sends on stdin
 ---@field decode fun(stdout: string, opts: table?): dblens.ResultSet
 ---@field estimate nil|fun(statement: string): { sql: string, mode: string, parse: fun(decoded, raw): integer? }
+---@field file nil|fun(spec): string  -- set only by adapters whose database IS a local file
 ---@field sql table
 
 local M = {}
@@ -24,15 +39,25 @@ local REGISTRY = {
   sqlite = 'dblens.adapters.sqlite',
   postgres = 'dblens.adapters.postgres',
   mysql = 'dblens.adapters.mysql',
+  mariadb = 'dblens.adapters.mariadb',
+  duckdb = 'dblens.adapters.duckdb',
+  mssql = 'dblens.adapters.mssql',
 }
 
---- Alternate spellings accepted in connection specs.
+--- Alternate spellings accepted in connection specs. `mariadb` used to be an alias for `mysql`
+--- and is now its own adapter: it drives the `mariadb` client binary, which a MariaDB install
+--- ships instead of `mysql`.
 local ALIASES = {
   sqlite3 = 'sqlite',
   postgresql = 'postgres',
   pg = 'postgres',
   psql = 'postgres',
-  mariadb = 'mysql',
+  maria = 'mariadb',
+  duck = 'duckdb',
+  sqlserver = 'mssql',
+  ['sql-server'] = 'mssql',
+  tsql = 'mssql',
+  sqlcmd = 'mssql',
 }
 
 local loaded = {}
@@ -62,8 +87,19 @@ function M.get(kind)
       )
   end
   if not loaded[key] then
-    loaded[key] = require(REGISTRY[key])
-    assert(loaded[key].kind == key, 'adapters: registry key must match adapter kind')
+    local adapter = require(REGISTRY[key])
+    assert(adapter.kind == key, 'adapters: registry key must match adapter kind')
+    -- Checked at load, not at review time: an adapter that forgot to say how its LOCKED mode is
+    -- enforced would otherwise be shown to the user under the same word as the strong ones.
+    local enforcement = adapter.read_only_enforcement
+    assert(
+      type(enforcement) == 'table'
+        and type(enforcement.mechanism) == 'string'
+        and type(enforcement.summary) == 'string'
+        and (enforcement.strength == 'strong' or enforcement.strength == 'best-effort'),
+      ('adapters: `%s` must declare read_only_enforcement'):format(key)
+    )
+    loaded[key] = adapter
   end
   return loaded[key], nil
 end

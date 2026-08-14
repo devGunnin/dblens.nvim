@@ -76,7 +76,7 @@ function M.check_predicate(where, dialect)
     if
       token.type == 'word'
       and sql.is_write_verb(token.text)
-      and sql.opens_statement(code, index)
+      and sql.opens_statement(code, index, dialect)
     then
       return ('filter must not contain `%s`'):format(token.text:upper())
     end

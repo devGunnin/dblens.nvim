@@ -1,4 +1,5 @@
 --- The schema explorer: renders the tree and turns keys into app actions.
+local empty = require('dblens.ui.empty')
 local icons_mod = require('dblens.ui.icons')
 local keymaps = require('dblens.keymaps')
 local layout_mod = require('dblens.ui.layout')
@@ -24,10 +25,15 @@ local KIND_HL = {
 
 local BADGE_HL = { PK = 'DbLensPK', FK = 'DbLensFK', NN = 'DbLensNN', UQ = 'DbLensIndex' }
 
+--- Whether a node is a view rather than a table.
+local function is_view(node)
+  return node.kind == 'relation' and node.relation.kind == 'view'
+end
+
 --- Icon key for a node, distinguishing tables from views.
 local function icon_key(node)
   if node.kind == 'relation' then
-    return node.relation.kind == 'view' and 'view' or 'table'
+    return is_view(node) and 'view' or 'table'
   end
   return icons_mod.NODE[node.kind]
 end
@@ -62,7 +68,8 @@ local function compose(node, icons, line_index)
   if glyph then
     add(icons[glyph] .. ' ', 'DbLensIcon')
   end
-  add(node.label, KIND_HL[node.kind] or 'DbLensNormal')
+  -- A view is not a table and should not read as one, icon and name both.
+  add(node.label, is_view(node) and 'DbLensView' or (KIND_HL[node.kind] or 'DbLensNormal'))
 
   for _, badge in ipairs(node.badges or {}) do
     add(' ', nil)
@@ -74,6 +81,28 @@ local function compose(node, icons, line_index)
   return table.concat(parts), marks
 end
 
+--- Nothing is connected yet: name the key that connects, and the command that creates one.
+local function no_connection(icons, options)
+  return empty.panel(icons.database .. '  no connection', {
+    { key = keymaps.lhs_for('global', 'connections', options.keymaps.global), text = 'pick one' },
+    { key = ':DbLensAdd', text = 'add one' },
+  })
+end
+
+--- The connection and mode line above the tree.
+local function winbar_segments(session, icons)
+  local mode = session:is_read_only()
+      and { text = icons.lock .. ' LOCKED', hl = 'DbLensLocked', keep = true }
+    or { text = icons.edit .. ' EDIT', hl = 'DbLensEdit', keep = true }
+  return {
+    { text = ' ' .. icons.database .. ' ' .. session.spec.name, hl = 'DbLensTitle', keep = true },
+    -- The connection's target is the first thing a narrow window gives up; the name and the mode
+    -- are not negotiable.
+    { text = session:describe(), hl = 'DbLensDim' },
+    mode,
+  }
+end
+
 --- Redraw the tree.
 ---@param state dblens.State
 function M.render(state)
@@ -81,7 +110,7 @@ function M.render(state)
   if not api.nvim_buf_is_valid(buf) then
     return
   end
-  local icons = icons_mod.get(state.options.ui.icons)
+  local icons = state.icons
 
   local nodes = {}
   if state.session then
@@ -97,8 +126,7 @@ function M.render(state)
 
   local lines, marks = {}, {}
   if #nodes == 0 then
-    lines = { '', '  no connection', '', '  press <leader>dc to pick one' }
-    marks = { { line = 1, col = 0, end_col = #lines[2], hl = 'DbLensDim' } }
+    lines, marks = no_connection(icons, state.options)
   end
   for index, node in ipairs(nodes) do
     local line, line_marks = compose(node, icons, index - 1)
@@ -119,18 +147,9 @@ function M.render(state)
   end
 
   if api.nvim_win_is_valid(win) then
-    local session = state.session
-    status.set(win, {
-      {
-        text = ' ' .. icons.database .. ' ' .. (session and session.spec.name or 'dblens'),
-        hl = 'DbLensTitle',
-      },
-      { text = session and session:describe() or '', hl = 'DbLensDim' },
-      {
-        text = session and (session:is_read_only() and (icons.lock .. ' LOCKED') or 'EDIT') or '',
-        hl = session and not session:is_read_only() and 'DbLensWarn' or 'DbLensReadOnly',
-      },
-    }, state.options)
+    local segments = state.session and winbar_segments(state.session, icons)
+      or { { text = ' ' .. icons.database .. ' dblens', hl = 'DbLensTitle' } }
+    status.set(win, segments, state.options)
   end
 end
 

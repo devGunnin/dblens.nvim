@@ -218,8 +218,11 @@ end
 --- The script line a client blamed for a failure, or nil.
 ---
 --- Each client says it differently, and this is the only way to trace a failure inside a batch
---- back to the statement that caused it: `sqlite3` "near line 3", `psql:<stdin>:3:`, mysql
---- "at line 3".
+--- back to the statement that caused it: `sqlite3` "near line 3", `psql:<stdin>:3:`, mysql/mariadb
+--- "at line 3", sqlcmd "Msg 208, ..., Line 3".
+---
+--- duckdb is deliberately absent: its `LINE 1:` counts from the start of the failing STATEMENT,
+--- not the script (verified), so reading it would blame the wrong queued change.
 ---@param stderr string
 ---@return integer?
 function M.error_line(stderr)
@@ -227,6 +230,7 @@ function M.error_line(stderr)
   local line = stderr:match('near line (%d+)')
     or stderr:match('psql:[^:\n]*:(%d+):')
     or stderr:match(' at line (%d+)')
+    or stderr:match('Msg %d+, Level %d+, State %d+[^\n]*, Line (%d+)')
   return line and tonumber(line) or nil
 end
 

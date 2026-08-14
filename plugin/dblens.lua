@@ -9,55 +9,91 @@ if vim.fn.has('nvim-0.10') ~= 1 then
   return
 end
 
-local function command(name, fn, opts)
-  vim.api.nvim_create_user_command(name, fn, opts or {})
-end
-
 local function complete_connections()
   return require('dblens').connection_names()
 end
 
-command('DbLens', function(args)
-  require('dblens').open(args.args)
-end, { nargs = '?', complete = complete_connections, desc = 'Open dblens' })
-
-command('DbLensClose', function()
-  require('dblens').close()
-end, { desc = 'Close dblens and restore the previous layout' })
-
-command('DbLensToggle', function()
-  require('dblens').toggle()
-end, { desc = 'Toggle dblens' })
-
-command('DbLensConnections', function()
-  local dblens = require('dblens')
-  dblens.ensure_setup()
-  if not dblens.is_open() then
-    dblens.open()
-    return
+--- Run the same handler the matching keymap runs, so a command and its binding cannot diverge.
+local function action(name)
+  return function()
+    require('dblens').action(name)
   end
-  require('dblens.ui.picker').connections(require('dblens.app').state())
-end, { desc = 'Pick a dblens connection' })
+end
 
-command('DbLensAdd', function()
-  require('dblens').add_connection()
-end, { desc = 'Add a dblens connection' })
+--- name, handler, options. Every global binding has a command here, and every command is listed
+--- in the README and the vimdoc — `tests/spec/commands_spec.lua` fails when one drifts.
+local COMMANDS = {
+  {
+    'DbLens',
+    function(args)
+      require('dblens').open(args.args)
+    end,
+    { nargs = '?', complete = complete_connections, desc = 'Open dblens' },
+  },
+  {
+    'DbLensClose',
+    function()
+      require('dblens').close()
+    end,
+    { desc = 'Close dblens and restore the previous layout' },
+  },
+  { 'DbLensToggle', action('toggle'), { desc = 'Toggle dblens' } },
+  { 'DbLensConnections', action('connections'), { desc = 'Pick a dblens connection' } },
+  { 'DbLensQuery', action('query'), { desc = 'Focus the dblens SQL editor' } },
+  { 'DbLensTables', action('tables'), { desc = 'Find a table' } },
+  { 'DbLensHistory', action('history'), { desc = 'Browse dblens query history' } },
+  { 'DbLensSnippets', action('snippets'), { desc = 'Browse saved dblens snippets' } },
+  {
+    'DbLensAdd',
+    function()
+      require('dblens').add_connection()
+    end,
+    { desc = 'Add a dblens connection' },
+  },
+  {
+    'DbLensRemove',
+    function(args)
+      require('dblens').remove_connection(args.args)
+    end,
+    { nargs = 1, complete = complete_connections, desc = 'Remove a dblens connection' },
+  },
+  {
+    'DbLensWrite',
+    function()
+      require('dblens').write_mode()
+    end,
+    { desc = 'Open the active dblens connection for editing' },
+  },
+  {
+    'DbLensLock',
+    function()
+      require('dblens').lock()
+    end,
+    { desc = 'Lock the active dblens connection read-only' },
+  },
+  { 'DbLensBegin', action('txn_begin'), { desc = 'Begin a dblens transaction' } },
+  { 'DbLensCommit', action('txn_commit'), { desc = 'Commit the dblens transaction' } },
+  { 'DbLensRollback', action('txn_rollback'), { desc = 'Roll back the dblens transaction' } },
+  { 'DbLensPending', action('txn_pending'), { desc = 'Show pending dblens changes' } },
+  {
+    'DbLensRestore',
+    function()
+      require('dblens').restore()
+    end,
+    { desc = 'Reopen the last dblens session' },
+  },
+  {
+    'DbLensHelp',
+    function()
+      require('dblens').help()
+    end,
+    { desc = 'Show every dblens binding for the current pane' },
+  },
+}
 
-command('DbLensRemove', function(args)
-  require('dblens').remove_connection(args.args)
-end, { nargs = 1, complete = complete_connections, desc = 'Remove a dblens connection' })
-
-command('DbLensWrite', function()
-  require('dblens').write_mode()
-end, { desc = 'Open the active dblens connection for editing' })
-
-command('DbLensLock', function()
-  require('dblens').lock()
-end, { desc = 'Lock the active dblens connection read-only' })
-
-command('DbLensRestore', function()
-  require('dblens').restore()
-end, { desc = 'Reopen the last dblens session' })
+for _, entry in ipairs(COMMANDS) do
+  vim.api.nvim_create_user_command(entry[1], entry[2], entry[3])
+end
 
 -- Defer so a user's own `setup{}` wins; this only fills in for zero-config users.
 vim.schedule(function()

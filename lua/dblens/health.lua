@@ -90,6 +90,23 @@ local function check_clients(options)
   end
 end
 
+--- What a LOCKED connection means PER ENGINE. Reported as a warning where it is best-effort,
+--- because the word "read-only" reads the same in the UI for all of them and is not the same
+--- promise: on SQL Server the refusal is dblens's own classifier, not the engine.
+local function check_read_only()
+  health.start('Read-only enforcement')
+  for _, kind in ipairs(adapters.kinds()) do
+    local adapter = assert(adapters.get(kind), 'health: a registered kind must resolve')
+    local enforcement = adapter.read_only_enforcement
+    local line = ('%s [%s]: %s'):format(adapter.label, enforcement.mechanism, enforcement.summary)
+    if enforcement.strength == 'strong' then
+      health.ok(line)
+    else
+      health.warn(line)
+    end
+  end
+end
+
 --- Whether a password reference is configured -- never which variable, never its value.
 local function describe_secret(spec)
   if spec.password_env then
@@ -133,14 +150,18 @@ local function check_connections(options)
   local counts = ('%d from setup{}, %d from file'):format(from_config, from_file)
   health.ok(('%d connection(s): %s'):format(#specs, counts))
   for _, spec in ipairs(specs) do
-    local access = spec.read_only and 'read-only' or 'writable'
+    local adapter = adapters.get(spec.kind)
+    local strength = adapter and adapter.read_only_enforcement.strength or 'unknown'
+    -- The strength rides on the connection's own line: "read-only" reads the same for all of
+    -- them, and on SQL Server it is a classifier rather than the engine.
+    local access = spec.read_only and ('read-only (%s)'):format(strength) or 'writable'
     health.info(('%s [%s] %s, %s'):format(spec.name, spec.kind, access, describe_secret(spec)))
   end
   -- Surfaced where a user reviews their connections, because "read-only" above reads stronger
   -- than it is: it stops every ordinary write, not a deliberate dblink/UDF one.
   health.info(
-    'a read-only connection is enforced by the server per run, and is not a boundary against '
-      .. 'a user with write credentials -- connect as a database read-only role for that '
+    'a strong read-only connection is enforced by the engine per run, and is not a boundary '
+      .. 'against a user with write credentials -- connect as a database read-only role for that '
       .. '(:h dblens-safety-guarantee)'
   )
 end
@@ -176,6 +197,7 @@ function M.check()
   check_nvim()
   local options = check_config()
   check_clients(options)
+  check_read_only()
   check_connections(options)
   check_integrations()
 end

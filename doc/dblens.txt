@@ -17,6 +17,7 @@ CONTENTS                                                     *dblens-contents*
   7. Commands ................................ |dblens-commands|
   8. Configuration ........................... |dblens-config|
   9. Safety .................................. |dblens-safety|
+      SQL Server: a weaker lock .............. |dblens-safety-mssql|
  10. Transactions ............................ |dblens-transactions|
  11. Completion .............................. |dblens-completion|
  12. Health .................................. |dblens-health|
@@ -29,9 +30,8 @@ CONTENTS                                                     *dblens-contents*
                                                                       *dblens*
 
 dblens.nvim is a database viewer for Neovim. It gives you a schema tree, a
-paged result grid and a SQL scratch buffer in one tab page, and drives SQLite,
-PostgreSQL and MySQL through the `sqlite3`, `psql` and `mysql` command-line
-clients.
+paged result grid and a SQL scratch buffer in one tab page, and drives six
+engines through the command-line clients you already have.
 
 There is no compiled component and no server: every query is a one-shot client
 process, decoded through a record protocol chosen so that a SQL NULL is never
@@ -39,19 +39,35 @@ confused with the text "NULL". Writes go through a single choke point that
 enforces read-only connections, a confirmation preview, and a `count(*)` guard
 proving a row-targeted edit matches exactly one row. See |dblens-safety|.
 
+                                                             *dblens-engines*
+Supported engines, and how strong a LOCKED connection is on each. The
+difference is not cosmetic: on the "strong" engines the ENGINE refuses the
+write, on SQL Server dblens's own classifier does. See |dblens-safety-mssql|.
+>
+    kind        client      LOCKED enforced by          strength    verified
+    sqlite      sqlite3     file open mode + -safe      strong      3.53 live
+    duckdb      duckdb      file open mode + -safe      strong      1.5.5 live
+    postgres    psql        read-only transaction       strong      18.4 live
+    mysql       mysql       read-only txn + session     strong      8.4 live
+    mariadb     mariadb     read-only txn + session     strong      11.8 live
+    mssql       sqlcmd      dblens's classifier         BEST-EFFORT 2022 live
+<
 ==============================================================================
 2. Requirements                                          *dblens-requirements*
 
 - Neovim 0.10 or newer.
 - The command-line client for each database you want to reach:
 
-    SQLite              `sqlite3`
+    SQLite              `sqlite3` (3.34 or newer, for `-safe`)
+    DuckDB              `duckdb`
     PostgreSQL          `psql`
-    MySQL / MariaDB     `mysql`
+    MySQL               `mysql`
+    MariaDB             `mariadb`  (MariaDB's own client, not the symlink)
+    SQL Server          `sqlcmd`   (mssql-tools18, or go-sqlcmd)
 
 No compiled dependencies. A missing client only makes that one database kind
-unavailable; `:checkhealth dblens` reports which clients were found. See
-|dblens-health|.
+unavailable; `:checkhealth dblens` reports which clients were found, and which
+engines enforce a locked connection themselves. See |dblens-health|.
 
 ==============================================================================
 3. Installation                                               *dblens-install*
@@ -77,13 +93,28 @@ requires, and optionally `read_only`.
 Kinds and their required fields:
 
     `sqlite`      `path`        the database file
+    `duckdb`      `path`        the database file
     `postgres`    `database`    optional: `host`, `port`, `user`, `sslmode`
     `mysql`       `database`    optional: `host`, `port`, `user`
+    `mariadb`     `database`    optional: `host`, `port`, `user`
+    `mssql`       `database`    optional: `host`, `port`, `user`,
+                              `trust_server_certificate`
 
-The aliases `sqlite3`, `postgresql`, `pg`, `psql` and `mariadb` are accepted
-as spellings of a kind. For `sqlite`, `create = true` allows opening a file
-that does not exist yet; without it a missing file is an error rather than a
-silently created empty database.
+Accepted alias spellings: `sqlite3`, `duck`, `postgresql`, `pg`, `psql`,
+`maria`, `sqlserver`, `sql-server`, `tsql`, `sqlcmd`.
+
+`mariadb` used to be an alias for `mysql`. It is its own kind now, because
+MariaDB ships the `mariadb` client rather than `mysql`; an existing
+`kind = 'mariadb'` connection keeps working and now drives that binary. Set
+`clients.mariadb = 'mysql'` if your machine only has the compatibility symlink.
+
+For `sqlite` and `duckdb`, `create = true` allows opening a file that does not
+exist yet; without it a missing file is an error rather than a silently
+created empty database.
+
+`trust_server_certificate` is for `mssql` only: ODBC Driver 18 encrypts by
+default and verifies the certificate, which a development server's self-signed
+one fails. Set it only when you know the server is the one you meant.
 
 Connections come from two places: `connections` in `setup()` (owned by your
 config, not editable from the UI) and the connections file written by
@@ -203,7 +234,12 @@ chosen from the extension (`.json` for JSON, CSV otherwise).
 
 Every binding is declared once and can be remapped or disabled per scope
 through `keymaps` in `setup()`; see |dblens-config-keymaps|. `?` shows the
-live list inside any dblens window.
+live list in the tree and the grid; the SQL editor uses `<localleader>?` so
+that its backwards search keeps working. The overlay is generated from the
+same table, so it can never name a key that is not bound.
+
+With which-key installed, the `<leader>d` prefix is labelled `dblens`
+automatically. Nothing is required, and nothing happens without it.
 
 GLOBAL                                                *dblens-mappings-global*
 
@@ -215,7 +251,8 @@ Bound by `setup()`, in normal mode, reachable from anywhere.
     `<leader>dt`      tables           Find a table
     `<leader>dh`      history          Query history
     `<leader>ds`      snippets         Saved snippets
-    `<leader>dw`      write_toggle     Lock the connection / open it for editing
+    `<leader>dw`      write_toggle     Lock / unlock for editing
+    `<leader>dl`      lock             Lock the connection
     `<leader>dB`      txn_begin        Begin transaction
     `<leader>dC`      txn_commit       Commit transaction
     `<leader>dR`      txn_rollback     Roll back transaction
@@ -253,7 +290,7 @@ Normal mode, in the result grid.
     `Y`               yank_row         Yank the row as CSV
     `gy`              yank_json        Yank the row as JSON
     `gi`              yank_insert      Yank the row as INSERT
-    `X`               export           Export the result to a file
+    `X`               export           Export to a file
     `?`               help             This help
     `q`               close            Close dblens
 
@@ -261,15 +298,15 @@ EDITOR                                                *dblens-mappings-editor*
 
 In the SQL scratch buffer. Normal mode unless marked.
 
-    `<CR>`            run              Run the statement at the cursor
+    `<CR>`            run              Run the statement
     `<CR>` (visual)   run_selection    Run the selection
     `<localleader>r`  run_all          Run the whole buffer
     `<localleader>e`  explain          EXPLAIN the statement
     `<localleader>E`  explain_analyze  EXPLAIN ANALYZE
-    `<C-c>`           cancel           Cancel the running query
+    `<C-c>`           cancel           Cancel the query
     `<localleader>s`  save_snippet     Save as a snippet
     `<localleader>h`  history          Query history
-    `?`               help             This help
+    `<localleader>?`  help             This help
     `<localleader>q`  close            Close dblens
 
 ==============================================================================
@@ -306,6 +343,34 @@ In the SQL scratch buffer. Normal mode unless marked.
 :DbLensLock             Lock the active connection again. The very next run is
                         refused by the server. Refused while a transaction
                         queue is pending - commit or roll back first.
+
+                                                                *:DbLensQuery*
+:DbLensQuery            Open dblens if needed and focus the SQL editor.
+
+                                                               *:DbLensTables*
+:DbLensTables           Open dblens if needed and search for a table.
+
+                                                              *:DbLensHistory*
+:DbLensHistory          Browse the query history.
+
+                                                             *:DbLensSnippets*
+:DbLensSnippets         Browse the saved snippets.
+
+                                                                *:DbLensBegin*
+:DbLensBegin            Begin a transaction. |dblens-transactions|
+
+                                                               *:DbLensCommit*
+:DbLensCommit           Commit the open transaction.
+
+                                                             *:DbLensRollback*
+:DbLensRollback         Roll back the open transaction.
+
+                                                              *:DbLensPending*
+:DbLensPending          List the changes queued in the open transaction.
+
+                                                                 *:DbLensHelp*
+:DbLensHelp             Show every binding that applies in the current pane.
+                        The same overlay `?` opens.
 
                                                               *:DbLensRestore*
 :DbLensRestore          Reopen the connection and table that were open when
@@ -366,6 +431,7 @@ Every option with its default: >lua
 
       ui = {
         border = 'rounded',   -- border for every dblens float
+        statusline = true,    -- pane separator drawn as a rule
         -- true = plain Unicode, 'nerd' = Nerd Font glyphs, false = ASCII.
         icons  = true,
         winbar = true,        -- status winbar above each pane
@@ -399,8 +465,11 @@ Every option with its default: >lua
 
       clients = {
         sqlite   = 'sqlite3', -- binary, or path, per database kind
+        duckdb   = 'duckdb',
         postgres = 'psql',
         mysql    = 'mysql',
+        mariadb  = 'mariadb', -- MariaDB's own client, not the symlink
+        mssql    = 'sqlcmd',  -- mssql-tools18, or go-sqlcmd
       },
 
       keymaps = {
@@ -428,7 +497,9 @@ by `setup{}` rather than when the pane is first opened. A whole scope can be
 ==============================================================================
 9. Safety                                                      *dblens-safety*
 
-Read-only is enforced by the DATABASE SERVER. Everything else - the
+Read-only is enforced by the DATABASE ENGINE on five of the six engines, and
+by dblens's own classifier on SQL Server - see |dblens-safety-mssql|, and do
+not assume the guarantees below apply there. Everything else - the
 confirmation prompt and the refusal of client meta-commands - is enforced at
 one choke point, `Session:gate`, which every statement dblens sends passes
 through before a client process exists.
@@ -438,16 +509,18 @@ WHAT LOCKED GUARANTEES                              *dblens-safety-guarantee*
 Read this before pointing dblens at a database you care about. LOCKED is the
 default for every connection.
 
-LOCKED DOES guarantee: >
+On SQLite, DuckDB, PostgreSQL, MySQL and MariaDB, LOCKED DOES guarantee: >
     no accidental write - nothing you did not mean to run reaches the database
-    no write through any ORDINARY SQL statement, however it is spelled, on any
-      of the three engines. The DATABASE SERVER refuses it - a read-only
-      transaction on PostgreSQL and MySQL, the file handle's open mode on
-      SQLite - not dblens reading your SQL
+    no write through any ORDINARY SQL statement, however it is spelled. The
+      DATABASE ENGINE refuses it - a read-only transaction on PostgreSQL,
+      MySQL and MariaDB, the file handle's open mode on SQLite and DuckDB -
+      not dblens reading your SQL
     no second statement. Every framing trick that stacked one (a `;` inside a
       comment, a bare \r, a nested block comment, a Unicode line separator) is
-      refused unparsed, by a byte scan
+      refused unparsed, by a byte scan. That scan looks for `;`, so it does
+      not carry to T-SQL, which needs no separator at all
 <
+`:checkhealth dblens` reports the strength per engine, and per connection.
 LOCKED DOES NOT guarantee protection from someone who both HOLDS WRITE
 CREDENTIALS and deliberately calls a write-capable extension: >
     SELECT dblink_exec('dbname=app ...', 'INSERT ...')
@@ -476,22 +549,31 @@ Every connection is LOCKED unless it says `read_only = false` (or
 inside a SERVER-SIDE READ-ONLY TRANSACTION, and opens the connection read-only
 as well, so the engine itself refuses every write however the statement is
 spelled: >
-    SQLite      sqlite3 -readonly   (no wrap: it is the file open mode)
+    SQLite      sqlite3 -readonly -safe  (no wrap: it is the file open mode)
                 -> "attempt to write a readonly database"
+    DuckDB      duckdb -readonly -safe   (no wrap: it is the file open mode)
+                -> "Cannot execute statement of type ... in read-only mode"
+                -safe is NOT decoration: under -readonly alone,
+                COPY (SELECT 1) TO '/tmp/x.csv' still WROTE the file.
+                Read-only covers the database; -safe covers the filesystem
     PostgreSQL  BEGIN READ ONLY; DECLARE ... CURSOR ...; <run>; COMMIT;
                 plus PGOPTIONS=-c default_transaction_read_only=on
                 -> "cannot execute ... in a read-only transaction"
     MySQL       START TRANSACTION READ ONLY; <run>; COMMIT;
-                plus --init-command=SET SESSION TRANSACTION READ ONLY
+    MariaDB     plus --init-command=SET SESSION TRANSACTION READ ONLY
                 -> ERROR 1792 "Cannot execute statement in a READ ONLY
                    transaction"
+    SQL Server  no such switch exists - see |dblens-safety-mssql|
 <
-The transaction is the guarantee; the connection switch is the backup. On
-PostgreSQL and MySQL that switch is session state a statement in the same run
-can turn off, and both `SET default_transaction_read_only = off; INSERT ...`
-and `SET SESSION TRANSACTION READ WRITE; INSERT ...` used to land a row. Inside
-an open read-only transaction they cannot: a SET retargets only LATER
-transactions. PostgreSQL additionally lets `SET TRANSACTION READ WRITE`
+On MySQL and MariaDB BOTH the transaction and the session switch are
+load-bearing. Inside a bare `START TRANSACTION READ ONLY`, `CREATE TABLE` and
+`DROP TABLE` SUCCEED - verified live on MySQL 8.4 and MariaDB 11.8, because
+DDL commits the transaction implicitly and then runs outside it. The SESSION
+switch is what refuses those. The transaction is what a SET in the same run
+cannot undo: both `SET default_transaction_read_only = off; INSERT ...` and
+`SET SESSION TRANSACTION READ WRITE; INSERT ...` used to land a row, and
+inside an open read-only transaction they cannot, because a SET retargets only
+LATER transactions. PostgreSQL additionally lets `SET TRANSACTION READ WRITE`
 escalate a read-only transaction until it has taken a snapshot, which is what
 the `DECLARE ... CURSOR` is for - it takes one and returns nothing.
 This is the guarantee because the alternative is not one. dblens used to
@@ -515,8 +597,9 @@ and |dblens.statusline()| say LOCKED or EDIT.
 
 ONE STATEMENT AT A TIME                             *dblens-safety-one-stmt*
 
-What the server still cannot stop on PostgreSQL and MySQL: a statement that
-ENDS or REPLACES the read-only transaction and writes in a new one - >
+What the server still cannot stop on PostgreSQL, MySQL and MariaDB: a
+statement that ENDS or REPLACES the read-only transaction and writes in a new
+one - >
     ROLLBACK; SET default_transaction_read_only = off; BEGIN; INSERT ...
     START TRANSACTION READ WRITE; INSERT ...
 <
@@ -541,6 +624,62 @@ a `;` inside a string literal or a quoted identifier (`SELECT ';'`) is refused
 too, because proving that one is a single statement would mean trusting the
 lexer again.
 
+This rule is a scan for `;`, so IT DOES NOT CARRY TO T-SQL. SQL Server ends a
+statement at whitespace: `SELECT 1 DROP TABLE t` is two statements with no `;`
+in it, verified live - the table was dropped. See |dblens-safety-mssql|.
+
+SQL SERVER: A WEAKER LOCK                                *dblens-safety-mssql*
+
+A LOCKED `mssql` connection is enforced by DBLENS, NOT BY SQL SERVER. SQL
+Server offers no way to ask the engine for it: >
+    there is no read-only transaction - BEGIN TRANSACTION has no READ ONLY
+    there is no read-only connection mode. `sqlcmd -K ReadOnly` sets
+      ApplicationIntent, which only routes to a readable secondary in an
+      availability group. dblens passes it because it is the truthful thing
+      to declare, NOT because it enforces anything: verified live on SQL
+      Server 2022 that an INSERT sent under it lands
+<
+So LOCKED here is three client-side refusals, and a bug in any of them is a
+write rather than a prompt: >
+    1. the classifier - anything dblens cannot prove is a read is refused.
+       On every other engine this layer is best-effort; here it IS the boundary
+    2. the T-SQL juxtaposition rule - a write verb anywhere but the head of
+       the statement is treated as opening a new one, because T-SQL needs no
+       separator. Cost: an UNQUOTED column named after a non-reserved write
+       verb (`copy`, `replace` used bare) is refused while locked; quote it
+    3. `GO` and the `:` commands - `GO` runs what follows as its OWN batch, a
+       second statement no framing rule sees (verified live), and `sqlcmd -X`
+       does not stop it. Refused in LOCKED and EDIT alike: none of them is SQL
+<
+Underneath those, a locked run is wrapped in `SET XACT_ABORT ON; BEGIN
+TRANSACTION; <run>; ROLLBACK TRANSACTION;`. That is a NET, NOT A GUARANTEE,
+and its limit was measured: >
+    a write past the classifier is undone - INSERT and DROP TABLE inside the
+      wrap both left the database unchanged (SQL Server DDL is transactional)
+    a `GO` alone does not escape it - the transaction survives the batch
+      boundary, so the trailing ROLLBACK still reaches the write
+    but `... GO ... INSERT ... COMMIT TRANSACTION` DOES escape it, and the
+      row lands
+<
+Even where the net holds, sqlcmd exits 0, so dblens would report a success for
+something that did not land. It is the safe failure, not a correct one.
+
+CONNECT AS A READ-ONLY SQL LOGIN. That is the boundary SQL Server does have: >
+    CREATE LOGIN dblens_ro WITH PASSWORD = '...';
+    CREATE USER dblens_ro FOR LOGIN dblens_ro;
+    ALTER ROLE db_datareader ADD MEMBER dblens_ro;
+    DENY EXECUTE TO dblens_ro;
+<
+Two more `mssql` facts worth knowing before you trust a cell: >
+    NULL IS AMBIGUOUS. sqlcmd prints SQL NULL as the four characters NULL and
+      has no null-marker option, so a real NULL and the string 'NULL' arrive
+      as the same bytes. Every other engine dblens drives distinguishes them
+    CONTROL CHARACTERS IN VALUES ARE FLATTENED, by `sqlcmd -k1`. Without it a
+      value holding a newline split the record and one holding 0x1F split the
+      row. A flattened cell beats a corrupted grid
+    NO EXPLAIN. A SQL Server plan needs SET SHOWPLAN_ALL ON as its own batch,
+      and dblens sends one statement per invocation
+<
 SIDE CHANNELS                                     *dblens-safety-side-channel*
 
 Some functions do their work OUTSIDE the transaction dblens opened - in a
@@ -551,9 +690,20 @@ layer above passes it. A LOCKED connection refuses these names: >
     postgres_fdw...    a second database session dblens cannot make read-only
     lo_import lo_export pg_read_file pg_read_binary_file pg_ls_dir
     pg_stat_file       the PostgreSQL server's filesystem
-    LOAD_FILE          the MySQL server's filesystem
-    sys_exec sys_eval  a shell on the MySQL server, via a UDF
+    LOAD_FILE          the MySQL / MariaDB server's filesystem
+    sys_exec sys_eval  a shell on the MySQL / MariaDB server, via a UDF
+    xp_cmdshell sp_execute_external_script sp_OACreate sp_OAMethod
+                       a command on the SQL Server host
+    OPENROWSET OPENDATASOURCE OPENQUERY BULK xp_dirtree xp_subdirs
+    xp_fileexist xp_fixeddrives xp_regread
+                       another data source, or the SQL Server host's files
 <
+The SQL Server names matter more than the rest: on every other engine there is
+a read-only transaction behind this list, and on SQL Server there is not.
+DuckDB is absent for the same reason SQLite is - a locked DuckDB connection
+runs `-safe`, so the ENGINE refuses every filesystem reach (COPY ... TO,
+read_csv, INSTALL), and a name list would duplicate that.
+
 The refusal names the function it objected to; unlock to run it. This is
 measurable, not decorative. Verified live on PostgreSQL 16: inside dblens's
 read-only wrap `lo_export` WROTE a file on the server, `pg_read_file` READ
@@ -597,9 +747,17 @@ read-only role and put it in the connection's `user`. >
     -- fail; no CREATE ROUTINE, so a shell UDF cannot be installed.
     CREATE USER 'dblens_ro'@'%' IDENTIFIED BY '...';
     GRANT SELECT, SHOW VIEW ON app.* TO 'dblens_ro'@'%';
+
+    -- SQL Server. This one is NOT optional: it is the ONLY hard boundary
+    -- there, because the engine has no read-only connection mode at all.
+    CREATE LOGIN dblens_ro WITH PASSWORD = '...';
+    CREATE USER dblens_ro FOR LOGIN dblens_ro;
+    ALTER ROLE db_datareader ADD MEMBER dblens_ro;
+    DENY EXECUTE TO dblens_ro;
 <
-SQLite has no roles: `-readonly` is already the open mode, and the file's own
-permissions (`chmod a-w app.db`) are the layer under it.
+SQLite and DuckDB have no roles: `-readonly` is already the open mode, `-safe`
+closes the filesystem, and the file's own permissions (`chmod a-w app.db`) are
+the layer under both.
 
 Verified live on PostgreSQL 16, as that role: a plain INSERT is "permission
 denied for table"; `lo_export` and `pg_read_file` are "permission denied for
@@ -838,7 +996,8 @@ General ~
     `DbLensMatch`         Search
     `DbLensError`         DiagnosticError
     `DbLensWarn`          DiagnosticWarn
-    `DbLensOk`            DiagnosticOk
+    `DbLensCursorLine`    CursorLine
+    `DbLensWinBar`        Normal
 
 Tree ~
     `DbLensSchema`        Directory
@@ -864,9 +1023,9 @@ Grid ~
     `DbLensSortKey`       Search
 
 Status ~
-    `DbLensStatus`        StatusLine
     `DbLensSpinner`       DiagnosticInfo
-    `DbLensReadOnly`      DiagnosticWarn
+    `DbLensLocked`        DiagnosticOk
+    `DbLensEdit`          DiagnosticWarn, bold
     `DbLensTxn`           DiagnosticInfo
 
 ==============================================================================
@@ -915,14 +1074,25 @@ dblens.statusline()     A segment for your own statusline: the connection,
 ==============================================================================
 15. Limitations                                           *dblens-limitations*
 
-SQLite is verified live. The read-only guarantee is verified live on all three
-- PostgreSQL 16 and MySQL 8.4 included - by the cases in
-`tests/spec/readonly_spec.lua`, which need a server and skip with a note when
-there is none (see the head of that file). The rest of the PostgreSQL and
-MySQL surface - catalog queries, DDL reconstruction, error reporting - has
-much thinner live coverage, so expect rough edges there.
+The read-only behaviour is verified live on all six engines - SQLite 3.53,
+DuckDB 1.5.5, PostgreSQL 18.4, MySQL 8.4, MariaDB 11.8 and SQL Server 2022 -
+by the cases in `tests/spec/readonly_spec.lua` and `tests/spec/engines_spec.lua`,
+which need a server (or the client binary) and skip with a note when there is
+none. The rest of each surface - catalog queries, DDL reconstruction, error
+reporting - has much thinner live coverage, so expect rough edges there. The
+newest three (mariadb, duckdb, mssql) are the thinnest.
 
 Other limits:
+
+- SQL SERVER'S LOCKED MODE IS BEST-EFFORT, enforced by dblens rather than the
+  engine, and its NULL decoding is ambiguous. Read |dblens-safety-mssql|
+  before pointing a locked `mssql` connection at anything you care about.
+- DuckDB reports no affected-row count: it has no `changes()` and prints
+  nothing at all for a DML statement, so dblens reports none rather than a
+  fabricated zero. It has no row estimate either, so a destructive statement
+  gets no blast-radius preview.
+- SQL Server has no EXPLAIN dblens can run: a plan needs SET SHOWPLAN_ALL ON
+  as its own batch, and dblens sends one statement per client invocation.
 
 - A result is capped at `max_rows` rows for rendering. The SQL is never
   rewritten, so the client still does the full work; client output is capped
@@ -931,10 +1101,10 @@ Other limits:
   ORDER BY or WHERE in the query.
 - SQLite exposes no schema level (attached databases are out of scope) and has
   neither EXPLAIN ANALYZE nor a row estimate.
-- PostgreSQL has no native DDL statement, so the DDL view is reconstructed
-  from the catalog. It is meant to be read, not replayed.
+- PostgreSQL and SQL Server have no native DDL statement, so the DDL view is
+  reconstructed from the catalog. It is meant to be read, not replayed.
 - Affected-row counts must ride along in the same client invocation, so an
-  adapter with no affected-rows query (PostgreSQL) reports none.
+  adapter with no affected-rows query (PostgreSQL, DuckDB) reports none.
 - A LOCKED connection is not a sandbox around a user who already holds write
   credentials. The side-channel refusal matches names and a SECURITY DEFINER
   wrapper defeats it; a database read-only role is the hard boundary. What

@@ -89,6 +89,24 @@ function M.strings(value, out, depth)
   return out
 end
 
+--- Contents of a file in this checkout, addressed from the repo root.
+---
+--- The documentation tables are hand-written and the keymap registry is not, so the specs that
+--- prove they agree have to read the repo's own files.
+---@param relative string
+---@return string
+function M.repo_file(relative)
+  assert(type(relative) == 'string' and relative ~= '', 'helpers.repo_file: expected a path')
+  local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h:h')
+  local path = root .. '/' .. relative
+  local handle = io.open(path, 'r')
+  assert(handle, ('helpers.repo_file: cannot read %s'):format(path))
+  local text = handle:read('*a')
+  handle:close()
+  assert(text ~= '', ('helpers.repo_file: %s is empty'):format(path))
+  return text
+end
+
 --- A freshly loaded copy of `name`, leaving the already-loaded one in place. Lets a spec see a
 --- module in its untouched, never-configured state.
 ---@param name string
@@ -218,13 +236,36 @@ function M.fake_session(session_mod, spec, overrides)
 end
 
 --- The client each adapter drives by default.
-M.CLIENTS = { sqlite = 'sqlite3', postgres = 'psql', mysql = 'mysql' }
+M.CLIENTS = {
+  sqlite = 'sqlite3',
+  postgres = 'psql',
+  mysql = 'mysql',
+  mariadb = 'mariadb',
+  duckdb = 'duckdb',
+  mssql = 'sqlcmd',
+}
+
+--- A live FILE-backed database (sqlite, duckdb) for the current test: the client to drive, and a
+--- scratch path to seed. `DBLENS_TEST_<KIND>_CLIENT` overrides the binary; a missing binary
+--- returns nil so the case can note itself as skipped.
+---@param kind 'sqlite'|'duckdb'
+---@return { client: string, clients: table }?
+function M.live_file_client(kind)
+  assert(type(kind) == 'string' and kind ~= '', 'helpers.live_file_client: expected a kind')
+  local client = vim.env['DBLENS_TEST_' .. kind:upper() .. '_CLIENT'] or M.CLIENTS[kind]
+  if not client or vim.fn.executable(client) ~= 1 then
+    return nil
+  end
+  local clients = vim.tbl_extend('force', M.CLIENTS, {})
+  clients[kind] = client
+  return { client = client, clients = clients }
+end
 
 --- A live server, described entirely by environment so the suite stays green without one.
 ---
 --- `DBLENS_TEST_<KIND>_PORT` is what turns a live case on; `_HOST`, `_USER`, `_PASSWORD`, `_DB`
 --- and `_CLIENT` fill in the rest.
----@param kind 'postgres'|'mysql'
+---@param kind 'postgres'|'mysql'|'mariadb'|'mssql'
 ---@return { spec: table, secret: string?, clients: table }?
 function M.live_target(kind)
   assert(type(kind) == 'string' and kind ~= '', 'helpers.live_target: expected a kind')
@@ -235,18 +276,20 @@ function M.live_target(kind)
   end
   local clients = vim.tbl_extend('force', M.CLIENTS, {})
   clients[kind] = vim.env[prefix .. '_CLIENT'] or M.CLIENTS[kind]
-  return {
-    spec = {
-      name = 'live',
-      kind = kind,
-      host = vim.env[prefix .. '_HOST'] or '127.0.0.1',
-      port = port,
-      user = vim.env[prefix .. '_USER'],
-      database = vim.env[prefix .. '_DB'] or 'app',
-    },
-    secret = vim.env[prefix .. '_PASSWORD'],
-    clients = clients,
+  local spec = {
+    name = 'live',
+    kind = kind,
+    host = vim.env[prefix .. '_HOST'] or '127.0.0.1',
+    port = port,
+    user = vim.env[prefix .. '_USER'],
+    database = vim.env[prefix .. '_DB'] or 'app',
   }
+  -- A dev SQL Server presents a self-signed certificate and ODBC Driver 18 verifies it by
+  -- default, so a live mssql target has to say it trusts the one it is pointed at.
+  if kind == 'mssql' then
+    spec.trust_server_certificate = vim.env[prefix .. '_TRUST_CERT'] ~= '0'
+  end
+  return { spec = spec, secret = vim.env[prefix .. '_PASSWORD'], clients = clients }
 end
 
 --- The single value a synchronous callback was handed, or an explicit "never called" marker.

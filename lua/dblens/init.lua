@@ -55,6 +55,9 @@ local function global_handlers()
     write_toggle = function()
       app.set_locked(nil)
     end,
+    lock = function()
+      app.set_locked(true)
+    end,
     txn_begin = function()
       app.txn_begin()
     end,
@@ -68,6 +71,18 @@ local function global_handlers()
       require('dblens.ui.picker').pending(state)
     end),
   }
+end
+
+--- Run a global action by name.
+---
+--- Commands go through here rather than reimplementing what the binding does, so `:DbLensTables`
+--- and `<leader>dt` can never drift apart.
+---@param name string  an action from `keymaps.specs.global`
+function M.action(name)
+  M.ensure_setup()
+  local handler = global_handlers()[name]
+  assert(handler, ('dblens.action: unknown action `%s`'):format(tostring(name)))
+  handler()
 end
 
 local function bind_globals(options)
@@ -95,6 +110,7 @@ function M.setup(opts)
   local options = config.setup(opts)
   require('dblens.ui.highlights').setup(options.ui.highlights)
   bind_globals(options)
+  require('dblens.ui.whichkey').setup(options)
   configured = true
   return options
 end
@@ -171,6 +187,21 @@ end
 function M.lock()
   M.ensure_setup()
   require('dblens.app').set_locked(true)
+end
+
+--- Show the binding overlay for the pane the cursor is in, for a user who turned the keymaps off.
+function M.help()
+  M.ensure_setup()
+  local app = require('dblens.app')
+  if not app.is_open() then
+    app.open()
+  end
+  local state = app.state()
+  if not state then
+    return
+  end
+  local pane = require('dblens.ui.layout').current_pane(state.layout) or 'sidebar'
+  require('dblens.ui.help').show(state, pane)
 end
 
 --- A segment for the user's own statusline: connection, mode, transaction and running state.

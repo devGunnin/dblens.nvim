@@ -23,7 +23,13 @@ local M = {}
 ---@field nested_comment boolean   -- /* /* */ */ nests; only postgres does
 ---@field exec_comment boolean     -- /*! ... */ is executed, so its body is code
 ---@field named_commands boolean   -- a bare leading `system`/`source` is a client command
+---@field sqlcmd_commands boolean  -- `GO` and the `:` commands sqlcmd reads instead of the server
 ---@field dash_comment_needs_space boolean -- `--` opens a comment only when whitespace follows
+--- `statement_separator_optional` is the T-SQL fact that breaks the one-statement rule: SQL Server
+--- ends a statement at whitespace, so `SELECT 1 DROP TABLE t` is TWO statements with no `;` for
+--- `single_statement_problem` to find (verified live on 2022). Under it, a write verb anywhere but
+--- the head is treated as opening a statement.
+---@field statement_separator_optional boolean
 
 M.dialects = {
   standard = {
@@ -36,7 +42,9 @@ M.dialects = {
     nested_comment = false,
     exec_comment = false,
     named_commands = false,
+    sqlcmd_commands = false,
     dash_comment_needs_space = false,
+    statement_separator_optional = false,
   },
   sqlite = {
     ident_quote = '"',
@@ -48,7 +56,9 @@ M.dialects = {
     nested_comment = false,
     exec_comment = false,
     named_commands = false,
+    sqlcmd_commands = false,
     dash_comment_needs_space = false,
+    statement_separator_optional = false,
   },
   postgres = {
     ident_quote = '"',
@@ -60,7 +70,9 @@ M.dialects = {
     nested_comment = true,
     exec_comment = false,
     named_commands = false,
+    sqlcmd_commands = false,
     dash_comment_needs_space = false,
+    statement_separator_optional = false,
   },
   mysql = {
     ident_quote = '`',
@@ -72,7 +84,43 @@ M.dialects = {
     nested_comment = false,
     exec_comment = true,
     named_commands = true,
+    sqlcmd_commands = false,
     dash_comment_needs_space = true,
+    statement_separator_optional = false,
+  },
+  --- DuckDB nests block comments (verified: `/* /* */` is unterminated, `/* /* */ */` parses) and
+  --- takes `$$`-quoted strings, so it lexes like postgres with backticks left OFF -- a backtick
+  --- there is not an identifier quote, and leaving it `punct` makes the statement unprovable
+  --- rather than silently mis-scanned.
+  duckdb = {
+    ident_quote = '"',
+    backtick = false,
+    bracket = false,
+    hash_comment = false,
+    dollar_quote = true,
+    backslash_escape = false,
+    nested_comment = true,
+    exec_comment = false,
+    named_commands = false,
+    sqlcmd_commands = false,
+    dash_comment_needs_space = false,
+    statement_separator_optional = false,
+  },
+  --- T-SQL. `[name]` is its native identifier quote; dblens EMITS `"name"`, which sqlcmd is told
+  --- to accept with `-I` (SET QUOTED_IDENTIFIER ON).
+  mssql = {
+    ident_quote = '"',
+    backtick = false,
+    bracket = true,
+    hash_comment = false,
+    dollar_quote = false,
+    backslash_escape = false,
+    nested_comment = true,
+    exec_comment = false,
+    named_commands = false,
+    sqlcmd_commands = true,
+    dash_comment_needs_space = false,
+    statement_separator_optional = true,
   },
 }
 
@@ -91,7 +139,12 @@ M.dialects.permissive = {
   nested_comment = false,
   exec_comment = true,
   named_commands = true,
+  sqlcmd_commands = true,
   dash_comment_needs_space = true,
+  -- OFF, unlike the other axes, and not an oversight. Statement juxtaposition is a T-SQL fact,
+  -- and assuming it for an unknown engine refuses ordinary reads (`SHOW CREATE TABLE t`) for no
+  -- gain: every security decision knows its dialect, because `Session:gate` passes the adapter's.
+  statement_separator_optional = false,
 }
 
 ---@class dblens.Token
@@ -649,17 +702,26 @@ local STATEMENT_START_AFTER = { ['('] = true, [')'] = true, [';'] = true }
 ---
 --- The head of the token stream is deliberately NOT such a place: a filter predicate starts with
 --- a column name, and a statement's own leading verb is classified before this is consulted.
+---
+--- Under a dialect that does not require a separator between statements (T-SQL), there is no such
+--- place to point at: any later word can begin one, so every position but the head counts. The
+--- cost is that an UNQUOTED column named after a non-reserved write verb (`copy`, `replace` used
+--- as a bare name) is refused there; quoting it makes it an identifier token again.
 ---@param toks dblens.Token[]
 ---@param index integer
+---@param dialect dblens.Dialect?
 ---@return boolean
-function M.opens_statement(toks, index)
+function M.opens_statement(toks, index, dialect)
   assert(type(index) == 'number' and index >= 1, 'sql.opens_statement: index must be positive')
-  local previous = toks[index - 1]
-  if not (previous and previous.type == 'punct' and STATEMENT_START_AFTER[previous.text]) then
-    return false
-  end
   local following = toks[index + 1]
-  return not (following and following.type == 'punct' and following.text == '(')
+  if following and following.type == 'punct' and following.text == '(' then
+    return false -- a call: `REPLACE(...)`, `TRUNCATE(x, 2)`
+  end
+  local previous = toks[index - 1]
+  if previous and previous.type == 'punct' and STATEMENT_START_AFTER[previous.text] then
+    return true
+  end
+  return (dialect or M.dialects.permissive).statement_separator_optional == true and index > 1
 end
 
 --- Classify a token stream as a read, or fail closed.
@@ -740,7 +802,7 @@ local function analyse(toks, depth, d)
     if t.type == 'word' then
       local word = t.text:upper()
       local hidden = read.scan and WRITE_VERBS[word]
-      if hidden and M.opens_statement(toks, index) then
+      if hidden and M.opens_statement(toks, index, d) then
         unread.destructive = hidden.destructive == true
         return unread
       end
@@ -849,6 +911,21 @@ local NAMED_COMMAND = {
   DELIMITER = true,
 }
 
+--- sqlcmd commands, which the CLIENT reads instead of sending. `GO` is the one that matters most:
+--- it ENDS the batch, so the statement after it runs outside anything the batch opened. `sqlcmd -X`
+--- refuses `:`-commands and `!!` but NOT `GO` (verified live), so this is the only layer that can.
+--- `RESET` is deliberately absent: it is a sqlcmd command AND a postgres statement (`RESET ALL`),
+--- it reaches nothing outside the database, and listing it would refuse a real read elsewhere.
+local SQLCMD_COMMAND = {
+  GO = true,
+  EXIT = true,
+  QUIT = true,
+  ED = true,
+  LIST = true,
+  LISTVAR = true,
+  SERVERLIST = true,
+}
+
 --- Reject a client meta-command before it reaches a client.
 ---
 --- These are not SQL and no connection setting covers them: `psql` runs `\!` as a shell command
@@ -873,9 +950,18 @@ function M.client_meta_problem(text, dialect)
     if dot then
       return ('refusing `%s`: client dot-commands are not SQL'):format(dot)
     end
-    local word = d.named_commands and line:match('^%s*([%a_]+)') or nil
-    if word and NAMED_COMMAND[word:upper()] then
+    local word = (d.named_commands or d.sqlcmd_commands) and line:match('^%s*([%a_]+)') or nil
+    if word and d.named_commands and NAMED_COMMAND[word:upper()] then
       return ('refusing `%s`: it is a client command that runs outside the database'):format(word)
+    end
+    if word and d.sqlcmd_commands and SQLCMD_COMMAND[word:upper()] then
+      return (
+        'refusing `%s`: it is a sqlcmd command, not SQL -- `GO` would end the batch and '
+        .. 'run what follows outside it'
+      ):format(word)
+    end
+    if d.sqlcmd_commands and line:match('^%s*:%S') then
+      return 'refusing a `:` sqlcmd command: it would run outside the database'
     end
   end
   for _, token in ipairs(M.tokens(text, d)) do
@@ -920,6 +1006,26 @@ local SIDE_CHANNEL = {
   {
     why = 'is a user-defined function that runs a command on the server',
     names = { 'SYS_EXEC', 'SYS_EVAL' },
+  },
+  {
+    why = 'runs a command on the SQL Server host, which no transaction governs',
+    names = { 'XP_CMDSHELL', 'SP_EXECUTE_EXTERNAL_SCRIPT', 'SP_OACREATE', 'SP_OAMETHOD' },
+  },
+  {
+    -- SQL Server has no read-only transaction to escape, so these matter more here than
+    -- elsewhere: each is one statement led by SELECT that reaches a file or another server.
+    why = "opens its own data source or reads the server's filesystem, outside this connection",
+    names = {
+      'OPENROWSET',
+      'OPENDATASOURCE',
+      'OPENQUERY',
+      'BULK',
+      'XP_DIRTREE',
+      'XP_SUBDIRS',
+      'XP_FILEEXIST',
+      'XP_FIXEDDRIVES',
+      'XP_REGREAD',
+    },
   },
 }
 

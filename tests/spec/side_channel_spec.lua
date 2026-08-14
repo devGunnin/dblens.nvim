@@ -33,6 +33,22 @@ local SIDE_CHANNELS = {
   { name = 'mysql LOAD_FILE', sql = "SELECT LOAD_FILE('/etc/passwd')" },
   { name = 'mysql sys_exec UDF', sql = "SELECT sys_exec('touch /tmp/pwned')" },
   { name = 'mysql sys_eval UDF', sql = "SELECT sys_eval('id')" },
+  --- SQL Server's are worth more here than anywhere else: it has no read-only transaction for
+  --- them to escape, so the name check is the only layer between a locked connection and them.
+  {
+    name = 'mssql OPENROWSET reads a file',
+    sql = "SELECT * FROM OPENROWSET(BULK '/etc/passwd', SINGLE_CLOB) x",
+  },
+  {
+    name = 'mssql OPENDATASOURCE opens another server',
+    sql = "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Server=evil').db.dbo.t",
+  },
+  {
+    name = 'mssql OPENQUERY runs on a linked server',
+    sql = "SELECT * FROM OPENQUERY(link, 'SELECT 1')",
+  },
+  { name = 'mssql xp_dirtree lists the filesystem', sql = "SELECT * FROM xp_dirtree('/tmp')" },
+  { name = 'mssql xp_fileexist', sql = "SELECT xp_fileexist('/tmp/x')" },
 }
 
 describe('side channels: what a locked connection cannot vouch for', function()
@@ -83,12 +99,78 @@ describe('side channels: what a locked connection cannot vouch for', function()
       "SELECT 'dblink_exec is refused' AS why",
       'SELECT "dblink_log" FROM audit',
       'SELECT * FROM "load_file"',
+      'SELECT "openrowset" FROM audit',
     }) do
-      for _, dialect in ipairs({ sql.dialects.postgres, sql.dialects.mysql, sql.dialects.sqlite }) do
+      -- mariadb is absent because it shares mysql's dialect; the case below drives every
+      -- registered ADAPTER, which is what proves no engine skips this layer.
+      for _, dialect in ipairs({
+        sql.dialects.postgres,
+        sql.dialects.mysql,
+        sql.dialects.sqlite,
+        sql.dialects.duckdb,
+        sql.dialects.mssql,
+      }) do
         eq(sql.side_channel_problem(text, dialect), nil, {
           fail_reason = ('`%s` is an ordinary read'):format(text),
         })
       end
+    end
+  end)
+
+  --- The list is shared across dialects on purpose: it is a name check, and a name that reaches
+  --- outside the connection on one engine is not safe to allow on another just because that
+  --- engine does not define it. What matters is that every ENGINE routes through it.
+  it('applies to every registered adapter, with the dialect that adapter uses', function()
+    local adapters = require('dblens.adapters')
+    for _, kind in ipairs(adapters.kinds()) do
+      local adapter = assert(adapters.get(kind))
+      eq(
+        type(sql.side_channel_problem("SELECT LOAD_FILE('/etc/passwd')", adapter.dialect)),
+        'string',
+        {
+          fail_reason = ('%s does not refuse a known side channel'):format(kind),
+        }
+      )
+      eq(sql.side_channel_problem('SELECT a FROM t WHERE b = 1', adapter.dialect), nil, {
+        fail_reason = ('%s refuses an ordinary read'):format(kind),
+      })
+    end
+  end)
+
+  --- MariaDB shares MySQL's dialect and so its list: `LOAD_FILE` reads a file on the server, and
+  --- `INTO OUTFILE`/`INTO DUMPFILE` write one. The first is named here, the last two are refused a
+  --- layer earlier as a banned read tail.
+  it('covers the mariadb file functions on a locked mariadb connection', function()
+    local session = h.fake_session(
+      require('dblens.session'),
+      { kind = 'mariadb', database = 'app', read_only = true }
+    )
+    for _, payload in ipairs({
+      "SELECT LOAD_FILE('/etc/passwd')",
+      "SELECT * FROM users INTO OUTFILE '/tmp/pwned'",
+      "SELECT a FROM users INTO DUMPFILE '/tmp/pwned'",
+    }) do
+      eq(type(session:gate(payload)), 'string', { fail_reason = payload .. ' was not refused' })
+    end
+  end)
+
+  --- On mssql this list matters more than anywhere else: there is no read-only transaction for
+  --- these to escape, so nothing behind the name check would have stopped them.
+  it('refuses every mssql side channel on a locked mssql connection', function()
+    local session = h.fake_session(
+      require('dblens.session'),
+      { kind = 'mssql', database = 'app', read_only = true }
+    )
+    for _, payload in ipairs({
+      "SELECT * FROM OPENROWSET(BULK '/etc/passwd', SINGLE_CLOB) x",
+      "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Server=evil').db.dbo.t",
+      "SELECT * FROM OPENQUERY(link, 'SELECT 1')",
+      "SELECT * FROM xp_dirtree('/tmp')",
+      "SELECT xp_fileexist('/tmp/x')",
+      "EXEC xp_cmdshell 'id'",
+      "BULK INSERT t FROM '/etc/passwd'",
+    }) do
+      eq(type(session:gate(payload)), 'string', { fail_reason = payload .. ' was not refused' })
     end
   end)
 end)
@@ -162,6 +244,21 @@ describe('side channels: the ones earlier layers already refuse', function()
       by = 'DUMPFILE is banned in a read tail',
     },
     { name = 'LOAD DATA INFILE', sql = "LOAD DATA INFILE '/etc/passwd' INTO TABLE t", by = 'LOAD' },
+    {
+      name = 'mssql xp_cmdshell',
+      sql = "EXEC xp_cmdshell 'id'",
+      by = 'EXEC is a write verb',
+    },
+    {
+      name = 'mssql sp_execute_external_script',
+      sql = "EXECUTE sp_execute_external_script @language = N'Python', @script = N'x'",
+      by = 'EXECUTE is a write verb',
+    },
+    {
+      name = 'mssql BULK INSERT',
+      sql = "BULK INSERT t FROM '/etc/passwd'",
+      by = 'not a read verb',
+    },
   }
 
   it('classifies each as a write, so a locked connection refuses it', function()

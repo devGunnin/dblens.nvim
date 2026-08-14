@@ -89,7 +89,14 @@ local function classify(cell, declared)
   return 'text'
 end
 
-local CLASS_HL = { null = 'DbLensNull', number = 'DbLensNumber', boolean = 'DbLensBoolean' }
+--- One group per class, text included: a documented `DbLensString` that nothing ever applied was
+--- an override the user could set and never see.
+local CLASS_HL = {
+  null = 'DbLensNull',
+  number = 'DbLensNumber',
+  boolean = 'DbLensBoolean',
+  text = 'DbLensString',
+}
 
 ---@class dblens.GridInput
 ---@field columns string[]

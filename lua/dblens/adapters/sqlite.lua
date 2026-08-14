@@ -32,6 +32,11 @@ local M = {
     explain_analyze = false,
     estimate_rows = false,
   },
+  read_only_enforcement = {
+    mechanism = 'file-open',
+    strength = 'strong',
+    summary = 'the database file is opened `-readonly`, so the engine refuses every write',
+  },
   --- Required connection fields, used by the connection form and by validation.
   fields = { { name = 'path', label = 'Database file', required = true } },
 }
@@ -153,6 +158,11 @@ end
 --- Rows touched by the statement that just ran, in the same client invocation.
 function M.sql.affected()
   return 'SELECT changes() AS affected'
+end
+
+--- How the commit batch opens and closes. Atomicity comes from `-bail`, not from these keywords.
+function M.sql.batch_frame()
+  return { open = 'BEGIN;', close = 'COMMIT;' }
 end
 
 --- A statement that fails unless `count_sql` yields exactly 1, so a queued change is re-guarded

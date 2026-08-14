@@ -18,7 +18,7 @@ local h = require('helpers')
 local sql = require('dblens.sql')
 
 local eq = h.eq
-local CLIENTS = { sqlite = 'sqlite3', postgres = 'psql', mysql = 'mysql' }
+local CLIENTS = h.CLIENTS
 
 local function get(kind)
   local adapter, err = require('dblens.adapters').get(kind)
@@ -26,10 +26,20 @@ local function get(kind)
   return adapter
 end
 
---- What each adapter must put on the wire to make the SERVER enforce read-only.
+--- What each adapter must put on the wire to make the ENGINE enforce read-only.
+---
+--- `switch = false` means there is nothing to put there, and that is a CLAIM about the engine
+--- rather than an omission: SQL Server has no read-only connection mode, so its locked mode is
+--- the gate's classifier. An adapter is only allowed in that row if it declares itself
+--- best-effort, which is what keeps this table from becoming a place to hide a missing mechanism.
 local MECHANISM = {
   sqlite = {
     spec = { kind = 'sqlite', path = '/tmp/dblens-ro.db' },
+    where = 'argv',
+    switch = '-readonly',
+  },
+  duckdb = {
+    spec = { kind = 'duckdb', path = '/tmp/dblens-ro.duckdb' },
     where = 'argv',
     switch = '-readonly',
   },
@@ -43,6 +53,16 @@ local MECHANISM = {
     where = 'argv',
     switch = '--init-command=SET SESSION TRANSACTION READ ONLY',
   },
+  mariadb = {
+    spec = { kind = 'mariadb', database = 'app' },
+    where = 'argv',
+    switch = '--init-command=SET SESSION TRANSACTION READ ONLY',
+  },
+  mssql = {
+    spec = { kind = 'mssql', database = 'app' },
+    where = 'nowhere',
+    switch = false,
+  },
 }
 
 local function flatten(command)
@@ -53,66 +73,195 @@ local function flatten(command)
   return parts
 end
 
-describe('read-only is enforced by the server, per adapter', function()
+describe('read-only is enforced by the engine, per adapter', function()
   it('puts the documented switch on the wire for a read-only connection', function()
     for kind, want in pairs(MECHANISM) do
-      local spec = vim.tbl_extend('force', want.spec, { read_only = true })
-      local command = get(kind).command(spec, nil, 'records', CLIENTS)
-      eq(
-        h.has(flatten(command), want.switch),
-        true,
-        { fail_reason = ('%s must pass `%s` in %s'):format(kind, want.switch, want.where) }
-      )
+      if want.switch then
+        local spec = vim.tbl_extend('force', want.spec, { read_only = true })
+        local command = get(kind).command(spec, nil, 'records', CLIENTS)
+        eq(
+          h.has(flatten(command), want.switch),
+          true,
+          { fail_reason = ('%s must pass `%s` in %s'):format(kind, want.switch, want.where) }
+        )
+      end
     end
   end)
 
   it('leaves a writable connection writable', function()
     for kind, want in pairs(MECHANISM) do
-      local spec = vim.tbl_extend('force', want.spec, { read_only = false })
-      local command = get(kind).command(spec, nil, 'records', CLIENTS)
-      eq(
-        h.has(flatten(command), want.switch),
-        false,
-        { fail_reason = ('%s must not force read-only on a writable connection'):format(kind) }
-      )
+      if want.switch then
+        local spec = vim.tbl_extend('force', want.spec, { read_only = false })
+        local command = get(kind).command(spec, nil, 'records', CLIENTS)
+        eq(
+          h.has(flatten(command), want.switch),
+          false,
+          { fail_reason = ('%s must not force read-only on a writable connection'):format(kind) }
+        )
+      end
     end
   end)
 
+  --- duckdb needs BOTH switches, and this is not tidiness: verified live that under `-readonly`
+  --- alone, `COPY (SELECT 1) TO '/tmp/x.csv'` still WROTE the file. `-readonly` covers the
+  --- database, `-safe` covers the filesystem.
+  it('locks duckdb against the filesystem as well as the database', function()
+    local spec = { kind = 'duckdb', path = '/tmp/dblens-ro.duckdb', read_only = true }
+    local locked = get('duckdb').command(spec, nil, 'records', CLIENTS).argv
+    eq({ h.has(locked, '-readonly'), h.has(locked, '-safe') }, { true, true })
+    local writable = get('duckdb').command(
+      vim.tbl_extend('force', spec, { read_only = false }),
+      nil,
+      'records',
+      CLIENTS
+    ).argv
+    eq(h.has(writable, '-safe'), false, {
+      fail_reason = '-safe on a writable connection would break read_csv, which is most of duckdb',
+    })
+  end)
+
   --- Guards the pivot itself: an adapter that ignores `read_only` would be back to trusting the
-  --- classifier, silently, and every unit test above would still pass for the other two.
-  it('makes every registered adapter answer differently for a read-only connection', function()
+  --- classifier, silently, and every unit test above would still pass for the other adapters.
+  --- An adapter is allowed to build the same command either way ONLY by declaring that it has no
+  --- engine-side mechanism at all, which is what `best-effort` means.
+  it('makes every registered adapter either differ, or admit it is classifier-only', function()
     local kinds = require('dblens.adapters').kinds()
     eq(#kinds > 0, true)
     for _, kind in ipairs(kinds) do
-      local base = MECHANISM[kind] and MECHANISM[kind].spec
-      eq(
-        base ~= nil,
-        true,
-        { fail_reason = ('adapter `%s` has no read-only mechanism'):format(kind) }
-      )
+      local entry = MECHANISM[kind]
+      eq(entry ~= nil, true, { fail_reason = ('adapter `%s` has no mechanism row'):format(kind) })
       local adapter = get(kind)
-      local writable = flatten(
-        adapter.command(
-          vim.tbl_extend('force', base, { read_only = false }),
-          nil,
-          'records',
-          CLIENTS
-        )
-      )
-      local locked = flatten(
-        adapter.command(
-          vim.tbl_extend('force', base, { read_only = true }),
-          nil,
-          'records',
-          CLIENTS
-        )
-      )
-      h.neq(
-        locked,
-        writable,
-        { fail_reason = ('adapter `%s` builds the same command either way'):format(kind) }
-      )
+      local function build(read_only)
+        local spec = vim.tbl_extend('force', entry.spec, { read_only = read_only })
+        return flatten(adapter.command(spec, nil, 'records', CLIENTS))
+      end
+      if entry.switch then
+        eq(adapter.read_only_enforcement.strength, 'strong', { fail_reason = kind })
+        h.neq(build(true), build(false), {
+          fail_reason = ('adapter `%s` builds the same command either way'):format(kind),
+        })
+      else
+        eq(adapter.read_only_enforcement.strength, 'best-effort', {
+          fail_reason = ('adapter `%s` has no read-only switch but claims to be strong'):format(
+            kind
+          ),
+        })
+      end
     end
+  end)
+end)
+
+--- The whole of what a LOCKED mssql connection is: a refusal dblens makes itself. No case here
+--- asks a server anything, because there is no server-side mechanism to ask about.
+describe('mssql: LOCKED is the classifier, and the tests say so', function()
+  local LOCKED_SPEC = { kind = 'mssql', database = 'app', read_only = true }
+
+  local function locked_session()
+    return h.fake_session(require('dblens.session'), LOCKED_SPEC)
+  end
+
+  --- `-K ReadOnly` is ApplicationIntent, which enforces nothing outside an availability group:
+  --- verified live on SQL Server 2022 that an INSERT sent under it lands. If a later change ever
+  --- makes it look like the mechanism, the declaration below is what contradicts it.
+  it('does not claim `-K ReadOnly` as enforcement', function()
+    local argv = get('mssql').command(LOCKED_SPEC, nil, 'records', CLIENTS).argv
+    eq(h.has(argv, 'ReadOnly'), true)
+    eq(get('mssql').read_only_enforcement.mechanism, 'classifier')
+    eq(get('mssql').read_only_enforcement.strength, 'best-effort')
+  end)
+
+  it('refuses every plain write at the gate, before a client is spawned', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local session = h.fake_session(session_mod, LOCKED_SPEC)
+      for _, statement in ipairs({
+        'DROP TABLE victim',
+        'DELETE FROM victim',
+        'UPDATE victim SET a = 99',
+        'INSERT INTO victim VALUES (1)',
+        'TRUNCATE TABLE victim',
+        'EXEC sp_configure',
+      }) do
+        local box = h.capture()
+        session:run(statement, {}, box.sink)
+        eq(type(box[2]), 'string', { fail_reason = statement .. ' reached a client' })
+      end
+      eq(#calls, 0)
+    end)
+  end)
+
+  --- THE T-SQL FACT. `SELECT 1 DROP TABLE victim` has no `;` in it, and live on SQL Server 2022
+  --- it ran both statements and dropped the table. The framing rule is a scan for `;`, so it
+  --- passes this; the dialect's `statement_separator_optional` is what refuses it.
+  it('refuses a second statement that is only separated by a space', function()
+    local sqlmod = require('dblens.sql')
+    local JUXTAPOSED = {
+      'SELECT 1 DROP TABLE victim',
+      'SELECT a FROM t DELETE FROM victim',
+      'SELECT 1 INSERT INTO victim VALUES (1)',
+      "SELECT 1 EXEC xp_cmdshell 'id'",
+    }
+    for _, payload in ipairs(JUXTAPOSED) do
+      eq(sqlmod.single_statement_problem(payload), nil, {
+        fail_reason = ('%s: the framing rule cannot see this, which is the point'):format(payload),
+      })
+      eq(sqlmod.classify(payload, sqlmod.dialects.mssql).write, true, {
+        fail_reason = ('%s must classify as a write on T-SQL'):format(payload),
+      })
+      eq(type(locked_session():gate(payload)), 'string', {
+        fail_reason = ('%s reached the client on a locked mssql connection'):format(payload),
+      })
+    end
+  end)
+
+  --- `GO` ends the sqlcmd batch, so anything after it runs outside the wrap. Verified live that
+  --- `SELECT 1 / GO / DROP TABLE victim` dropped the table, and that `sqlcmd -X` does not stop it.
+  it('refuses `GO` and the sqlcmd `:` commands', function()
+    local session = locked_session()
+    for _, payload in ipairs({
+      'SELECT 1\nGO\nDROP TABLE victim',
+      'GO',
+      ':!! touch /tmp/pwned',
+      ':r /etc/passwd',
+    }) do
+      eq(type(session:gate(payload)), 'string', { fail_reason = payload .. ' was not refused' })
+    end
+  end)
+
+  --- Refused whatever the mode, like every other client meta-command: they never reach a server,
+  --- so no connection setting covers them.
+  it('refuses `GO` on a writable connection too', function()
+    local session = h.fake_session(
+      require('dblens.session'),
+      { kind = 'mssql', database = 'app', read_only = false }
+    )
+    eq(type(session:gate('SELECT 1\nGO\nDROP TABLE victim')), 'string')
+  end)
+
+  it('still lets an ordinary read through', function()
+    local session = locked_session()
+    for _, statement in ipairs({
+      'SELECT * FROM users WHERE a = 1',
+      'SELECT TOP 10 name FROM sys.tables ORDER BY name',
+      "SELECT REPLACE(name, 'a', 'b') FROM t",
+      'SELECT count(*) AS n FROM "dbo"."my tbl"',
+    }) do
+      eq(session:gate(statement), nil, { fail_reason = statement .. ' was wrongly refused' })
+    end
+  end)
+
+  --- Defence in depth, and named as such: the wrap ROLLS BACK rather than refusing, so it is what
+  --- catches a classifier miss, not what makes the connection read-only.
+  it('wraps a locked run in a transaction it rolls back', function()
+    local script = get('mssql').read_only_script('SELECT 1')
+    eq(script:sub(1, 20), 'SET XACT_ABORT ON;\nB')
+    eq(script:find('BEGIN TRANSACTION;', 1, true) ~= nil, true)
+    eq(script:find('SELECT 1', 1, true) ~= nil, true)
+    eq(script:find('ROLLBACK TRANSACTION;', 1, true) ~= nil, true)
+    eq(script:find('COMMIT', 1, true), nil, {
+      fail_reason = 'a locked mssql run must never commit: ' .. script,
+    })
   end)
 end)
 
@@ -146,10 +295,11 @@ end)
 local WRAP = {
   postgres = 'BEGIN READ ONLY;',
   mysql = 'START TRANSACTION READ ONLY;',
+  mariadb = 'START TRANSACTION READ ONLY;',
 }
 
 describe('a locked run is sent inside a server-side read-only transaction', function()
-  it('opens one per adapter, and leaves sqlite alone', function()
+  it('opens one per adapter, and leaves the file-backed ones alone', function()
     for kind, opener in pairs(WRAP) do
       local script = get(kind).read_only_script('SELECT 1')
       eq(script:sub(1, #opener), opener, {
@@ -157,8 +307,9 @@ describe('a locked run is sent inside a server-side read-only transaction', func
       })
       eq(script:find('SELECT 1', 1, true) ~= nil, true)
     end
-    -- sqlite's `-readonly` is the file open mode, so there is no session state to wrap.
+    -- `-readonly` is the file open mode for both, so there is no session state to wrap.
     eq(get('sqlite').read_only_script('SELECT 1'), 'SELECT 1')
+    eq(get('duckdb').read_only_script('SELECT 1'), 'SELECT 1')
   end)
 
   --- PostgreSQL lets `SET TRANSACTION READ WRITE` escalate a read-only transaction until the
@@ -358,6 +509,169 @@ describe('sqlite3, live: the server refuses the write, not the classifier', func
   end)
 end)
 
+--- duckdb, live. Same proof as sqlite's -- a real database file, the argv the adapter really
+--- builds, no gate in front of it -- plus the one duckdb needs and sqlite does not: `-readonly`
+--- covers the DATABASE, and it took `-safe` to cover the FILESYSTEM.
+---
+--- The nested-comment payload is absent on purpose: duckdb NESTS block comments, so
+--- `SELECT 1 /* /* */ ; DROP TABLE victim` is a parse error there rather than a stacked write,
+--- and a case that cannot land even when allowed would prove nothing about the locked run.
+describe('duckdb, live: the engine refuses the write, not the classifier', function()
+  local duckdb = get('duckdb')
+  local scratch, client = nil, nil
+
+  local function seed()
+    local db = ('%s/victim-%d.duckdb'):format(scratch, math.random(1, 2 ^ 30))
+    local made = vim
+      .system({
+        client,
+        '-batch',
+        '-bail',
+        db,
+        'CREATE TABLE victim(a int); INSERT INTO victim VALUES (1);',
+      })
+      :wait()
+    assert(made.code == 0, 'readonly_spec: could not seed the duckdb database: ' .. made.stderr)
+    return db
+  end
+
+  --- Read back over a WRITABLE connection, so the count is the engine's own.
+  local function state_of(db)
+    local exists = vim
+      .system({ client, '-batch', db, "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'victim'" })
+      :wait()
+    local rows = vim.system({ client, '-batch', db, 'SELECT count(*) FROM victim' }):wait()
+    return {
+      victim = vim.trim(exists.stdout),
+      rows = rows.code == 0 and vim.trim(rows.stdout) or 'gone',
+    }
+  end
+
+  local function send(db, read_only, statement)
+    local spec = { kind = 'duckdb', path = db, read_only = read_only }
+    local command = duckdb.command(spec, nil, 'records', h.CLIENTS)
+    return vim.system(command.argv, { stdin = statement }):wait(60000)
+  end
+
+  local function skip()
+    if client then
+      return false
+    end
+    MiniTest.add_note('duckdb is not installed; the live duckdb read-only proof did not run')
+    return true
+  end
+
+  before_each(function()
+    local target = h.live_file_client('duckdb')
+    client = target and target.client or nil
+    scratch = vim.fn.tempname()
+    vim.fn.mkdir(scratch, 'p')
+  end)
+
+  after_each(function()
+    if scratch then
+      vim.fn.delete(scratch, 'rf')
+    end
+  end)
+
+  local DUCK_WRITES = {
+    { name = 'DROP TABLE', sql = 'DROP TABLE victim' },
+    { name = 'DELETE', sql = 'DELETE FROM victim' },
+    { name = 'UPDATE', sql = 'UPDATE victim SET a = 99' },
+    { name = 'INSERT', sql = 'INSERT INTO victim VALUES (2)' },
+    {
+      name = 'INSERT behind a CTE',
+      sql = 'WITH x AS (SELECT 2 AS n) INSERT INTO victim SELECT n FROM x',
+    },
+    { name = 'CREATE TABLE', sql = 'CREATE TABLE sneaky(a int)' },
+    { name = 'ALTER TABLE', sql = 'ALTER TABLE victim ADD COLUMN b int' },
+  }
+
+  it('applies every one of these writes on a WRITABLE connection', function()
+    if skip() then
+      return
+    end
+    for _, case in ipairs(DUCK_WRITES) do
+      local db = seed()
+      local result = send(db, false, case.sql)
+      eq(result.code, 0, {
+        fail_reason = ('%s failed even when allowed: %s'):format(case.name, result.stderr),
+      })
+    end
+  end)
+
+  it('has the ENGINE refuse every one of them on a read-only connection', function()
+    if skip() then
+      return
+    end
+    for _, case in ipairs(DUCK_WRITES) do
+      local db = seed()
+      local before = state_of(db)
+      local result = send(db, true, case.sql)
+      eq(result.code ~= 0, true, {
+        fail_reason = ('%s: the client exited 0, so the engine did not refuse it'):format(
+          case.name
+        ),
+      })
+      eq({ state_of(db).victim, state_of(db).rows }, { before.victim, before.rows }, {
+        fail_reason = ('%s: the database changed on a read-only connection'):format(case.name),
+      })
+    end
+  end)
+
+  --- THE CASE `-readonly` ALONE MISSES. Verified: with `-readonly` but no `-safe`, this wrote the
+  --- file. Read-only is about the database; a COPY TO reaches the filesystem.
+  it('refuses to write a file from a locked connection', function()
+    if skip() then
+      return
+    end
+    local db = seed()
+    local target = ('%s/exfiltrated.csv'):format(scratch)
+    local result = send(db, true, ("COPY (SELECT 1) TO '%s'"):format(target))
+    eq(result.code ~= 0, true, { fail_reason = 'COPY TO was allowed on a locked connection' })
+    eq(vim.fn.filereadable(target), 0, {
+      fail_reason = 'a locked duckdb connection wrote a file on this machine',
+    })
+  end)
+
+  it('still lets ordinary reads through', function()
+    if skip() then
+      return
+    end
+    local db = seed()
+    for _, statement in ipairs({
+      'SELECT count(*) FROM victim',
+      "SELECT REPLACE('abc', 'a', 'z')",
+      'SELECT a FROM victim ORDER BY a',
+    }) do
+      local result = send(db, true, statement)
+      eq(result.code, 0, {
+        fail_reason = ('a locked connection refused the read `%s`: %s'):format(
+          statement,
+          result.stderr
+        ),
+      })
+    end
+  end)
+
+  --- The wire format, proved against the client rather than against a fixture: `-ascii` does NOT
+  --- set duckdb's separators the way it sets sqlite3's, so the adapter passes them explicitly.
+  it('decodes a real result, NULLs and all, through the adapter', function()
+    if skip() then
+      return
+    end
+    local db = seed()
+    local out = send(db, true, "SELECT 1 AS a, NULL AS b, 'NULL' AS c")
+    eq(out.code, 0, { fail_reason = out.stderr })
+    local decoded = duckdb.decode(out.stdout, {})
+    eq(decoded.columns, { 'a', 'b', 'c' })
+    eq(decoded.rows[1][1], '1')
+    eq(decoded.rows[1][2], h.NULL, { fail_reason = 'a real NULL must decode as NULL' })
+    eq(decoded.rows[1][3], 'NULL', { fail_reason = "the string 'NULL' must survive as text" })
+    eq(decoded.malformed, 0)
+  end)
+end)
+
 --- Payloads that turn the read-only switch off mid-run and then write. Every one of them LANDED
 --- a write on a `read_only = true` connection before the transaction wrap; inside an open
 --- read-only transaction the server refuses them, because a `SET` retargets only LATER
@@ -390,9 +704,15 @@ local FLIPS = {
       sql = 'SELECT 1 --1; SET SESSION TRANSACTION READ WRITE; INSERT INTO victim VALUES (98)',
     },
     { name = 'plain INSERT', sql = 'INSERT INTO victim VALUES (97)' },
+    --- DDL is the case the transaction wrap does NOT cover on its own: verified on both engines
+    --- that inside a bare `START TRANSACTION READ ONLY`, `DROP TABLE` succeeds, because DDL
+    --- commits the transaction implicitly. `SET SESSION TRANSACTION READ ONLY` in `command` is
+    --- what refuses it, so this case is here to fail loudly if that switch is ever dropped.
     { name = 'DROP TABLE', sql = 'DROP TABLE victim' },
+    { name = 'TRUNCATE TABLE', sql = 'TRUNCATE TABLE victim' },
   },
 }
+FLIPS.mariadb = FLIPS.mysql
 
 local live_target = h.live_target
 
@@ -556,6 +876,7 @@ end
 
 describe_live('postgres')
 describe_live('mysql')
+describe_live('mariadb')
 
 describe('the MySQL `--` rule', function()
   local PAYLOAD = 'SELECT 1 --1; SET SESSION TRANSACTION READ WRITE; INSERT INTO victim VALUES (1)'
@@ -613,6 +934,8 @@ local ESCAPES = {
     'COMMIT; SET SESSION TRANSACTION READ WRITE; INSERT INTO victim VALUES (7)',
   },
 }
+--- Verified live on MariaDB 11.8.8 that both of these LAND when sent anyway, exactly as on MySQL.
+ESCAPES.mariadb = ESCAPES.mysql
 
 describe('the statements that can still leave the read-only transaction', function()
   it('classifies every one of them as a write, on its own dialect and permissively', function()

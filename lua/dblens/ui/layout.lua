@@ -46,6 +46,15 @@ local function configure_window(win, pane, options)
   wo.list = false
   wo.wrap = false
   wo.cursorline = pane ~= 'editor'
+  -- The row under the cursor is the only row marker in the data panes, so it stays on even when
+  -- the pane is not focused.
+  wo.cursorlineopt = pane ~= 'editor' and 'line' or 'both'
+  wo.winhighlight = require('dblens.ui.highlights').winhighlight(options.ui.statusline)
+  if options.ui.statusline then
+    -- The winbar already names the pane, so the line between two panes is a rule rather than a
+    -- repeated `dblens: query.sql`. Window-local, so it never touches the user's own windows.
+    wo.statusline = "%{repeat('─', winwidth(0))}"
+  end
   -- `~` past the last line reads as clutter in a data pane.
   wo.fillchars = 'eob: '
   wo.winfixwidth = pane == 'sidebar'
@@ -53,6 +62,41 @@ local function configure_window(win, pane, options)
   if not options.ui.winbar then
     wo.winbar = ''
   end
+end
+
+--- The sidebar yields down to this before the grid is allowed to take the rest.
+local MIN_SIDEBAR = 20
+--- Columns the grid keeps before the sidebar starts giving any back.
+local MIN_MAIN = 50
+
+--- Sidebar width for a terminal this wide.
+---
+--- The configured width is a preference, not a demand: 34 columns of tree beside a 45-column
+--- grid is unreadable on an 80-column terminal, so the sidebar yields once the grid would drop
+--- below `MIN_MAIN`. On anything roomier the configured width is honoured exactly.
+---@param configured integer
+---@param total_columns integer
+---@return integer  -- at least 1, never wider than the screen
+function M.sidebar_width(configured, total_columns)
+  assert(type(configured) == 'number' and configured > 0, 'layout.sidebar_width: bad width')
+  assert(type(total_columns) == 'number', 'layout.sidebar_width: needs the screen width')
+  local width = math.min(configured, math.max(MIN_SIDEBAR, total_columns - MIN_MAIN))
+  return math.max(1, math.min(width, math.max(1, total_columns - 1)))
+end
+
+--- Rows for the results pane out of the rows the two stacked panes share.
+---@param total_rows integer
+---@param share number  -- fraction strictly between 0 and 1
+---@return integer  -- at least 1, and always leaves the editor at least 1
+function M.results_height(total_rows, share)
+  assert(type(total_rows) == 'number', 'layout.results_height: needs the rows available')
+  assert(type(share) == 'number' and share > 0 and share < 1, 'layout.results_height: bad share')
+  if total_rows < 2 then
+    return 1
+  end
+  -- Below three rows the grid cannot show a header, its rule and one row of data.
+  local height = math.max(math.floor(total_rows * share), math.min(3, total_rows - 1))
+  return math.max(1, math.min(height, total_rows - 1))
 end
 
 --- Build the three-pane layout in a new tabpage.
@@ -94,16 +138,18 @@ function M.open(options)
   return layout
 end
 
---- Apply the configured sidebar width and results share.
+--- Apply the configured sidebar width and results share to the space actually available.
 function M.resize(layout, options)
   if not M.is_open(layout) then
     return
   end
-  api.nvim_win_set_width(layout.wins.sidebar, options.ui.sidebar.width)
+  api.nvim_win_set_width(
+    layout.wins.sidebar,
+    M.sidebar_width(options.ui.sidebar.width, vim.o.columns)
+  )
   local total = api.nvim_win_get_height(layout.wins.editor)
     + api.nvim_win_get_height(layout.wins.results)
-  local results = math.max(3, math.floor(total * options.ui.results.height))
-  api.nvim_win_set_height(layout.wins.results, results)
+  api.nvim_win_set_height(layout.wins.results, M.results_height(total, options.ui.results.height))
 end
 
 ---@return boolean
@@ -117,6 +163,21 @@ function M.is_open(layout)
     end
   end
   return true
+end
+
+--- Which pane the cursor is in, or nil when it is somewhere else entirely.
+---@return 'sidebar'|'editor'|'results'|nil
+function M.current_pane(layout)
+  if not layout then
+    return nil
+  end
+  local win = api.nvim_get_current_win()
+  for _, pane in ipairs(PANES) do
+    if layout.wins[pane] == win then
+      return pane
+    end
+  end
+  return nil
 end
 
 --- Move the cursor to a pane. Returns false when that pane is gone.

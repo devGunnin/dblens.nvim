@@ -72,8 +72,23 @@ end
 --- Interactively add a connection to the connections file.
 ---@param options table
 ---@param on_done fun(spec: dblens.ConnectionSpec)?
+--- `sqlite -- SQLite (read-only: strong)`. The strength is in the picker because it is the one
+--- thing that differs between engines and cannot be discovered later without reading the docs.
+local function describe_kind(kind)
+  local adapter = adapters.get(kind)
+  if not adapter then
+    return kind
+  end
+  return ('%s -- %s (read-only: %s)'):format(
+    kind,
+    adapter.label,
+    adapter.read_only_enforcement.strength
+  )
+end
+
 function M.add(options, on_done)
-  vim.ui.select(adapters.kinds(), { prompt = 'Database kind' }, function(kind)
+  local select_opts = { prompt = 'Database kind', format_item = describe_kind }
+  vim.ui.select(adapters.kinds(), select_opts, function(kind)
     if not kind then
       return
     end

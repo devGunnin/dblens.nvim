@@ -8,13 +8,24 @@ local api = vim.api
 
 local M = {}
 
-local WELCOME = {
-  '-- dblens scratch buffer',
-  '-- <CR> runs the statement at the cursor, or the selection in visual mode',
-  '-- ? shows every binding',
-  '',
-  '',
-}
+--- The opening lines of the scratch buffer, naming the keys that are actually bound. Hardcoding
+--- them meant the buffer told a user who had remapped `run` to press a key that did nothing.
+local function welcome(options)
+  local overrides = options.keymaps.editor
+  local run = keymaps.lhs_for('editor', 'run', overrides)
+  local help = keymaps.lhs_for('editor', 'help', overrides)
+  local lines = { '-- dblens scratch buffer' }
+  if run then
+    -- Short enough to survive an 80-column terminal without being clipped.
+    lines[#lines + 1] = ('-- %s  run the statement at the cursor, or the selection'):format(run)
+  end
+  if help then
+    lines[#lines + 1] = ('-- %s  every binding'):format(help)
+  end
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = ''
+  return lines
+end
 
 --- Byte offset of the cursor within the buffer's text, 1-based.
 local function cursor_offset(buf, win)
@@ -79,14 +90,14 @@ function M.render(state)
   end
   local session = state.session
   local segments = {
-    { text = ' SQL', hl = 'DbLensTitle' },
-    { text = session and session.spec.name or 'not connected', hl = 'DbLensAccent' },
+    { text = ' SQL', hl = 'DbLensTitle', keep = true },
+    { text = session and session.spec.name or 'not connected', hl = 'DbLensAccent', keep = true },
   }
   if session and session.txn:is_active() then
-    segments[#segments + 1] = { text = session.txn:label(), hl = 'DbLensTxn' }
+    segments[#segments + 1] = { text = session.txn:label(), hl = 'DbLensTxn', keep = true }
   end
   if state.busy then
-    segments[#segments + 1] = { text = state.busy, hl = 'DbLensSpinner' }
+    segments[#segments + 1] = { text = state.busy, hl = 'DbLensSpinner', keep = true }
   end
   status.set(win, segments, state.options)
 end
@@ -150,7 +161,8 @@ end
 function M.attach(state)
   local app = require('dblens.app')
   local buf = state.layout.bufs.editor
-  layout_mod.set_lines(buf, WELCOME)
+  local lines = welcome(state.options)
+  layout_mod.set_lines(buf, lines)
   vim.bo[buf].modifiable = true
   keymaps.bind('editor', buf, handlers(state, app), state.options.keymaps.editor)
   if state.options.completion.enabled then
@@ -160,7 +172,7 @@ function M.attach(state)
   end
   local win = state.layout.wins.editor
   if api.nvim_win_is_valid(win) then
-    api.nvim_win_set_cursor(win, { #WELCOME, 0 })
+    api.nvim_win_set_cursor(win, { #lines, 0 })
   end
 end
 

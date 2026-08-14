@@ -37,6 +37,9 @@ M.defaults = {
 
   ui = {
     border = 'rounded',
+    --- Draw the line between two panes as a plain rule instead of the buffer name. Window-local
+    --- to the dblens tab; set false to keep your own statusline there.
+    statusline = true,
     --- true = plain Unicode symbols, 'nerd' = Nerd Font glyphs, false = ASCII.
     icons = true,
     winbar = true,
@@ -60,7 +63,16 @@ M.defaults = {
     highlights = {},
   },
 
-  clients = { sqlite = 'sqlite3', postgres = 'psql', mysql = 'mysql' },
+  --- One entry per adapter kind: the binary each one shells out to. MariaDB ships `mariadb`
+  --- rather than `mysql`, and SQL Server's client is `sqlcmd` (Microsoft's or go-sqlcmd).
+  clients = {
+    sqlite = 'sqlite3',
+    postgres = 'psql',
+    mysql = 'mysql',
+    mariadb = 'mariadb',
+    duckdb = 'duckdb',
+    mssql = 'sqlcmd',
+  },
 
   --- Per-scope action -> lhs overrides. Defaults and valid action names live in `dblens.keymaps`.
   keymaps = { global = {}, sidebar = {}, results = {}, editor = {} },

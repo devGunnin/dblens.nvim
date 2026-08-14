@@ -25,6 +25,12 @@ local M = {
     explain_analyze = true,
     estimate_rows = true,
   },
+  read_only_enforcement = {
+    mechanism = 'session-and-transaction',
+    strength = 'strong',
+    summary = 'every locked run is sent inside a pinned `BEGIN READ ONLY`, on a connection '
+      .. 'started with `default_transaction_read_only=on`; the server refuses the write',
+  },
   fields = {
     { name = 'host', label = 'Host', default = 'localhost' },
     { name = 'port', label = 'Port', default = 5432 },
@@ -258,6 +264,11 @@ end
 
 function M.sql.affected()
   return nil
+end
+
+--- How the commit batch opens and closes. Atomicity comes from `ON_ERROR_STOP=1`.
+function M.sql.batch_frame()
+  return { open = 'BEGIN;', close = 'COMMIT;' }
 end
 
 --- A statement that fails unless `count_sql` yields exactly 1, re-checking a queued change's

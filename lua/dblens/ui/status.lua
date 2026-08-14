@@ -12,6 +12,7 @@ end
 ---@class dblens.Segment
 ---@field text string
 ---@field hl string?
+---@field keep boolean?  -- survives a narrow window; the rest are given up first
 
 --- Build a winbar string from segments.
 ---@param segments dblens.Segment[]
@@ -23,7 +24,9 @@ function M.compose(segments)
       parts[#parts + 1] = ('%%#%s#%s'):format(segment.hl or 'DbLensDim', escape(segment.text))
     end
   end
-  parts[#parts + 1] = '%#Normal#'
+  -- The tail follows the winbar's own group, not Normal: on a colorscheme where the two differ
+  -- the Normal reset painted a visible seam across the rest of the bar.
+  parts[#parts + 1] = '%#DbLensWinBar#'
   return table.concat(parts)
 end
 
@@ -67,6 +70,44 @@ function M.fit(segments, width)
   return out
 end
 
+--- Choose which segments a `width`-wide winbar can afford, keeping the essential ones.
+---
+--- A narrow window has to give something up, and what it used to give up was whatever came last
+--- — which is the LOCKED/EDIT indicator. So the optional segments go first, from the right, and
+--- only when the essential ones alone still do not fit is anything clipped.
+---@param segments dblens.Segment[]
+---@param width integer
+---@return dblens.Segment[]  -- separators included
+function M.lay_out(segments, width)
+  assert(vim.islist(segments), 'status.lay_out: expected a list of segments')
+  assert(type(width) == 'number', 'status.lay_out: needs the window width')
+  local kept = {}
+  for _, segment in ipairs(segments) do
+    if segment.text and segment.text ~= '' then
+      kept[#kept + 1] = segment
+    end
+  end
+
+  local function total(list)
+    local used = 0
+    for _, segment in ipairs(list) do
+      used = used + vim.fn.strdisplaywidth(segment.text)
+    end
+    -- Three cells per ` · ` separator.
+    return used + math.max(0, #list - 1) * 3
+  end
+
+  for index = #kept, 1, -1 do
+    if total(kept) <= width then
+      break
+    end
+    if not kept[index].keep then
+      table.remove(kept, index)
+    end
+  end
+  return M.fit(M.dotted(kept), width)
+end
+
 --- Draw the winbar, or clear it when `ui.winbar` is off.
 ---
 --- The option has to be honoured HERE: clearing it once at window setup was undone by the next
@@ -84,7 +125,7 @@ function M.set(win, segments, options)
     return
   end
   local width = vim.api.nvim_win_get_width(win)
-  vim.wo[win].winbar = M.compose(M.fit(M.dotted(segments), width))
+  vim.wo[win].winbar = M.compose(M.lay_out(segments, width))
 end
 
 ---@class dblens.Spinner

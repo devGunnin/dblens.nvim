@@ -49,7 +49,14 @@ M.specs = {
     {
       action = 'write_toggle',
       lhs = '<leader>dw',
-      desc = 'Lock the connection / open it for editing',
+      desc = 'Lock / unlock for editing',
+      mode = 'n',
+      group = 'dblens',
+    },
+    {
+      action = 'lock',
+      lhs = '<leader>dl',
+      desc = 'Lock the connection',
       mode = 'n',
       group = 'dblens',
     },
@@ -149,7 +156,7 @@ M.specs = {
     {
       action = 'export',
       lhs = 'X',
-      desc = 'Export the result to a file',
+      desc = 'Export to a file',
       mode = 'n',
       group = 'yank',
     },
@@ -161,7 +168,7 @@ M.specs = {
     {
       action = 'run',
       lhs = '<CR>',
-      desc = 'Run the statement at the cursor',
+      desc = 'Run the statement',
       mode = 'n',
       group = 'run',
     },
@@ -196,7 +203,7 @@ M.specs = {
     {
       action = 'cancel',
       lhs = '<C-c>',
-      desc = 'Cancel the running query',
+      desc = 'Cancel the query',
       mode = 'n',
       group = 'run',
     },
@@ -214,7 +221,15 @@ M.specs = {
       mode = 'n',
       group = 'library',
     },
-    { action = 'help', lhs = '?', desc = 'This help', mode = 'n', group = 'window' },
+    -- Not a bare `?`: the editor is the one dblens buffer the user types in, and taking its
+    -- backwards search away is exactly the kind of leak a plugin must not cause.
+    {
+      action = 'help',
+      lhs = '<localleader>?',
+      desc = 'This help',
+      mode = 'n',
+      group = 'window',
+    },
     {
       action = 'close',
       lhs = '<localleader>q',
@@ -261,6 +276,21 @@ function M.resolve(scope, overrides)
     end
   end
   return out
+end
+
+--- The key an action currently answers to, for a hint the user reads on screen.
+---
+--- Empty states and the editor's welcome text name a binding, and a hardcoded one drifts the
+--- moment a user remaps it, so they ask here instead.
+---@return string?  -- nil when the action is unbound in this scope
+function M.lhs_for(scope, action, overrides)
+  assert(type(action) == 'string' and action ~= '', 'keymaps.lhs_for: expected an action')
+  for _, entry in ipairs(M.resolve(scope, overrides)) do
+    if entry.spec.action == action then
+      return entry.lhs[1]
+    end
+  end
+  return nil
 end
 
 --- Bind a scope's keys in one buffer.

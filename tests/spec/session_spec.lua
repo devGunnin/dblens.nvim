@@ -322,12 +322,15 @@ describe('txn: the committed script', function()
     return ('SELECT CASE WHEN (%s) = 1 THEN 1 ELSE fail() END'):format(count_sql)
   end
 
+  --- The adapter supplies this; `BEGIN;` is what all but mssql use.
+  local FRAME = { open = 'BEGIN;', close = 'COMMIT;' }
+
   it('maps a client-reported line back to the change that produced it', function()
     local t = txn.new()
     assert(t:begin())
     t:add({ sql = 'UPDATE a SET x = 1', summary = 'a', guard = 'SELECT count(*) FROM a' })
     t:add({ sql = 'UPDATE b SET x = 2', summary = 'b' })
-    local script, err, owners = t:script(assert_one)
+    local script, err, owners = t:script(assert_one, FRAME)
     eq(err, nil)
     local lines = vim.split(script, '\n', { plain = true })
     eq(lines[1], 'BEGIN;')
@@ -345,7 +348,7 @@ describe('txn: the committed script', function()
     assert(t:begin())
     t:add({ sql = 'INSERT INTO t (a)\nVALUES (1)', summary = 'x' })
     t:add({ sql = 'UPDATE t SET a = 2', summary = 'y' })
-    local script, _, owners = t:script(assert_one)
+    local script, _, owners = t:script(assert_one, FRAME)
     local lines = vim.split(script, '\n', { plain = true })
     eq(lines[4], 'UPDATE t SET a = 2;')
     eq(owners[2].index, 1)
@@ -354,10 +357,10 @@ describe('txn: the committed script', function()
   end)
 
   it('refuses to build a script outside a transaction or with nothing queued', function()
-    eq(select(1, txn.new():script(assert_one)), nil)
+    eq(select(1, txn.new():script(assert_one, FRAME)), nil)
     local t = txn.new()
     assert(t:begin())
-    eq(select(1, t:script(assert_one)), nil)
+    eq(select(1, t:script(assert_one, FRAME)), nil)
   end)
 end)
 

@@ -28,6 +28,12 @@ local M = {
     explain_analyze = true,
     estimate_rows = true,
   },
+  read_only_enforcement = {
+    mechanism = 'session-and-transaction',
+    strength = 'strong',
+    summary = 'every locked run is sent inside `START TRANSACTION READ ONLY`, on a session '
+      .. 'opened `SET SESSION TRANSACTION READ ONLY`; the server refuses the write',
+  },
   fields = {
     { name = 'host', label = 'Host', default = 'localhost' },
     { name = 'port', label = 'Port', default = 3306 },
@@ -57,9 +63,12 @@ end
 
 --- The password goes through MYSQL_PWD, never argv, which would expose it in the process list.
 ---
---- A read-only connection makes READ ONLY the session's transaction default, so a transaction
---- the script opens for itself is read-only too. It is the BACKUP; the guarantee is the read-only
---- transaction `read_only_script` wraps the run in.
+--- `--init-command=SET SESSION TRANSACTION READ ONLY` and the transaction wrap are BOTH
+--- load-bearing, and neither alone is enough. Verified live on MySQL 8.4 and MariaDB 11.8: inside
+--- a bare `START TRANSACTION READ ONLY`, `CREATE TABLE` and `DROP TABLE` SUCCEED -- DDL commits
+--- the transaction implicitly and then runs outside it. The SESSION setting is what refuses those
+--- (ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION, 1792); the transaction is what a `SET` in the same
+--- run cannot undo. Removing either one opens a hole the other does not cover.
 ---
 --- `--local-infile=0` blocks `LOAD DATA LOCAL INFILE`, which reads a file on THIS machine. There
 --- is no client flag that disables `system`/`source` (`--skip-named-commands` still honours them
@@ -92,6 +101,8 @@ end
 --- WRITE` retargets only later transactions and the write still comes back ER_CANT_EXECUTE_IN_
 --- READ_ONLY_TRANSACTION (1792), and `SET TRANSACTION READ WRITE` is refused outright with
 --- ER_CANT_CHANGE_TX_CHARACTERISTICS (1568). Both verified live on 8.4.
+---
+--- It does NOT cover DDL on its own -- see `command`, which is where DDL is refused.
 ---
 --- The bare `;` before COMMIT terminates a statement that did not terminate itself; the client
 --- ignores the empty statement it makes when the caller already ended with one.
@@ -291,6 +302,12 @@ end
 
 function M.sql.affected()
   return 'SELECT ROW_COUNT() AS affected'
+end
+
+--- How the commit batch opens and closes. Atomicity comes from the client stopping at the first
+--- error, not from these keywords.
+function M.sql.batch_frame()
+  return { open = 'BEGIN;', close = 'COMMIT;' }
 end
 
 --- A statement that fails unless `count_sql` yields exactly 1, re-checking a queued change's

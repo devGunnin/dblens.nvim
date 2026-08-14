@@ -8,17 +8,26 @@
 --- which. It starts from the spec (locked unless `read_only = false`) and `set_locked` flips it
 --- at runtime, so unlocking is an explicit user action rather than a hole in the gate.
 ---
---- What LOCKED GUARANTEES, and what it does not, stated exactly:
+--- What LOCKED GUARANTEES, and what it does not, stated exactly. It is NOT the same on every
+--- engine — each adapter states its own strength in `adapter.read_only_enforcement`, and
+--- `:checkhealth dblens` shows it.
 ---
---- GUARANTEED — no write reaches the database through any normal SQL statement, whatever the
+--- GUARANTEED, on every engine whose enforcement is `strong` (sqlite, duckdb, postgres, mysql,
+--- mariadb) — no write reaches the database through any normal SQL statement, whatever the
 --- dialect and however it is spelled. Two mechanisms, and neither is the classifier:
----  * the SERVER — the run is sent inside a read-only TRANSACTION (`adapter.read_only_script`)
----    over a connection opened read-only (`adapter.command`). No `SET` in the same run escapes
----    it; sqlite needs none, its `-readonly` is the file open mode. That holds for ONE statement.
----  * the ONE-STATEMENT rule — postgres and mysql let a SECOND statement end or replace that
----    transaction and write in a fresh one, so a locked connection refuses any input
+---  * the ENGINE — the run is sent over a connection opened read-only (`adapter.command`) and,
+---    where the engine has one, inside a read-only TRANSACTION (`adapter.read_only_script`). No
+---    `SET` in the same run escapes it; sqlite and duckdb need no wrap, their `-readonly` is the
+---    file open mode. That holds for ONE statement.
+---  * the ONE-STATEMENT rule — postgres and mysql/mariadb let a SECOND statement end or replace
+---    that transaction and write in a fresh one, so a locked connection refuses any input
 ---    `sql.single_statement_problem` cannot prove is exactly one. It is a byte scan, so unlike
 ---    the four lexer generations before it there is no dialect it can be wrong about.
+---
+--- NOT GUARANTEED ON mssql, which is why its enforcement is `best-effort`. SQL Server has no
+--- read-only transaction and no read-only connection mode, and T-SQL ends a statement at
+--- whitespace so the one-statement rule has no `;` to find. There the refusal IS the classifier,
+--- and the hard boundary is a read-only SQL login. See `lua/dblens/adapters/mssql.lua`.
 ---
 --- NOT GUARANTEED — a user who ALREADY HOLDS WRITE CREDENTIALS and deliberately calls a function
 --- that writes through a side channel. `SELECT dblink_exec('...','INSERT ...')` runs its INSERT
@@ -130,14 +139,15 @@ end
 ---@param on_done fun(ok: boolean, err: string?)
 function Session:connect(on_done)
   assert(type(on_done) == 'function', 'session:connect: on_done must be a function')
-  if self.spec.kind == 'sqlite' and not self.spec.create then
+  -- Every FILE-backed adapter, not just sqlite: both sqlite3 and duckdb silently create a missing
+  -- database, so a typo would open an empty one instead of failing.
+  if self.adapter.file and not self.spec.create then
     local path, path_err = path_mod.expand(self.spec.path)
     if not path then
       on_done(false, path_err)
       return
     end
     if vim.fn.filereadable(path) == 0 then
-      -- sqlite3 silently creates a missing file; a typo would open an empty database.
       on_done(false, ('no such database file: %s (set `create = true` to make it)'):format(path))
       return
     end
@@ -273,9 +283,9 @@ function Session:stdin_for(statement)
   if not self:is_read_only() then
     return statement
   end
-  -- The wrap only guarantees read-only for ONE statement, so this is the invariant `gate` exists
-  -- to hold. Asserted here too: a future caller that reaches the client without the gate must
-  -- fail loudly rather than send an unprovable script.
+  -- The wrap only covers ONE statement, so this is the invariant `gate` exists to hold. Asserted
+  -- here too: a future caller that reaches the client without the gate must fail loudly rather
+  -- than send an unprovable script. On T-SQL this proves less than it looks — see the header.
   local framing = sqlmod.single_statement_problem(statement)
   assert(
     framing == nil,
@@ -565,7 +575,9 @@ function Session:commit(on_done)
   end
   local assert_one = self.adapter.sql.assert_one
   assert(type(assert_one) == 'function', 'session:commit: adapter has no row-guard builder')
-  local script, err, owners = self.txn:script(assert_one)
+  local batch_frame = self.adapter.sql.batch_frame
+  assert(type(batch_frame) == 'function', 'session:commit: adapter has no transaction frame')
+  local script, err, owners = self.txn:script(assert_one, batch_frame())
   if not script then
     on_done(false, err, true)
     return
