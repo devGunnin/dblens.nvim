@@ -25,22 +25,39 @@ local function check_nvim()
   end
 end
 
---- Resolved options, or nil when `setup{}` rejected the user's config.
----@return table?
-local function check_config()
+--- The options in force, and WHERE THEY CAME FROM.
+---
+--- `config.get()` falls back to defaults, so reporting it as "loaded" told a user whose `setup{}`
+--- had just been refused that their configuration was fine while nothing they set was in effect.
+--- `config.status()` is what distinguishes the three cases.
+---@param options table  -- the options actually in force
+local function check_config(options)
+  assert(type(options) == 'table', 'health: check_config needs the resolved options')
   health.start('Configuration')
-  local ok, result = pcall(config.get)
-  if not ok then
-    health.error('configuration is invalid: ' .. tostring(result))
-    return nil
+  local state, rejected = config.status()
+  local in_force = state == 'configured' and 'the last setup{} that succeeded'
+    or 'the built-in defaults'
+  if rejected then
+    health.error(('setup{} was refused, so %s are in force: %s'):format(in_force, rejected))
+  elseif state == 'defaults' then
+    health.info('setup{} has not run; these are the built-in defaults')
+  else
+    health.ok('configuration loaded')
   end
-  assert(type(result) == 'table', 'health: config.get must return options')
-  health.ok('configuration loaded')
-  health.info(('connections file: %s'):format(result.connections_file))
-  local cap = result.history.max_entries
-  health.info(('history file: %s (max %d entries)'):format(result.history_file, cap))
-  health.info(('session file: %s'):format(result.state_file))
-  return result
+  health.info(('dblens %s'):format(require('dblens').VERSION))
+  health.info(('connections file: %s'):format(options.connections_file))
+  local cap = options.history.max_entries
+  health.info(('history file: %s (max %d entries)'):format(options.history_file, cap))
+  health.info(('session file: %s'):format(options.state_file))
+  -- The limits a bug report needs: a truncated grid or a killed client is one of these four.
+  health.info(
+    ('limits: page_size %d, max_rows %d, max_bytes %d, timeout_ms %d'):format(
+      options.page_size,
+      options.max_rows,
+      options.max_bytes,
+      options.timeout_ms
+    )
+  )
 end
 
 --- Version string reported by a client binary. Bounded: a hung client must not hang checkhealth.
@@ -66,10 +83,10 @@ local function client_version(binary)
   return text, nil
 end
 
---- A missing client is a warning, not an error: most users only ever use one of the three.
+--- A missing client is a warning, not an error: most users only ever use one of the six.
 local function check_clients(options)
   health.start('Database clients')
-  local clients = (options and options.clients) or config.defaults.clients
+  local clients = options.clients
   assert(type(clients) == 'table', 'health: `clients` must be a table')
   for _, kind in ipairs(adapters.kinds()) do
     local adapter = assert(adapters.get(kind), 'health: a registered kind must resolve')
@@ -128,10 +145,6 @@ end
 
 local function check_connections(options)
   health.start('Connections')
-  if not options then
-    health.warn('skipped: the configuration could not be loaded')
-    return
-  end
   local ok, specs, problems = pcall(require('dblens.connections').load, options)
   if not ok then
     health.error('could not load connections: ' .. tostring(specs))
@@ -166,10 +179,34 @@ local function check_connections(options)
   )
 end
 
+--- What dblens binds globally, and what was already bound to the same key by someone else.
+---
+--- `<leader>d` is the debug prefix in LazyVim, AstroNvim and most kickstart-derived configs, and
+--- `vim.keymap.set` overwrites in silence, so the user's `<leader>dc` can become dblens's with
+--- nothing on screen to say so. Reported here rather than notified at startup: a plugin that
+--- talks on every launch is worse than one a user has to ask.
+local function check_keymaps()
+  health.start('Global keymaps')
+  local taken = require('dblens').keymaps_taken_over()
+  if #taken == 0 then
+    health.ok('no global keymap was taken over from another plugin')
+    return
+  end
+  for _, entry in ipairs(taken) do
+    health.warn(
+      ('%s was bound by something else (%s) before dblens took it -- set '):format(
+        entry.lhs,
+        entry.previous
+      ) .. '`keymaps = { global = false }` or remap the action to keep it'
+    )
+  end
+end
+
 local INTEGRATIONS = {
   { label = 'nvim-web-devicons', module = 'nvim-web-devicons' },
   { label = 'nvim-cmp', module = 'cmp' },
   { label = 'blink.cmp', module = 'blink.cmp' },
+  { label = 'which-key.nvim', module = 'which-key' },
 }
 
 --- Presence without loading: a health check must not run another plugin's setup as a side effect.
@@ -195,10 +232,17 @@ end
 
 function M.check()
   check_nvim()
-  local options = check_config()
+  local ok, options = pcall(config.get)
+  if not ok then
+    health.start('Configuration')
+    health.error('the configuration could not be resolved at all: ' .. tostring(options))
+    return
+  end
+  check_config(options)
   check_clients(options)
   check_read_only()
   check_connections(options)
+  check_keymaps()
   check_integrations()
 end
 

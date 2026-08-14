@@ -65,8 +65,14 @@ describe('commands', function()
     local commands = defined_commands()
     eq(commands.DbLens.nargs, '?')
     eq(commands.DbLensRemove.nargs, '1')
-    eq(type(commands.DbLens.complete), 'function')
-    eq(type(commands.DbLensRemove.complete), 'function')
+    -- `nvim_get_commands` reports a Lua completion as the STRING `<Lua function>` on 0.10 and as
+    -- the function itself from 0.11 on, so the assertion is that one is wired up at all.
+    for _, name in ipairs({ 'DbLens', 'DbLensRemove' }) do
+      local complete = commands[name].complete
+      eq(complete ~= nil and complete ~= '', true, {
+        fail_reason = (':%s completes nothing'):format(name),
+      })
+    end
   end)
 
   it('is listed in the README and the vimdoc, every one of them', function()

@@ -8,7 +8,7 @@ local api = vim.api
 local M = {}
 
 ---@class dblens.Layout
----@field tabpage integer
+---@field tabpage integer?  -- nil only while `open` is still building it
 ---@field wins table<string, integer>
 ---@field bufs table<string, integer>
 
@@ -99,42 +99,56 @@ function M.results_height(total_rows, share)
   return math.max(1, math.min(height, total_rows - 1))
 end
 
---- Build the three-pane layout in a new tabpage.
----@param options table
----@return dblens.Layout
-function M.open(options)
-  local bufs = {}
-  for _, pane in ipairs(PANES) do
-    bufs[pane] = make_buffer(pane)
-  end
-
+--- Fill `layout` in: a new tabpage, the three panes, and the configured geometry.
+---
+--- Separate from `M.open` so that a throw anywhere in here still leaves `layout` describing
+--- everything created so far, which is what makes the cleanup below exact.
+local function build(layout, options)
   vim.cmd('tabnew')
   local placeholder = api.nvim_get_current_buf()
-  local tabpage = api.nvim_get_current_tabpage()
+  layout.tabpage = api.nvim_get_current_tabpage()
 
-  local wins = {}
+  local wins = layout.wins
   wins.editor = api.nvim_get_current_win()
-  api.nvim_win_set_buf(wins.editor, bufs.editor)
+  api.nvim_win_set_buf(wins.editor, layout.bufs.editor)
 
   vim.cmd('belowright split')
   wins.results = api.nvim_get_current_win()
-  api.nvim_win_set_buf(wins.results, bufs.results)
+  api.nvim_win_set_buf(wins.results, layout.bufs.results)
 
   -- `topleft`/`botright` make the sidebar span the full tab height, beside both other panes.
   vim.cmd(options.ui.sidebar.position == 'right' and 'botright vsplit' or 'topleft vsplit')
   wins.sidebar = api.nvim_get_current_win()
-  api.nvim_win_set_buf(wins.sidebar, bufs.sidebar)
+  api.nvim_win_set_buf(wins.sidebar, layout.bufs.sidebar)
 
-  if api.nvim_buf_is_valid(placeholder) and placeholder ~= bufs.editor then
+  if api.nvim_buf_is_valid(placeholder) and placeholder ~= layout.bufs.editor then
     pcall(api.nvim_buf_delete, placeholder, { force = true })
   end
 
   for _, pane in ipairs(PANES) do
     configure_window(wins[pane], pane, options)
   end
-
-  local layout = { tabpage = tabpage, wins = wins, bufs = bufs }
   M.resize(layout, options)
+end
+
+--- Build the three-pane layout in a new tabpage.
+---
+--- `open` owns what it creates until it returns. A throw part-way through — a `ui.sidebar.width`
+--- the geometry rejects, a border Neovim will not take — used to strand the tabpage and its three
+--- scratch buffers where nothing could reach them: the caller had no layout to close, and every
+--- retry added another dead tab.
+---@param options table
+---@return dblens.Layout
+function M.open(options)
+  local layout = { tabpage = nil, wins = {}, bufs = {} }
+  for _, pane in ipairs(PANES) do
+    layout.bufs[pane] = make_buffer(pane)
+  end
+  local ok, err = pcall(build, layout, options)
+  if not ok then
+    M.close(layout)
+    error(err, 0)
+  end
   return layout
 end
 
@@ -154,11 +168,12 @@ end
 
 ---@return boolean
 function M.is_open(layout)
-  if not layout or not api.nvim_tabpage_is_valid(layout.tabpage) then
+  if not layout or not layout.tabpage or not api.nvim_tabpage_is_valid(layout.tabpage) then
     return false
   end
   for _, pane in ipairs(PANES) do
-    if not api.nvim_win_is_valid(layout.wins[pane]) then
+    local win = layout.wins[pane]
+    if not win or not api.nvim_win_is_valid(win) then
       return false
     end
   end
@@ -192,16 +207,24 @@ function M.focus(layout, pane)
 end
 
 --- Drop every dblens window but one, for the case where closing the tabpage is not possible.
+---
+--- The survivor is handed back to the user, so the window options that do NOT revert with the
+--- buffer are undone here. `winfixwidth` is the one that bites: left set, the window silently
+--- refuses to be resized by `:vsplit` or `<C-w>=` long after dblens is gone.
 local function collapse_windows(layout)
   local wins = {}
   for _, pane in ipairs(PANES) do
     local win = layout.wins[pane]
-    if api.nvim_win_is_valid(win) then
+    if win and api.nvim_win_is_valid(win) then
       wins[#wins + 1] = win
     end
   end
   for index = 2, #wins do
     pcall(api.nvim_win_close, wins[index], true)
+  end
+  if wins[1] and api.nvim_win_is_valid(wins[1]) then
+    vim.wo[wins[1]].winfixwidth = false
+    vim.wo[wins[1]].winfixheight = false
   end
 end
 
@@ -213,9 +236,9 @@ function M.close(layout)
   if not layout then
     return
   end
-  if api.nvim_tabpage_is_valid(layout.tabpage) then
+  if layout.tabpage and api.nvim_tabpage_is_valid(layout.tabpage) then
     -- Leaving the tab first avoids a redraw into a half-closed layout.
-    pcall(function()
+    local ok, err = pcall(function()
       if #api.nvim_list_tabpages() > 1 then
         api.nvim_set_current_tabpage(layout.tabpage)
         vim.cmd('tabclose')
@@ -223,8 +246,16 @@ function M.close(layout)
       end
       collapse_windows(layout)
     end)
+    -- The buffers still go, so the failure is partial rather than a hang; saying so beats
+    -- leaving the user with windows they cannot account for.
+    if not ok then
+      vim.notify(
+        'dblens: could not close the layout windows: ' .. tostring(err),
+        vim.log.levels.WARN
+      )
+    end
   end
-  for _, buf in pairs(layout.bufs) do
+  for _, buf in pairs(layout.bufs or {}) do
     if api.nvim_buf_is_valid(buf) then
       pcall(api.nvim_buf_delete, buf, { force = true })
     end

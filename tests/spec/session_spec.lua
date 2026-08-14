@@ -377,6 +377,80 @@ describe('exec: which line the client blamed', function()
   end)
 end)
 
+--- `create = true` is documented as "opens a file that does not exist yet", but every connection
+--- is LOCKED by default and locked passes `-readonly`, which cannot create one. The user got the
+--- client's own "unable to open database file" and no file. Now the refusal names the setting.
+describe('session: create on a locked connection', function()
+  local function connect(spec)
+    local session = h.fake_session(require('dblens.session'), spec)
+    local outcome
+    session:connect(function(ok, err)
+      outcome = { ok = ok, err = err }
+    end)
+    return outcome
+  end
+
+  it('refuses, and names the setting that makes it work', function()
+    local missing = vim.fn.tempname() .. '/new.db'
+    local outcome = connect({ path = missing, create = true, read_only = true })
+    eq(outcome.ok, false)
+    eq(outcome.err:find('read_only = false', 1, true) ~= nil, true, {
+      fail_reason = 'the refusal must name the setting: ' .. tostring(outcome.err),
+    })
+    eq(vim.fn.filereadable(missing), 0, { fail_reason = 'nothing may be created on the way out' })
+  end)
+
+  it('still refuses a missing file that was never asked to be created', function()
+    local outcome = connect({ path = vim.fn.tempname() .. '/gone.db', read_only = true })
+    eq(outcome.ok, false)
+    eq(outcome.err:find('set `create = true`', 1, true) ~= nil, true)
+  end)
+
+  it('lets a writable connection through to the client', function()
+    h.with_fake_exec(function()
+      return { stdout = scalar('n', 1) }
+    end, function(session_mod, calls)
+      local session = h.fake_session(session_mod, {
+        path = vim.fn.tempname() .. '/new.db',
+        create = true,
+        read_only = false,
+      })
+      local outcome
+      session:connect(function(ok, err)
+        outcome = { ok = ok, err = err }
+      end)
+      eq(outcome.err, nil)
+      eq(outcome.ok, true)
+      eq(#calls, 1, { fail_reason = 'the client is what creates the file' })
+    end)
+  end)
+end)
+
+describe('exec.format_error: the reason, not the first noise on stderr', function()
+  local exec = require('dblens.exec')
+
+  --- MariaDB 11.8 writes `--ssl-verify-server-cert is disabled` to stderr on EVERY connection, so
+  --- keeping the first line reported that warning as the reason a locked write was refused.
+  it('prefers the client error line over an earlier warning', function()
+    local stderr = table.concat({
+      "WARNING: option '--ssl-verify-server-cert' is disabled",
+      'ERROR 1792 (25006) at line 1: Cannot execute statement in a READ ONLY transaction.',
+    }, '\n')
+    local message = exec.format_error({ stderr = stderr, code = 1 }, 'mariadb')
+    eq(message:find('READ ONLY transaction', 1, true) ~= nil, true, {
+      fail_reason = 'the refusal must name the real cause, got: ' .. message,
+    })
+    eq(message:find('ssl-verify', 1, true), nil)
+  end)
+
+  it('still keeps the first line when nothing looks like an error', function()
+    eq(
+      exec.format_error({ stderr = 'psql: could not connect\nmore detail', code = 2 }, 'psql'),
+      'psql: psql: could not connect'
+    )
+  end)
+end)
+
 describe('protocol: NULL stays distinguishable', function()
   it('reads the sentinel as NULL and a value as itself', function()
     local decoded = protocol.decode(h.wire({ h.record('a'), h.record(h.NULL_SENTINEL) }))

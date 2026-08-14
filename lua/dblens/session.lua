@@ -141,14 +141,27 @@ function Session:connect(on_done)
   assert(type(on_done) == 'function', 'session:connect: on_done must be a function')
   -- Every FILE-backed adapter, not just sqlite: both sqlite3 and duckdb silently create a missing
   -- database, so a typo would open an empty one instead of failing.
-  if self.adapter.file and not self.spec.create then
+  if self.adapter.file then
     local path, path_err = path_mod.expand(self.spec.path)
     if not path then
       on_done(false, path_err)
       return
     end
-    if vim.fn.filereadable(path) == 0 then
+    local missing = vim.fn.filereadable(path) == 0
+    if missing and not self.spec.create then
       on_done(false, ('no such database file: %s (set `create = true` to make it)'):format(path))
+      return
+    end
+    -- `create` and LOCKED contradict each other: locked opens the file with `-readonly`, which
+    -- cannot create it, and the client's own error ("unable to open database file") tells the
+    -- user nothing about why. Name the one setting that makes the documented option work.
+    if missing and self.locked then
+      on_done(
+        false,
+        ('cannot create %s on a read-only connection: set `read_only = false` on this '):format(
+          path
+        ) .. 'connection to create the database, then lock it again'
+      )
       return
     end
   end

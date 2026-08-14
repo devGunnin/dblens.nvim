@@ -210,9 +210,21 @@ function M.format_error(result, label)
   if message == '' then
     message = ('exited with code %d'):format(result.code)
   end
-  -- Clients prefix their own name and repeat it per line; keep the first meaningful line.
-  local first = message:gmatch('[^\r\n]+')()
-  return ('%s: %s'):format(label, vim.trim(first or message))
+  -- Clients prefix their own name and repeat it per line; keep the first meaningful line. An
+  -- `ERROR`/`Msg` line wins over an earlier one, because MariaDB 11.8 writes a startup warning
+  -- (`--ssl-verify-server-cert is disabled`) to stderr on EVERY connection and it would otherwise
+  -- be reported as the reason a write was refused.
+  local first, reported
+  for line in message:gmatch('[^\r\n]+') do
+    local text = vim.trim(line)
+    if text ~= '' then
+      first = first or text
+      if not reported and (text:match('^ERROR') or text:match('^Msg %d')) then
+        reported = text
+      end
+    end
+  end
+  return ('%s: %s'):format(label, reported or first or message)
 end
 
 --- The script line a client blamed for a failure, or nil.

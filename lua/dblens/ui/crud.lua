@@ -72,11 +72,11 @@ local function apply(state, change, cell)
       app().render()
       return
     end
+    -- duckdb reports no affected count at all (`sql.affected` returns nil there), and inventing
+    -- a `1` claims something the engine never said.
+    local applied = outcome.affected
     app().notify(
-      ('applied (%s row%s)'):format(
-        outcome.affected or 1,
-        (outcome.affected or 1) == 1 and '' or 's'
-      )
+      applied and ('applied (%d row%s)'):format(applied, applied == 1 and '' or 's') or 'applied'
     )
     app().refresh_grid()
   end)

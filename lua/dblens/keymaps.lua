@@ -251,7 +251,7 @@ function M.resolve(scope, overrides)
   local specs = M.specs[scope]
   assert(specs, ('keymaps.resolve: unknown scope `%s`'):format(tostring(scope)))
   if overrides == false then
-    -- Whole-scope opt-out. `<leader>d` in particular is contended, and turning the ten global
+    -- Whole-scope opt-out. `<leader>d` in particular is contended, and turning the twelve global
     -- maps off one action at a time is not a real escape hatch.
     return {}
   end

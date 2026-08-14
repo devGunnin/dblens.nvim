@@ -4,7 +4,9 @@
 --- The runtime is built from exactly two directories -- this worktree and a pinned mini.nvim
 --- checkout under `.tests/` -- so a run never depends on the developer's own plugins.
 
-local MINI_URL = 'https://github.com/echasnovski/mini.nvim'
+-- `echasnovski/mini.nvim` now resolves only through GitHub's transfer redirect; the current
+-- home is the one to clone from.
+local MINI_URL = 'https://github.com/nvim-mini/mini.nvim'
 local MINI_PIN = 'v0.18.0'
 
 local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h:h')

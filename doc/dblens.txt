@@ -78,12 +78,15 @@ change something.
 
 lazy.nvim: >lua
     require('lazy').setup({
-      { 'dblens/dblens.nvim' },
+      { 'devGunnin/dblens.nvim' },
     })
 <
 packer: >lua
-    use 'dblens/dblens.nvim'
+    use 'devGunnin/dblens.nvim'
 <
+There is no published tag yet, so both snippets install the default branch;
+pin a commit if you want a fixed version.
+
 Then `:DbLens` to open and `:DbLensAdd` to add your first connection.
 
 ==============================================================================
@@ -112,7 +115,10 @@ MariaDB ships the `mariadb` client rather than `mysql`; an existing
 
 For `sqlite` and `duckdb`, `create = true` allows opening a file that does not
 exist yet; without it a missing file is an error rather than a silently
-created empty database.
+created empty database. Creating one WRITES, so the connection must also set
+`read_only = false`: every connection is locked by default, locked opens the
+file with `-readonly`, and dblens refuses the combination by name rather than
+letting the client fail with "unable to open database file".
 
 `trust_server_certificate` is for `mssql` only: ODBC Driver 18 encrypts by
 default and verifies the certificate, which a development server's self-signed
@@ -641,30 +647,45 @@ Server offers no way to ask the engine for it: >
       to declare, NOT because it enforces anything: verified live on SQL
       Server 2022 that an INSERT sent under it lands
 <
-So LOCKED here is three client-side refusals, and a bug in any of them is a
+So LOCKED here is four client-side refusals, and a bug in any of them is a
 write rather than a prompt: >
     1. the classifier - anything dblens cannot prove is a read is refused.
        On every other engine this layer is best-effort; here it IS the boundary
     2. the T-SQL juxtaposition rule - a write verb anywhere but the head of
        the statement is treated as opening a new one, because T-SQL needs no
-       separator. Cost: an UNQUOTED column named after a non-reserved write
-       verb (`copy`, `replace` used bare) is refused while locked; quote it
+       separator. INCLUDING ONE FOLLOWED BY `(`: `EXEC('...')` is T-SQL's
+       dynamic-SQL STATEMENT, not a call, and exempting it as a call let
+       `SELECT 1 EXEC('COMMIT TRANSACTION DROP TABLE t')` run as a READ on a
+       locked connection - verified live on 2022, INSERT/TRUNCATE/DROP/CREATE
+       DATABASE and a server-level CREATE LOGIN all landed. Cost, on this
+       engine only: `SELECT REPLACE(a,'x','y')` is refused while locked, as is
+       an UNQUOTED column named after a non-reserved write verb; quote it
     3. `GO` and the `:` commands - `GO` runs what follows as its OWN batch, a
-       second statement no framing rule sees (verified live), and `sqlcmd -X`
+       second statement no framing rule sees (verified live), and `sqlcmd -X1`
        does not stop it. Refused in LOCKED and EDIT alike: none of them is SQL
+    4. the side-channel name check reads INSIDE string literals here, because
+       `EXEC('...')` can turn a string into code. A locked read whose literal
+       names xp_cmdshell, OPENROWSET or dblink is refused for that reason
 <
+WHAT NONE OF THAT COVERS: anything the classifier does not recognise as a
+write. It is a lexer, not SQL Server's parser, and there is no second layer.
+
 Underneath those, a locked run is wrapped in `SET XACT_ABORT ON; BEGIN
-TRANSACTION; <run>; ROLLBACK TRANSACTION;`. That is a NET, NOT A GUARANTEE,
-and its limit was measured: >
+TRANSACTION; <run>; IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;`. That is a NET,
+NOT A GUARANTEE, and its limit was measured: >
     a write past the classifier is undone - INSERT and DROP TABLE inside the
       wrap both left the database unchanged (SQL Server DDL is transactional)
     a `GO` alone does not escape it - the transaction survives the batch
       boundary, so the trailing ROLLBACK still reaches the write
-    but `... GO ... INSERT ... COMMIT TRANSACTION` DOES escape it, and the
-      row lands
+    but anything that COMMITS THE WRAP AWAY escapes it and what follows runs
+      in autocommit: `... GO ... INSERT ... COMMIT TRANSACTION`, and
+      `EXEC('COMMIT TRANSACTION INSERT ...')` with no GO at all. The
+      classifier refuses both; the wrap alone never stopped them
 <
-Even where the net holds, sqlcmd exits 0, so dblens would report a success for
-something that did not land. It is the safe failure, not a correct one.
+The wrap therefore ends by checking the transaction is still open and fails the
+batch when it is not, so a run that committed its own net away is reported as
+an error. Where the net simply holds, sqlcmd exits 0 and dblens reports success
+for a write that was rolled back: the safe failure, not a correct one.
 
 CONNECT AS A READ-ONLY SQL LOGIN. That is the boundary SQL Server does have: >
     CREATE LOGIN dblens_ro WITH PASSWORD = '...';
@@ -970,16 +991,19 @@ Both plugins are optional and a missing one is not an error.
 `:checkhealth dblens` reports:
 
 - the Neovim version, against the 0.10 minimum;
-- whether the configuration loaded, and where the connections, history and
-  session files live;
+- the dblens version, whether the configuration loaded or was REFUSED, where
+  the connections, history and session files live, and the resolved limits;
 - each database client, whether it is executable, and its version;
+- what LOCKED means per engine, as a warning wherever it is best-effort rather
+  than enforced by the server (see |dblens-safety-mssql|);
 - every connection with its kind, its access, and whether it has a password
   reference - never which variable, never its value;
-- which optional integrations (nvim-web-devicons, nvim-cmp, blink.cmp) are
-  installed.
+- any global `<leader>d*` map dblens took over from another plugin;
+- which optional integrations (nvim-web-devicons, nvim-cmp, blink.cmp,
+  which-key.nvim) are installed.
 
 A missing client is a warning rather than an error: most users only ever use
-one of the three.
+one of the six.
 
 ==============================================================================
 13. Highlights                                             *dblens-highlights*
@@ -1080,7 +1104,8 @@ The read-only behaviour is verified live on all six engines - SQLite 3.53,
 DuckDB 1.5.5, PostgreSQL 18.4, MySQL 8.4, MariaDB 11.8 and SQL Server 2022 -
 by the cases in `tests/spec/readonly_spec.lua` and `tests/spec/engines_spec.lua`,
 which need a server (or the client binary) and skip with a note when there is
-none. The rest of each surface - catalog queries, DDL reconstruction, error
+none. CI supplies `sqlite3` and `duckdb` only, so the four server engines are
+verified where a maintainer runs them, not on every push. The rest of each surface - catalog queries, DDL reconstruction, error
 reporting - has much thinner live coverage, so expect rough edges there. The
 newest three (mariadb, duckdb, mssql) are the thinnest.
 

@@ -57,10 +57,18 @@ local function truncate_display(text, width)
   return table.concat(out)
 end
 
+--- Declared types that CONTAIN a numeric needle without being numbers: `interval` and `point`
+--- both contain `int`, and were rendered right-aligned in the number colour.
+local NOT_NUMERIC = { interval = true, point = true, line = true, lseg = true }
+
 local function type_class(declared)
   local lowered = declared:lower()
-  if lowered:find('bool') then
+  -- SQL Server's boolean is `bit`; every other engine spells it with `bool`.
+  if lowered:find('bool') or lowered == 'bit' then
     return 'boolean'
+  end
+  if NOT_NUMERIC[lowered] then
+    return 'text'
   end
   for _, needle in ipairs({ 'int', 'real', 'floa', 'doub', 'num', 'dec', 'money', 'serial' }) do
     if lowered:find(needle, 1, true) then

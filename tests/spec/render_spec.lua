@@ -100,6 +100,19 @@ describe('results: a large page is painted in chunks', function()
     eq(mark_count(state), 2 * 2 + 2)
   end)
 
+  --- `config.validate` refuses this now, so reaching it means something bypassed validation —
+  --- and the old loop's answer to a zero chunk was to reschedule itself forever at 100% CPU with
+  --- SIGTERM ignored. A render must terminate whatever it is handed.
+  it('still terminates when handed a chunk size that cannot advance', function()
+    local state
+    app, state = open_with_result(grid_rows(20, 2), grid_columns(2), {})
+    state.options.ui.grid.chunk_size = 0
+    results.render(state)
+
+    local total = 20 * 2 + 2
+    eq(drain(state, total), total, { fail_reason = 'the render never finished the page' })
+  end)
+
   it('drops the chunks of a superseded render instead of stacking them', function()
     local state
     app, state = open_with_result(grid_rows(200, 4), grid_columns(4), {
@@ -114,6 +127,39 @@ describe('results: a large page is painted in chunks', function()
       fail_reason = 'the abandoned render kept writing marks over the new one',
     })
     eq(vim.api.nvim_buf_line_count(state.layout.bufs.results), 3 + 2)
+  end)
+end)
+
+--- The needle list is matched as a substring, so `interval` and `point` both contain `int` and
+--- were coloured and aligned as numbers. SQL Server's boolean is `bit`, which matched nothing.
+describe('grid: a declared type decides the colour', function()
+  local grid = require('dblens.render.grid')
+
+  local function hl_of(declared, value)
+    local out = grid.render({
+      columns = { 'c' },
+      rows = { { value } },
+      types = { declared },
+      max_col_width = 40,
+      null_display = 'NULL',
+      separator = '│',
+      truncation = '…',
+    })
+    for _, mark in ipairs(out.marks) do
+      if mark.line == 2 then
+        return mark.hl
+      end
+    end
+    return nil
+  end
+
+  it('classifies the types that only look numeric', function()
+    eq(hl_of('integer', '1'), 'DbLensNumber')
+    eq(hl_of('numeric', '1.5'), 'DbLensNumber')
+    eq(hl_of('interval', '3 days 04:00:00'), 'DbLensString')
+    eq(hl_of('point', '(1,2)'), 'DbLensString')
+    eq(hl_of('bit', '1'), 'DbLensBoolean')
+    eq(hl_of('boolean', 't'), 'DbLensBoolean')
   end)
 end)
 

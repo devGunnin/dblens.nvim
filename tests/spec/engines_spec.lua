@@ -328,6 +328,23 @@ describe('mssql.decode', function()
     eq(mssql.decode('').columns, {})
   end)
 
+  --- A message or audit column can hold the exact text sqlcmd ends a result set with. Matching on
+  --- content stopped decoding there: the row and everything after it vanished, with no error and
+  --- `malformed = 0` — an empty grid for a table that has rows. Position is what decides now.
+  it('keeps a row whose value reads like the row-count line', function()
+    local decoded = mssql.decode(output({
+      'msg',
+      '---',
+      '(3 rows affected)',
+      'real row',
+      '',
+      '(2 rows affected)',
+    }))
+    eq(decoded.columns, { 'msg' })
+    eq(decoded.rows, { { '(3 rows affected)' }, { 'real row' } })
+    eq(decoded.malformed, 0)
+  end)
+
   --- THE DOCUMENTED LIMITATION, pinned so nobody later claims mssql decodes NULL exactly. sqlcmd
   --- has no null-marker option, so a real NULL and the string 'NULL' arrive as the same bytes.
   it('cannot tell SQL NULL from the string `NULL`, and this is the case that says so', function()
@@ -612,9 +629,17 @@ describe('mssql, live: what the server does and does not refuse', function()
     })
 
     local escaped = send(true, 'SELECT 1\nGO\nINSERT INTO victim VALUES (99) COMMIT TRANSACTION')
-    eq(escaped.code, 0, { fail_reason = tostring(escaped.stderr) })
     h.neq(rows_in('victim'), survives, {
       fail_reason = 'the rollback wrap held; if it now does, mssql could claim more than it does',
+    })
+    -- The row lands, and the run now SAYS SO. The wrap ends by checking the transaction is still
+    -- open, so a payload that commits it away fails the batch instead of exiting 0 on a write
+    -- dblens would otherwise have reported as a successful read.
+    h.neq(escaped.code, 0, {
+      fail_reason = 'a committed-away wrap must not report success: ' .. tostring(escaped.stderr),
+    })
+    eq(escaped.stderr:find('committed away', 1, true) ~= nil, true, {
+      fail_reason = 'the failure must name the cause: ' .. tostring(escaped.stderr),
     })
 
     -- And the gate is what actually stops it, on both counts.

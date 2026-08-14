@@ -129,6 +129,36 @@ describe('app: closing while a query runs', function()
   end)
 end)
 
+--- A throw while the UI was being built left `state` set with no layout: `is_open()` said false,
+--- `:DbLensClose` reported success and touched nothing, and the tab of dead scratch buffers it
+--- had already created stayed for the session — one more on every retry.
+describe('app: an open that fails part-way through', function()
+  it('leaves no state, no tabpage and no buffers behind', function()
+    local app = require('dblens.app')
+    local config = require('dblens.config')
+    config.setup(scratch_options())
+    -- Past validation, so the throw lands inside the layout build where the leak used to be.
+    config.get().ui.sidebar.width = 0
+
+    local tabs, bufs = #vim.api.nvim_list_tabpages(), #dblens_buffers()
+    for attempt = 1, 3 do
+      local ok = pcall(app.open)
+      eq(ok, false, { fail_reason = 'the open was supposed to fail' })
+      eq(app.state(), nil, { fail_reason = 'a failed open left state behind' })
+      eq(app.is_open(), false)
+      app.close()
+      eq(#vim.api.nvim_list_tabpages(), tabs, {
+        fail_reason = ('attempt %d stranded a tabpage'):format(attempt),
+      })
+      eq(#dblens_buffers(), bufs, {
+        fail_reason = ('attempt %d stranded scratch buffers'):format(attempt),
+      })
+      eq(augroup_exists(), false, { fail_reason = 'the lifecycle augroup outlived the failure' })
+    end
+    config.setup(scratch_options())
+  end)
+end)
+
 describe('app: results are routed to the request that asked for them', function()
   it('drops a count that belongs to a superseded view', function()
     h.with_fake_exec(function(call)

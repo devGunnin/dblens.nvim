@@ -159,6 +159,25 @@ local function build_state(options)
   }
 end
 
+--- Defined below, after the failure path that owns it.
+local start_instance
+
+--- Undo a half-built UI. Without this, an error during `start_instance` left `state` non-nil with
+--- no usable layout: `is_open()` said false, `:DbLensClose` reached `layout.close(nil)` and
+--- returned success, and every retry stranded another tab of dead scratch buffers.
+local function discard_failed_open()
+  local failed = state
+  state = nil
+  if not failed then
+    return
+  end
+  if failed.spinner then
+    failed.spinner:stop()
+  end
+  layout_mod.close(failed.layout)
+  pcall(vim.api.nvim_del_augroup_by_name, 'DbLensLifecycle')
+end
+
 --- Open the UI. With no name, picks the sole connection, restores, or shows the picker.
 ---@param name string?
 ---@param opts { restore: boolean? }?
@@ -173,6 +192,19 @@ function M.open(name, opts)
   end
 
   state = build_state(options)
+  local ok, err = pcall(start_instance, options)
+  if not ok then
+    discard_failed_open()
+    error(err, 0)
+  end
+
+  M.render()
+  M.choose_connection(name, opts and opts.restore)
+end
+
+--- Build everything a live UI owns: the specs, the layout, the spinner, the pane bindings and
+--- the lifecycle autocmds. Called only by `M.open`, which owns the failure path.
+function start_instance(options)
   local specs, problems = connections.load(options)
   for _, problem in ipairs(problems) do
     M.error(problem)
@@ -225,9 +257,6 @@ function M.open(name, opts)
       end
     end,
   })
-
-  M.render()
-  M.choose_connection(name, opts and opts.restore)
 end
 
 --- Decide what to connect to when the UI opens.
@@ -528,7 +557,14 @@ local function present(result, source, extra)
   state.grid.elapsed_ms = result.elapsed_ms
   state.grid.message = extra and extra.message or nil
   if result.malformed > 0 then
-    M.error(('%d row(s) did not match the column count and were padded'):format(result.malformed))
+    -- Not "padded": a SHORT row is padded, a LONG one keeps its extra fields and the grid shows
+    -- only the columns it has names for. Naming the wrong repair sent readers hunting for a
+    -- padding bug that was not there.
+    M.error(
+      ('%d row(s) did not match the column count; a value most likely contains the '):format(
+        result.malformed
+      ) .. 'field separator'
+    )
   end
 end
 
@@ -639,6 +675,13 @@ end
 function M.page(delta)
   local result = state.grid.result
   if not result then
+    return
+  end
+  -- Paging is a property of a browsed relation: `fetch_page` refuses anything else, so stepping
+  -- the pager here moved a counter nothing would honour and the key did nothing at all.
+  local source = state.grid.source
+  if not source or source.kind ~= 'relation' then
+    M.notify('paging needs a table; add LIMIT/OFFSET to the query instead')
     return
   end
   local moved

@@ -410,6 +410,60 @@ describe('adapter statement builders', function()
   end)
 end)
 
+--- The sidebar's Indexes and Constraints nodes run generated SQL on every engine, and none of it
+--- was covered: 24 statement builders that interpolate a relation name, with the hostile-name
+--- quoting proven for `page`/`count` and nowhere near these.
+describe('catalog statement builders: every adapter, every entry point', function()
+  it('embeds a hostile name safely and classifies as a read', function()
+    -- These queries embed the name as a LITERAL, so the apostrophe is the byte that decides
+    -- whether it stays data: unescaped it closes the literal, doubled it cannot.
+    local hostile = { schema = "s'x", name = "o'brien" }
+    for _, kind in ipairs(adapters.kinds()) do
+      local adapter = get(kind)
+      for _, entry in ipairs({ 'columns', 'indexes', 'constraints' }) do
+        -- nil is a legitimate answer for exactly one pair: sqlite has no constraint catalog, and
+        -- the tree derives constraints from columns and indexes there.
+        local statement = adapter.sql[entry](hostile)
+        if statement == nil then
+          eq({ kind, entry }, { 'sqlite', 'constraints' }, {
+            fail_reason = ('%s.%s built no statement'):format(kind, entry),
+          })
+        else
+          eq(statement:find("o'brien", 1, true), nil, {
+            fail_reason = ('%s.%s embedded the raw name: %s'):format(kind, entry, statement),
+          })
+          eq(statement:find("o''brien", 1, true) ~= nil, true, {
+            fail_reason = ('%s.%s never embedded the name at all'):format(kind, entry),
+          })
+          eq(sql.classify(statement, adapter.dialect).write, false, {
+            fail_reason = ('%s.%s is not a read: %s'):format(kind, entry, statement),
+          })
+        end
+      end
+    end
+  end)
+
+  it('never leaks a secret through describe, on any engine', function()
+    local SPECS = {
+      postgres = { user = 'u', host = 'h', port = 5433, database = 'd' },
+      mysql = { user = 'u', database = 'd' },
+      mariadb = { user = 'u', database = 'd' },
+      mssql = { user = 'u', database = 'd' },
+      sqlite = { path = '/tmp/x.db' },
+      duckdb = { path = '/tmp/x.duckdb' },
+    }
+    for _, kind in ipairs(adapters.kinds()) do
+      local spec = assert(SPECS[kind], ('no describe spec for %s'):format(kind))
+      spec = vim.tbl_extend('force', spec, { password_env = 'PGPASSWORD', password = SECRET })
+      local text = get(kind).describe(spec)
+      eq(type(text), 'string')
+      eq(text:find(SECRET, 1, true), nil, {
+        fail_reason = ('%s.describe leaked the secret: %s'):format(kind, text),
+      })
+    end
+  end)
+end)
+
 describe('common.check_predicate', function()
   it('accepts an ordinary predicate', function()
     eq(common.check_predicate('id > 5'), nil)
@@ -732,12 +786,25 @@ describe('mysql.decode result sets', function()
 end)
 
 describe('adapters: the transaction row guard', function()
+  --- Every adapter, not three. Structural only: how each engine FAILS differs too much to pin in
+  --- text (`RAISE`, `THROW`, a subquery that returns two rows), and that the failure is real is
+  --- what the live cases in `engines_spec.lua` and `session_spec.lua` prove.
   it('every adapter can build a statement that fails unless the count is 1', function()
-    for _, kind in ipairs({ 'sqlite', 'postgres', 'mysql' }) do
+    for _, kind in ipairs(adapters.kinds()) do
       local adapter = get(kind)
-      local statement = adapter.sql.assert_one('SELECT count(*) FROM t WHERE id = 1')
+      local count = 'SELECT count(*) FROM t WHERE id = 1'
+      local statement = adapter.sql.assert_one(count)
       eq(type(statement), 'string', { fail_reason = kind .. ' has no row-guard builder' })
-      h.neq(statement:find('count(*)', 1, true), nil)
+      h.neq(statement:find(count, 1, true), nil, {
+        fail_reason = ('%s did not carry the count query: %s'):format(kind, statement),
+      })
+      h.neq(statement, count, {
+        fail_reason = ('%s guards nothing: it is the count query itself'):format(kind),
+      })
+      -- The comparison the guard turns on; without it the count is decoration.
+      h.neq(statement:find('1', #count, true), nil, {
+        fail_reason = ('%s never compares the count to 1: %s'):format(kind, statement),
+      })
       expect_error(function()
         adapter.sql.assert_one('')
       end)

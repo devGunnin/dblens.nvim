@@ -34,6 +34,43 @@ describe('config.get', function()
   end)
 end)
 
+--- `get()` falls back to defaults whatever went wrong, so without `status()` a REFUSED config and
+--- a never-configured one are the same table. `:checkhealth` reported "OK configuration loaded"
+--- to a user whose own `setup{}` had just been rejected and none of whose settings were in force.
+describe('config.status', function()
+  it('tells a rejected setup from a missing one and from a good one', function()
+    local fresh = h.fresh_module('dblens.config')
+    local state, rejected = fresh.status()
+    eq(state, 'defaults')
+    eq(rejected, nil)
+
+    expect_error(function()
+      fresh.setup({ page_size = 0 })
+    end, 'positive integer')
+    state, rejected = fresh.status()
+    eq(state, 'defaults', { fail_reason = 'a refused setup must not read as configured' })
+    eq(type(rejected), 'string')
+    eq(fresh.get().page_size, 100, { fail_reason = 'defaults are what is actually in force' })
+
+    fresh.setup({ page_size = 7 })
+    state, rejected = fresh.status()
+    eq(state, 'configured')
+    eq(rejected, nil)
+  end)
+
+  it('reports the previous options as in force when a later setup is refused', function()
+    local fresh = h.fresh_module('dblens.config')
+    fresh.setup({ page_size = 7 })
+    expect_error(function()
+      fresh.setup({ page_size = 0 })
+    end, 'positive integer')
+    local state, rejected = fresh.status()
+    eq(state, 'configured')
+    eq(type(rejected), 'string')
+    eq(fresh.get().page_size, 7)
+  end)
+end)
+
 describe('config.setup unknown keys', function()
   it('names the offending key at the top level', function()
     expect_error(function()
@@ -139,6 +176,20 @@ describe('config.setup open subtrees', function()
     eq(options.ui.highlights, { DbLensNull = { fg = '#666' } })
   end)
 
+  --- The keys inside are open; the container is not. Exempting it too let `connections = "psql"`
+  --- through `setup{}` and blow up inside `ipairs` on `:DbLens`, half a session later.
+  it('still type-checks the container itself', function()
+    for _, opts in ipairs({
+      { connections = false },
+      { connections = 'psql' },
+      { ui = { highlights = 'nope' } },
+    }) do
+      expect_error(function()
+        config.setup(opts)
+      end, 'expects table', { fail_reason = 'an open subtree accepted a non-table container' })
+    end
+  end)
+
   it('accepts arbitrary keymap actions in every scope', function()
     local options = config.setup({
       keymaps = {
@@ -213,7 +264,7 @@ describe('config.setup validation', function()
   it('rejects a sidebar position that is not left or right', function()
     expect_error(function()
       config.setup({ ui = { sidebar = { position = 'top' } } })
-    end, "must be 'left' or 'right'")
+    end, "must be one of 'left', 'right'")
     eq(config.setup({ ui = { sidebar = { position = 'right' } } }).ui.sidebar.position, 'right')
   end)
 
@@ -247,6 +298,41 @@ describe('config.setup validation', function()
       config.setup({ ui = { grid = { max_col_width = 3 } } })
     end, 'ui%.grid%.max_col_width')
     eq(config.setup({ ui = { grid = { max_col_width = 4 } } }).ui.grid.max_col_width, 4)
+  end)
+
+  --- THE ONE THAT TOOK THE EDITOR DOWN. `chunk_size = 0` made the highlight loop reschedule
+  --- itself forever with no progress: 100% CPU, `:q` unreachable, SIGTERM ignored, SIGKILL the
+  --- only way out and every unsaved buffer in the instance lost.
+  it('refuses a chunk size that cannot make progress', function()
+    for _, size in ipairs({ 0, -1, 1.5 }) do
+      expect_error(function()
+        config.setup({ ui = { grid = { chunk_size = size } } })
+      end, 'ui%.grid%.chunk_size', { fail_reason = 'accepted chunk_size ' .. tostring(size) })
+    end
+    eq(config.setup({ ui = { grid = { chunk_size = 1 } } }).ui.grid.chunk_size, 1)
+  end)
+
+  --- Each of these was accepted by `setup{}` and then failed much later, deep inside a pane,
+  --- with a traceback naming a module the user never configured.
+  it('refuses the values that only break later', function()
+    local BAD = {
+      { { ui = { sidebar = { width = 0 } } }, 'ui%.sidebar%.width' },
+      { { ui = { border = 'fancy' } }, 'ui%.border' },
+      { { ui = { spinner = { frames = {} } } }, 'ui%.spinner%.frames' },
+      { { ui = { spinner = { interval = 0 } } }, 'ui%.spinner%.interval' },
+      { { ui = { float = { max_width = 5 } } }, 'ui%.float%.max_width' },
+      { { ui = { float = { max_height = 0 } } }, 'ui%.float%.max_height' },
+      { { history = { max_entries = 0 } }, 'history%.max_entries' },
+      { { completion = { keyword_case = 'Upper' } }, 'completion%.keyword_case' },
+    }
+    for _, case in ipairs(BAD) do
+      expect_error(function()
+        config.setup(case[1])
+      end, case[2], { fail_reason = 'accepted a value matching ' .. case[2] })
+    end
+    -- The documented spellings still pass.
+    eq(config.setup({ ui = { border = 'single' } }).ui.border, 'single')
+    eq(config.setup({ completion = { keyword_case = 'keep' } }).completion.keyword_case, 'keep')
   end)
 
   it('leaves the previous options in place when setup fails', function()

@@ -16,12 +16,22 @@
 ---  2. T-SQL ENDS A STATEMENT AT WHITESPACE. `SELECT 1 DROP TABLE t` is two statements with no
 ---     `;` in it -- verified live, the table was dropped. So `single_statement_problem`, which is
 ---     a scan for `;`, proves nothing here. The `mssql` dialect sets
----     `statement_separator_optional`, which makes the classifier treat a write verb ANYWHERE but
----     the head as opening a statement. That is what covers the juxtaposed case.
+---     `statement_separator_optional`, so on THIS dialect the classifier treats a write verb
+---     anywhere but the head as opening a statement -- including one followed by `(`, because
+---     `EXEC('...')` is T-SQL's dynamic-SQL statement, not a function call. Exempting it as a call
+---     is what let `SELECT 1 EXEC('COMMIT TRANSACTION DROP TABLE t')` through as a READ on a
+---     locked connection, verified live on 2022. The price of not exempting it: an ordinary
+---     `SELECT REPLACE(a,'x','y')` is refused HERE and nowhere else, and so is an unquoted column
+---     named after a write verb. Quote the name and it is an identifier again.
 ---  3. `GO` is a sqlcmd BATCH separator, so what follows it runs as its OWN batch -- a second
 ---     statement no framing rule sees. Verified live that `SELECT 1 / GO / DROP TABLE t` dropped
 ---     the table, and that `sqlcmd -X` does not stop it. `client_meta_problem` refuses `GO` and
 ---     the `:` commands for this dialect.
+---  4. A string literal can BE code here (`EXEC('...')`), so the `mssql` dialect also sets
+---     `string_is_code` and `side_channel_problem` scans inside quoted strings on this engine.
+---
+--- WHAT IT STILL DOES NOT COVER: anything the classifier does not recognise as a write. It is a
+--- lexer, not SQL Server's parser, and on this engine there is no second layer that refuses.
 ---
 --- `read_only_script` additionally wraps a locked run in a transaction that is ROLLED BACK. That
 --- is defence in depth, not the guarantee, and the limit was measured rather than assumed:
@@ -29,9 +39,11 @@
 ---    both left the database unchanged, because SQL Server DDL is transactional;
 ---  * a `GO` alone does not escape it either: the transaction survives the batch boundary on the
 ---    same connection, so the trailing ROLLBACK still reaches the write;
----  * but `... GO ... INSERT ... COMMIT TRANSACTION` DOES escape it, and the row lands.
---- And even where it holds, sqlcmd exits 0, so dblens would report a success for something that
---- did not land. It is the safe failure, not a correct one.
+---  * but anything that COMMITS the wrap away escapes it, and what follows runs in autocommit --
+---    `... GO ... INSERT ... COMMIT TRANSACTION`, and `EXEC('COMMIT TRANSACTION INSERT ...')`
+---    with no `GO` at all. Both are refused by the classifier now; the wrap alone never stopped
+---    them. The batch THROWs when it finds the transaction gone, so such a run is reported as a
+---    failure rather than a success.
 ---
 --- THE HARD BOUNDARY IS A READ-ONLY SQL LOGIN. Connect as a login granted `db_datareader` and
 --- denied everything else when the threat model is anything more than an accidental keystroke.
@@ -158,6 +170,10 @@ end
 --- ROLLBACK undoes anything a classifier miss managed to write. Verified live that both an INSERT
 --- and a DROP TABLE inside this wrap left the database unchanged, and that a SELECT still returns
 --- its rows.
+---
+--- The `THROW` is the honesty clause. A statement that commits the wrap away leaves `@@TRANCOUNT`
+--- at 0, and the trailing ROLLBACK is then a no-op the client still exits 0 on -- dblens would
+--- report success for a run whose net was cut. Failing the batch instead makes that visible.
 ---@param statement string
 ---@return string
 function M.read_only_script(statement)
@@ -167,7 +183,8 @@ function M.read_only_script(statement)
   )
   return 'SET XACT_ABORT ON;\nBEGIN TRANSACTION;\n'
     .. statement
-    .. '\n;\nIF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n'
+    .. "\n;\nIF @@TRANCOUNT = 0 THROW 50002, 'dblens: the read-only transaction was committed "
+    .. "away by this statement', 1;\nIF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n"
 end
 
 --- sqlcmd's trailing summary line, which is a message rather than a row.
@@ -224,6 +241,25 @@ local function ends_result(lines, index)
   return true
 end
 
+--- Whether the summary line at `index` is sqlcmd's terminator rather than a row whose single
+--- column happens to READ like one.
+---
+--- Position decides it, not content: the real summary is the last thing in the output, so a
+--- `(3 rows affected)` with more data after it is a value from a message or audit column. Matching
+--- on content alone truncated the result set there and reported `malformed = 0` -- a silent wrong
+--- answer, which is the worst failure a data viewer has.
+local function is_trailing_summary(lines, index)
+  if not lines[index]:match(ROWS_AFFECTED) then
+    return false
+  end
+  for i = index + 1, #lines do
+    if lines[i] ~= '' then
+      return false
+    end
+  end
+  return true
+end
+
 --- Decode sqlcmd's text output into a result set.
 ---
 --- The shape is fixed: header line, dashed rule, rows, blank line, `(N rows affected)`. Only the
@@ -265,7 +301,7 @@ function M.decode(stdout, opts)
 
   while lines[index] do
     local line = lines[index]
-    if line:match(ROWS_AFFECTED) or (line == '' and ends_result(lines, index)) then
+    if (line == '' and ends_result(lines, index)) or is_trailing_summary(lines, index) then
       break
     end
     local fields = split_fields(line)

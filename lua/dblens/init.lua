@@ -15,22 +15,76 @@ local configured = false
 --- Global keymaps currently bound, so a second `setup` can take them back down.
 local bound = {}
 
+--- Keys that already answered to something else when dblens bound them. `:checkhealth` reports
+--- these; nothing else does, and `vim.keymap.set` would not have said a word.
+local taken_over = {}
+
+--- Defined below; both binding paths need it.
+local existing_binding
+
+--- Drop the keys the previous `setup{}` bound — but only the ones still answering to dblens. A
+--- key another plugin has taken back since is theirs, and deleting it would leave it unbound.
 local function unbind_globals()
   for _, entry in ipairs(bound) do
-    pcall(vim.keymap.del, entry.mode, entry.lhs)
+    if not existing_binding(entry.mode, entry.lhs) then
+      pcall(vim.keymap.del, entry.mode, entry.lhs)
+    end
   end
   bound = {}
 end
 
+--- The literal keys an lhs becomes once `<leader>` and the terminal codes are resolved, which is
+--- the form `nvim_get_keymap` reports.
+local function resolved_keys(lhs)
+  local leader = tostring(vim.g.mapleader or '\\')
+  local local_leader = tostring(vim.g.maplocalleader or '\\')
+  local text = lhs:gsub('<[lL]eader>', function()
+    return leader
+  end)
+  text = text:gsub('<[lL]ocal[lL]eader>', function()
+    return local_leader
+  end)
+  return vim.api.nvim_replace_termcodes(text, true, true, true)
+end
+
+--- What `lhs` already answers to in `mode`, or nil. dblens's own binding does not count: a second
+--- `setup{}` re-binds what the first one bound.
+---@return string?  -- a short description of the existing binding
+function existing_binding(mode, lhs)
+  local wanted = resolved_keys(lhs)
+  for _, map in ipairs(vim.api.nvim_get_keymap(mode)) do
+    if map.lhs == wanted then
+      local desc = map.desc or ''
+      if desc:sub(1, 8) == 'dblens: ' then
+        return nil
+      end
+      return desc ~= '' and desc or (map.rhs or 'a Lua callback')
+    end
+  end
+  return nil
+end
+
+--- Keys dblens took over from another plugin, newest binding pass only.
+---@return { lhs: string, previous: string }[]
+function M.keymaps_taken_over()
+  return vim.deepcopy(taken_over)
+end
+
 --- Actions reachable from anywhere, not just inside a dblens window.
+---
+--- Every handler requires `dblens.app` when it RUNS, not when it is built. Binding is what
+--- happens on every Neovim start, and requiring the app there pulled in the whole query engine —
+--- 23 modules, the six adapters and the 1100-line lexer — for a user who never opens dblens.
 local function global_handlers()
-  local app = require('dblens.app')
+  local function app()
+    return require('dblens.app')
+  end
   local function in_ui(fn)
     return function()
-      if not app.is_open() then
-        app.open()
+      if not app().is_open() then
+        app().open()
       end
-      local state = app.state()
+      local state = app().state()
       if state then
         fn(state)
       end
@@ -38,7 +92,7 @@ local function global_handlers()
   end
   return {
     toggle = function()
-      app.toggle()
+      app().toggle()
     end,
     connections = in_ui(function(state)
       require('dblens.ui.picker').connections(state)
@@ -56,19 +110,19 @@ local function global_handlers()
       require('dblens.ui.picker').snippets(state)
     end),
     write_toggle = function()
-      app.set_locked(nil)
+      app().set_locked(nil)
     end,
     lock = function()
-      app.set_locked(true)
+      app().set_locked(true)
     end,
     txn_begin = function()
-      app.txn_begin()
+      app().txn_begin()
     end,
     txn_commit = function()
-      app.txn_commit()
+      app().txn_commit()
     end,
     txn_rollback = function()
-      app.txn_rollback()
+      app().txn_rollback()
     end,
     txn_pending = in_ui(function(state)
       require('dblens.ui.picker').pending(state)
@@ -90,18 +144,23 @@ end
 
 local function bind_globals(options)
   unbind_globals()
+  taken_over = {}
   local handlers = global_handlers()
   for _, entry in ipairs(keymaps.resolve('global', options.keymaps.global)) do
     local handler = handlers[entry.spec.action]
     assert(handler, ('dblens: no handler for global action `%s`'):format(entry.spec.action))
+    local modes = type(entry.spec.mode) == 'table' and entry.spec.mode or { entry.spec.mode }
     for _, lhs in ipairs(entry.lhs) do
-      vim.keymap.set(
-        entry.spec.mode,
-        lhs,
-        handler,
-        { desc = 'dblens: ' .. entry.spec.desc, silent = true }
-      )
-      bound[#bound + 1] = { mode = entry.spec.mode, lhs = lhs }
+      for _, mode in ipairs(modes) do
+        local previous = existing_binding(mode, lhs)
+        if previous then
+          taken_over[#taken_over + 1] = { lhs = lhs, previous = previous }
+        end
+      end
+      vim.keymap.set(modes, lhs, handler, { desc = 'dblens: ' .. entry.spec.desc, silent = true })
+      for _, mode in ipairs(modes) do
+        bound[#bound + 1] = { mode = mode, lhs = lhs }
+      end
     end
   end
 end

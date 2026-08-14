@@ -101,7 +101,13 @@ local function read_csv_field(text, from)
     if not at then
       return text:sub(from), #text + 1, false, true
     end
-    return text:sub(from, at - 1), at + 1, false, text:sub(at, at) == '\n'
+    local row_end = text:sub(at, at) == '\n'
+    local last = at - 1
+    -- CRLF: the CR belongs to the record terminator, not to the value.
+    if row_end and text:sub(last, last) == '\r' then
+      last = last - 1
+    end
+    return text:sub(from, last), at + 1, false, row_end
   end
 
   local parts, i = {}, from + 1
@@ -118,6 +124,9 @@ local function read_csv_field(text, from)
       i = at + 2
     else
       local after = text:sub(at + 1, at + 1)
+      if after == '\r' and text:sub(at + 2, at + 2) == '\n' then
+        return table.concat(parts), at + 3, true, true
+      end
       return table.concat(parts), at + 2, true, after ~= ','
     end
   end
@@ -148,6 +157,10 @@ local function split_csv(text)
 end
 
 --- Decode RFC 4180 CSV, as psql emits it under `--csv`.
+---
+--- `exec` reads client output as raw bytes (`text = false`), so on Windows every record ends
+--- `\r\n`. `read_csv_field` drops that CR as the framing it is, and only there: a CR inside a
+--- QUOTED value is data and survives.
 ---@param stdout string
 ---@param opts { null_sentinel: string?, columns: string[]? }?
 ---@return dblens.ResultSet

@@ -95,8 +95,7 @@ describe('side channels: what a locked connection cannot vouch for', function()
       'SELECT * FROM users WHERE a = 1',
       "SELECT REPLACE(name, 'a', 'b') FROM t",
       'SELECT count(*) FROM public.orders',
-      -- The name as DATA, and the name as a quoted IDENTIFIER: neither is a call.
-      "SELECT 'dblink_exec is refused' AS why",
+      -- The name as a quoted IDENTIFIER is a name, not a call.
       'SELECT "dblink_log" FROM audit',
       'SELECT * FROM "load_file"',
       'SELECT "openrowset" FROM audit',
@@ -114,6 +113,27 @@ describe('side channels: what a locked connection cannot vouch for', function()
           fail_reason = ('`%s` is an ordinary read'):format(text),
         })
       end
+    end
+  end)
+
+  --- A string literal is DATA everywhere except T-SQL, where `EXEC('...')` runs it. So the name
+  --- inside a string counts on mssql and only there, and the cost is named rather than hidden: a
+  --- locked mssql read comparing a column to such a literal is refused.
+  it('scans inside string literals on mssql, and nowhere else', function()
+    local text = "SELECT 'dblink_exec is refused' AS why"
+    eq(type(sql.side_channel_problem(text, sql.dialects.mssql)), 'string', {
+      fail_reason = 'a T-SQL string literal can be executed, so its words count',
+    })
+    for _, dialect in ipairs({
+      sql.dialects.postgres,
+      sql.dialects.mysql,
+      sql.dialects.sqlite,
+      sql.dialects.duckdb,
+      sql.dialects.permissive,
+    }) do
+      eq(sql.side_channel_problem(text, dialect), nil, {
+        fail_reason = 'a string literal is data on every engine but T-SQL',
+      })
     end
   end)
 

@@ -74,6 +74,7 @@ end
 --- is no client flag that disables `system`/`source` (`--skip-named-commands` still honours them
 --- at the head of a line, verified on 8.4), so `sql.client_meta_problem` refuses those instead.
 function M.command(spec, secret, mode, clients)
+  assert(type(clients.mysql) == 'string', 'mysql.command: no `clients.mysql` configured')
   local argv =
     { clients.mysql, '--default-character-set=utf8mb4', '--connect-timeout=10', '--local-infile=0' }
   if spec.read_only == true then

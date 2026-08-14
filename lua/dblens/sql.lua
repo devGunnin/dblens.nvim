@@ -25,6 +25,9 @@ local M = {}
 ---@field named_commands boolean   -- a bare leading `system`/`source` is a client command
 ---@field sqlcmd_commands boolean  -- `GO` and the `:` commands sqlcmd reads instead of the server
 ---@field dash_comment_needs_space boolean -- `--` opens a comment only when whitespace follows
+--- `string_is_code` is the T-SQL fact that a string literal can BE a statement: `EXEC('...')`
+--- runs its argument. Under it a side-channel name hiding inside a quoted string still counts.
+---@field string_is_code boolean
 --- `statement_separator_optional` is the T-SQL fact that breaks the one-statement rule: SQL Server
 --- ends a statement at whitespace, so `SELECT 1 DROP TABLE t` is TWO statements with no `;` for
 --- `single_statement_problem` to find (verified live on 2022). Under it, a write verb anywhere but
@@ -45,6 +48,7 @@ M.dialects = {
     sqlcmd_commands = false,
     dash_comment_needs_space = false,
     statement_separator_optional = false,
+    string_is_code = false,
   },
   sqlite = {
     ident_quote = '"',
@@ -59,6 +63,7 @@ M.dialects = {
     sqlcmd_commands = false,
     dash_comment_needs_space = false,
     statement_separator_optional = false,
+    string_is_code = false,
   },
   postgres = {
     ident_quote = '"',
@@ -73,6 +78,7 @@ M.dialects = {
     sqlcmd_commands = false,
     dash_comment_needs_space = false,
     statement_separator_optional = false,
+    string_is_code = false,
   },
   mysql = {
     ident_quote = '`',
@@ -87,6 +93,7 @@ M.dialects = {
     sqlcmd_commands = false,
     dash_comment_needs_space = true,
     statement_separator_optional = false,
+    string_is_code = false,
   },
   --- DuckDB nests block comments (verified: `/* /* */` is unterminated, `/* /* */ */` parses) and
   --- takes `$$`-quoted strings, so it lexes like postgres with backticks left OFF -- a backtick
@@ -105,6 +112,7 @@ M.dialects = {
     sqlcmd_commands = false,
     dash_comment_needs_space = false,
     statement_separator_optional = false,
+    string_is_code = false,
   },
   --- T-SQL. `[name]` is its native identifier quote; dblens EMITS `"name"`, which sqlcmd is told
   --- to accept with `-I` (SET QUOTED_IDENTIFIER ON).
@@ -121,6 +129,7 @@ M.dialects = {
     sqlcmd_commands = true,
     dash_comment_needs_space = false,
     statement_separator_optional = true,
+    string_is_code = true,
   },
 }
 
@@ -141,10 +150,12 @@ M.dialects.permissive = {
   named_commands = true,
   sqlcmd_commands = true,
   dash_comment_needs_space = true,
-  -- OFF, unlike the other axes, and not an oversight. Statement juxtaposition is a T-SQL fact,
-  -- and assuming it for an unknown engine refuses ordinary reads (`SHOW CREATE TABLE t`) for no
-  -- gain: every security decision knows its dialect, because `Session:gate` passes the adapter's.
+  -- OFF, unlike the other axes, and not an oversight. Statement juxtaposition and a string that
+  -- runs are T-SQL facts, and assuming them for an unknown engine refuses ordinary reads
+  -- (`SHOW CREATE TABLE t`, a message column holding `dblink`) for no gain: every security
+  -- decision knows its dialect, because `Session:gate` passes the adapter's.
   statement_separator_optional = false,
+  string_is_code = false,
 }
 
 ---@class dblens.Token
@@ -704,24 +715,37 @@ local STATEMENT_START_AFTER = { ['('] = true, [')'] = true, [';'] = true }
 --- a column name, and a statement's own leading verb is classified before this is consulted.
 ---
 --- Under a dialect that does not require a separator between statements (T-SQL), there is no such
---- place to point at: any later word can begin one, so every position but the head counts. The
---- cost is that an UNQUOTED column named after a non-reserved write verb (`copy`, `replace` used
---- as a bare name) is refused there; quoting it makes it an identifier token again.
+--- place to point at: any later word can begin one, so every position but the head counts, and
+--- the call exemption above does not apply either. `EXEC(...)`/`EXECUTE(...)` IS T-SQL's
+--- dynamic-SQL STATEMENT form, so exempting a write verb because a `(` follows it exempted the
+--- one construct that runs arbitrary SQL -- `SELECT 1 EXEC('DROP TABLE t')` classified as a read
+--- and the table was dropped on a LOCKED connection (verified live on SQL Server 2022).
+---
+--- The cost of dropping the exemption there is that an ordinary `SELECT REPLACE(a,'x','y')` is
+--- refused on mssql, along with an UNQUOTED column named after a non-reserved write verb; quoting
+--- the name makes it an identifier token again, and a locked mssql connection has no engine-side
+--- enforcement to fall back on, so the refusal is the safe direction.
 ---@param toks dblens.Token[]
 ---@param index integer
 ---@param dialect dblens.Dialect?
 ---@return boolean
 function M.opens_statement(toks, index, dialect)
   assert(type(index) == 'number' and index >= 1, 'sql.opens_statement: index must be positive')
+  local separator_optional = (dialect or M.dialects.permissive).statement_separator_optional == true
   local following = toks[index + 1]
-  if following and following.type == 'punct' and following.text == '(' then
+  if
+    not separator_optional
+    and following
+    and following.type == 'punct'
+    and following.text == '('
+  then
     return false -- a call: `REPLACE(...)`, `TRUNCATE(x, 2)`
   end
   local previous = toks[index - 1]
   if previous and previous.type == 'punct' and STATEMENT_START_AFTER[previous.text] then
     return true
   end
-  return (dialect or M.dialects.permissive).statement_separator_optional == true and index > 1
+  return separator_optional and index > 1
 end
 
 --- Classify a token stream as a read, or fail closed.
@@ -1059,16 +1083,29 @@ end
 --- the same rule `client_meta_problem` uses, so a column called `dblink_log` stays usable when
 --- quoted. A MySQL executable comment is not scanned either — it has no leading keyword, so it
 --- already classifies as a write and a locked connection refuses every write.
+---
+--- EXCEPT under `string_is_code`: T-SQL's `EXEC('...')` makes a string literal a statement, so
+--- there the words INSIDE a string are scanned too. The cost is that an mssql read comparing a
+--- column to a literal naming one of these is refused; on the one engine with no server-side
+--- read-only mode, that is the side to err on.
 ---@param text string
 ---@param dialect dblens.Dialect?
 ---@return string? problem  -- nil when no known side channel is named
 function M.side_channel_problem(text, dialect)
   assert(type(text) == 'string', 'sql.side_channel_problem: expected string')
-  for _, token in ipairs(M.tokens(text, dialect or M.dialects.permissive)) do
+  local d = dialect or M.dialects.permissive
+  for _, token in ipairs(M.tokens(text, d)) do
     if token.type == 'word' then
       local why = side_channel_reason(token.text:upper())
       if why then
         return ('`%s` %s'):format(token.text, why)
+      end
+    elseif token.type == 'string' and d.string_is_code then
+      for word in (token.value or token.text):gmatch('[%w_%$]+') do
+        local why = side_channel_reason(word:upper())
+        if why then
+          return ('`%s` %s'):format(word, why)
+        end
       end
     end
   end

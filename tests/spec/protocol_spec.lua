@@ -193,6 +193,16 @@ describe('protocol.decode_csv', function()
     eq(decoded.rows[7], { '7', 'q"c,comma' })
   end)
 
+  --- `exec` reads raw bytes, so a Windows psql ends every record `\r\n`. Left on, the CR rode on
+  --- the last column NAME and the last cell of every row: names then failed to match, so column
+  --- types, cursor→cell lookup and CRUD's row key all silently missed.
+  it('drops the CR of a CRLF record terminator, but never one inside a value', function()
+    local decoded = protocol.decode_csv('a,b\r\n1,2\r\n3,"in\r\nside"\r\n')
+    eq(decoded.columns, { 'a', 'b' })
+    eq(decoded.rows, { { '1', '2' }, { '3', 'in\r\nside' } })
+    eq(decoded.malformed, 0)
+  end)
+
   it('reads a quoted field as text even when it equals the NULL marker', function()
     local decoded = protocol.decode_csv('a\n"' .. NS .. '"\n')
     eq(decoded.rows[1], { NS })

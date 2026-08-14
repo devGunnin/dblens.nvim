@@ -12,6 +12,11 @@
 ---    the record separator, which is unusable. `-list` with explicit `-separator`/`-newline` is
 ---    what produces the record protocol.
 ---
+--- NOT VERIFIED: whether the `duckdb` shell escapes a raw 0x1F/0x1E/0x1D INSIDE a value, the way
+--- sqlite3 does (it emits `^_` for the separator byte, measured on 3.53.3). No test feeds the
+--- decoder such a value, and no live check has been run. A value carrying one of these bytes
+--- would split its row; the row is counted in `malformed` rather than dropped, so it surfaces.
+---
 --- `-safe` is applied only while LOCKED, on purpose. It disables ALL filesystem access, so
 --- applying it always would break `read_csv`/`read_parquet`, which is most of what DuckDB is for.
 --- That matches how every other adapter treats a filesystem reach: refused while locked, allowed

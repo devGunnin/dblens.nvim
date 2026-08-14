@@ -21,13 +21,17 @@ local NAMESPACE = api.nvim_create_namespace('dblens.results')
 --- Bumped on every render; in-flight chunk loops from an older render stop when they notice.
 local generation = 0
 
+--- `config.validate` refuses a chunk size below 1; the clamp is the second lock on the same door,
+--- because a loop that reschedules without advancing takes the whole editor down with it — 100%
+--- CPU, `:q` unreachable, SIGTERM ignored, SIGKILL the only way out.
 local function apply_marks(buf, marks, chunk_size, token)
+  local chunk = math.max(1, math.floor(tonumber(chunk_size) or 1))
   local index = 1
   local function step()
     if token ~= generation or not api.nvim_buf_is_valid(buf) then
       return
     end
-    local last = math.min(index + chunk_size - 1, #marks)
+    local last = math.min(index + chunk - 1, #marks)
     for at = index, last do
       local mark = marks[at]
       api.nvim_buf_set_extmark(
@@ -38,6 +42,7 @@ local function apply_marks(buf, marks, chunk_size, token)
         { end_col = mark.end_col, hl_group = mark.hl }
       )
     end
+    assert(last >= index or index > #marks, 'results.apply_marks: a chunk must make progress')
     index = last + 1
     if index <= #marks then
       vim.schedule(step)

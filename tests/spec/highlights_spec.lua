@@ -14,7 +14,21 @@ local function is_empty(spec)
   return next(spec) == nil
 end
 
+--- `highlight clear` is global and permanent, and these cases also leave `DbLensNull` pinned to a
+--- test colour plus a live `ColorScheme` autocmd. Restoring the colorscheme after each one keeps
+--- every alphabetically-later spec running against the same highlights it would see alone.
+local function restore_colors()
+  vim.cmd('highlight clear')
+  local scheme = vim.g.colors_name
+  if scheme and scheme ~= '' then
+    pcall(vim.cmd.colorscheme, scheme)
+  end
+  require('dblens.ui.highlights').setup({})
+end
+
 describe('highlights: the groups exist', function()
+  after_each(restore_colors)
+
   before_each(function()
     vim.cmd('highlight clear')
     highlights.setup({})
@@ -65,6 +79,8 @@ describe('highlights: the groups exist', function()
 end)
 
 describe('highlights: LOCKED and EDIT', function()
+  after_each(restore_colors)
+
   before_each(function()
     vim.cmd('highlight clear')
     highlights.setup({})
@@ -86,6 +102,8 @@ describe('highlights: LOCKED and EDIT', function()
 end)
 
 describe('highlights: overrides', function()
+  after_each(restore_colors)
+
   before_each(function()
     vim.cmd('highlight clear')
   end)

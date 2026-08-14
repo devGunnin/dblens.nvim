@@ -102,15 +102,18 @@ default configuration are all applied on load. Call `setup{}` only to change som
 
 ```lua
 require('lazy').setup({
-  { 'dblens/dblens.nvim' },
+  { 'devGunnin/dblens.nvim' },
 })
 ```
 
 **packer**
 
 ```lua
-use 'dblens/dblens.nvim'
+use 'devGunnin/dblens.nvim'
 ```
+
+There is no published tag yet, so both snippets install the default branch. Pin a commit if you
+want a fixed version.
 
 Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
@@ -202,7 +205,8 @@ now drives that binary; set `clients.mariadb = 'mysql'` if your machine only has
 ```lua
 require('dblens').setup({
   connections = {
-    -- sqlite: needs `path`. `create = true` allows opening a file that does not exist yet.
+    -- sqlite: needs `path`. `create = true` allows opening a file that does not exist yet,
+    -- and needs `read_only = false` with it: a locked connection cannot create one.
     { name = 'app', kind = 'sqlite', path = '~/src/app/db.sqlite3' },
 
     -- postgres: needs `database`; host/port/user optional, `sslmode` passed through as PGSSLMODE.
@@ -231,7 +235,7 @@ require('dblens').setup({
     -- mariadb: same fields as mysql, driven through the `mariadb` client.
     { name = 'wiki', kind = 'mariadb', host = 'db.internal', user = 'wiki', database = 'wiki' },
 
-    -- duckdb: needs `path`, like sqlite. `create = true` allows opening a file that is not there.
+    -- duckdb: needs `path`, like sqlite, with the same `create` + `read_only = false` pairing.
     { name = 'analytics', kind = 'duckdb', path = '~/data/warehouse.duckdb' },
 
     -- mssql: needs `database`. `trust_server_certificate` is for a dev server whose certificate
@@ -360,7 +364,7 @@ require('dblens').setup({
   keymaps = {
     -- Per action: a key, a list of keys, or false to drop that binding.
     -- A whole scope can be `false` to bind nothing in it -- `global = false` is the escape
-    -- hatch for the ten `<leader>d*` maps.
+    -- hatch for the twelve `<leader>d*` maps.
     global  = {},                 -- e.g. { toggle = '<leader>D', txn_begin = false }
     sidebar = {},
     results = {},
@@ -381,7 +385,7 @@ pane it belongs to is first opened.
 | `:DbLens [name]` | Open dblens, optionally on a named connection (completes names) |
 | `:DbLensClose` | Close dblens and restore the previous layout |
 | `:DbLensToggle` | Toggle dblens |
-| `:DbLensConnections` | Open dblens, or pick a connection if it is already open |
+| `:DbLensConnections` | Open dblens if needed, then pick a connection |
 | `:DbLensQuery` | Focus the SQL editor |
 | `:DbLensTables` | Find a table |
 | `:DbLensHistory` | Browse query history |
@@ -577,26 +581,43 @@ than a prompt:
 2. **the T-SQL juxtaposition rule** — T-SQL ends a statement at whitespace, so
    `SELECT 1 DROP TABLE t` is *two* statements with no `;` in it (verified live: the table was
    dropped). The one-statement byte scan cannot see that, so on this dialect a write verb
-   anywhere but the head of the statement is treated as opening a new one. The cost is that an
-   unquoted column named after a non-reserved write verb (`copy`, `replace` used bare) is refused
-   while locked; quote it and it works.
+   anywhere but the head of the statement is treated as opening a new one — **including one
+   followed by `(`**. `EXEC('…')` is T-SQL's dynamic-SQL *statement*, not a function call, and
+   treating it as a call was a hole: `SELECT 1 EXEC('COMMIT TRANSACTION DROP TABLE t')`
+   classified as a read and ran on a locked connection (verified live on 2022 — `INSERT`,
+   `TRUNCATE`, `DROP TABLE`, `CREATE DATABASE` and a server-level `CREATE LOGIN` all landed).
+   The cost of the rule, paid on this engine only: an ordinary `SELECT REPLACE(a,'x','y')` is
+   refused while locked, as is an unquoted column named after a non-reserved write verb (`copy`,
+   `replace` used bare). Quote the name, or unlock, and it works. On every other engine
+   `SELECT REPLACE(...)` is an ordinary read.
 3. **`GO` and the `:` commands** — `GO` is a sqlcmd *batch* separator, so what follows it runs as
    its own batch: a second statement no framing rule sees (verified live — `SELECT 1 / GO / DROP
-   TABLE t` dropped the table), and `sqlcmd -X` does not stop it. dblens refuses `GO`, `EXIT`,
+   TABLE t` dropped the table), and `sqlcmd -X1` does not stop it. dblens refuses `GO`, `EXIT`,
    `QUIT`, `ED`, `LIST` and any `:`-command at the head of a line, in both LOCKED and EDIT mode,
    because none of them is SQL.
+4. **the side-channel name check, string literals included** — on this engine only, because
+   `EXEC('…')` can turn a quoted string into code. A locked `mssql` read whose literal names
+   `xp_cmdshell`, `OPENROWSET` or `dblink` is refused for that reason.
 
-Underneath those, a locked run is wrapped in `SET XACT_ABORT ON; BEGIN TRANSACTION; … ROLLBACK
-TRANSACTION;`. That is a **net, not a guarantee**, and its limit was measured rather than assumed:
+**What none of that covers:** anything the classifier does not recognise as a write. It is a
+lexer, not SQL Server's parser, and on this engine there is no second layer that refuses.
+
+Underneath those, a locked run is wrapped in `SET XACT_ABORT ON; BEGIN TRANSACTION; … IF
+@@TRANCOUNT > 0 ROLLBACK TRANSACTION;`. That is a **net, not a guarantee**, and its limit was
+measured rather than assumed:
 
 - a write that got past the classifier is undone — an `INSERT` and a `DROP TABLE` inside the wrap
   both left the database unchanged, because SQL Server DDL is transactional;
 - a `GO` alone does not escape it either: the transaction survives the batch boundary on the same
   connection, so the trailing `ROLLBACK` still reaches the write;
-- but `… GO … INSERT … COMMIT TRANSACTION` **does** escape it, and the row lands.
+- but anything that **commits the wrap away** escapes it and what follows runs in autocommit —
+  `… GO … INSERT … COMMIT TRANSACTION`, and `EXEC('COMMIT TRANSACTION INSERT …')` with no `GO`
+  at all. The classifier refuses both; the wrap alone never stopped them.
 
-And even where the net holds, `sqlcmd` still exits 0, so dblens would report a success for
-something that did not land. It is the safe failure, not a correct one.
+The wrap therefore ends by checking the transaction is still open and failing the batch when it
+is not, so a run that committed its own net away is reported as an error instead of a success.
+Where the net simply holds, `sqlcmd` exits 0 and dblens reports success for a write that was
+rolled back: the safe failure, not a correct one.
 
 **Connect as a read-only SQL login.** That is the boundary SQL Server does have, and it is the
 only one:
@@ -779,8 +800,9 @@ a `DROP` is gated by both settings. An unconfirmed write is refused by the sessi
 undrawn.
 
 Before a single destructive ad-hoc statement, adapters that can estimate without executing
-(`caps.estimate_rows`: PostgreSQL via `EXPLAIN (FORMAT JSON)`, MySQL via `EXPLAIN`) show the
-planner's row estimate. SQLite cannot, and says so; a failed estimate says why.
+(`caps.estimate_rows`: PostgreSQL via `EXPLAIN (FORMAT JSON)`, MySQL and MariaDB via `EXPLAIN`)
+show the planner's row estimate. SQLite, DuckDB and SQL Server cannot, and say so; a failed
+estimate says why.
 
 **The exactly-one-row guard.** A cell edit or a row delete builds a `WHERE` from the primary
 key, or — when the table has none — from every column in the displayed row. Either way the
@@ -815,6 +837,10 @@ stops it escaping the statement, it does not stop an expensive or volatile funct
 
 CLI clients are one-shot processes, so a transaction cannot be held open across calls the way a
 socket session could. dblens therefore *defers*.
+
+Transaction mode needs a writable connection: on a LOCKED one `<leader>dB` and `<leader>dC` are
+refused, and since every connection is locked by default that is the first thing you meet — unlock
+with `<leader>dw` first.
 
 While transaction mode is on (`<leader>dB`), every change you make is **queued, not sent**. A
 queued change is **not visible to the server**, to other clients, or to a re-run of the same
@@ -863,10 +889,12 @@ Both plugins are optional; a missing one is not an error.
 
 ## Health
 
-`:checkhealth dblens` reports the Neovim version, whether the configuration loaded and where its
-files live, each database client and its version, every connection with its kind, access and
-whether it has a password reference, and which optional integrations are installed. It never
-resolves a password.
+`:checkhealth dblens` reports the Neovim version; the dblens version, whether the configuration
+loaded or was refused, where its files live and the resolved limits; each database client and its
+version; **what LOCKED means per engine**, as a warning wherever it is best-effort rather than
+enforced by the server; every connection with its kind, access and whether it has a password
+reference; any global keymap it took over from another plugin; and which optional integrations
+are installed. It never resolves a password.
 
 ## Highlight groups
 
@@ -947,13 +975,20 @@ decoding (including values holding the bytes the previous framing used as separa
 guard, batch atomicity and `--xml` decoding — the XML output exists because the default tab
 format cannot distinguish SQL `NULL` from the string `'NULL'`.
 
-**The read-only guarantee is verified live on all three**, by
-`tests/spec/readonly_spec.lua`. It sends each escape payload to a real server on a locked
-connection and asserts the table did not change, with a writable control that does change so the
-assertion cannot pass vacuously. The PostgreSQL and MySQL cases need a server
-(`DBLENS_TEST_POSTGRES_PORT` / `DBLENS_TEST_MYSQL_PORT`, plus `_HOST` `_USER` `_PASSWORD` `_DB`
-`_CLIENT`) and skip with a note when there is none. Catalog queries, DDL reconstruction and
-error reporting have much thinner live coverage on those two — please report what you hit.
+**DuckDB, MariaDB and SQL Server are verified live too** — DuckDB 1.5.5, MariaDB 11.8, SQL
+Server 2022 — which is what the Verified column of the engine table above reports.
+
+**The read-only guarantee is verified live on all six**, by `tests/spec/readonly_spec.lua`,
+`single_statement_spec.lua` and `side_channel_spec.lua`. Each sends its escape payloads to a real
+server on a locked connection and asserts the table did not change, with a writable control that
+does change so the assertion cannot pass vacuously. A server-backed engine needs
+`DBLENS_TEST_<KIND>_PORT` (plus `_HOST` `_USER` `_PASSWORD` `_DB` `_CLIENT`, and `_TRUST_CERT`
+for SQL Server) and skips with a note when there is none.
+
+**Where that verification actually runs.** CI installs `sqlite3` and `duckdb`, so those two live
+groups run on every push; the `postgres`, `mysql`, `mariadb` and `mssql` groups run only where a
+maintainer supplies a server, and skip with a note in CI. Catalog queries, DDL reconstruction and
+error reporting have much thinner live coverage everywhere — please report what you hit.
 
 ## Limitations
 
@@ -963,10 +998,10 @@ error reporting have much thinner live coverage on those two — please report w
   `WHERE` in the query.
 - SQLite exposes no schema level (attached databases are out of scope) and has no
   `EXPLAIN ANALYZE` or row estimate.
-- PostgreSQL has no native DDL statement, so `D` shows a DDL reconstructed from the catalog. It
-  is meant to be read, not replayed.
+- PostgreSQL and SQL Server have no native DDL statement, so `D` shows a DDL reconstructed from
+  the catalog. It is meant to be read, not replayed.
 - Every call spawns a fresh client process, so an affected-row count has to ride along in the
-  same invocation. An adapter with no affected-rows query (PostgreSQL) reports none.
+  same invocation. An adapter with no affected-rows query (PostgreSQL, DuckDB) reports none.
 - Outside a transaction the exactly-one-row guard and the write it guards are two separate
   client invocations, so a concurrent writer between them is not excluded.
 - `sqlite3 -ascii` escapes control bytes into caret notation on output, so a cell holding one

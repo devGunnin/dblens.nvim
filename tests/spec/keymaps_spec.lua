@@ -101,6 +101,40 @@ describe('keymaps: conflicts', function()
   end)
 end)
 
+--- `<leader>d` is the debug prefix in LazyVim, AstroNvim and most kickstart configs, and seven of
+--- the twelve global keys collide with LazyVim's dap set. `vim.keymap.set` overwrites in silence,
+--- so the user's continue key becomes a connection picker with nothing to explain it.
+describe('keymaps: taking a global key over from another plugin', function()
+  local dblens = require('dblens')
+
+  after_each(function()
+    pcall(vim.keymap.del, 'n', '<leader>dc')
+    dblens.setup({})
+  end)
+
+  it('records what it overwrote so checkhealth can report it', function()
+    vim.keymap.set('n', '<leader>dc', function() end, { desc = 'Debug: continue' })
+    dblens.setup({})
+    local taken = dblens.keymaps_taken_over()
+    local found
+    for _, entry in ipairs(taken) do
+      if entry.lhs == '<leader>dc' then
+        found = entry
+      end
+    end
+    eq(type(found), 'table', { fail_reason = 'the collision was not recorded' })
+    eq(found.previous, 'Debug: continue')
+  end)
+
+  it('does not report its own bindings as a takeover', function()
+    dblens.setup({})
+    dblens.setup({})
+    eq(dblens.keymaps_taken_over(), {}, {
+      fail_reason = 'a second setup{} must not report re-binding its own keys',
+    })
+  end)
+end)
+
 describe('keymaps.lhs_for', function()
   it('answers with the key the action is actually bound to', function()
     eq(keymaps.lhs_for('global', 'connections', nil), '<leader>dc')

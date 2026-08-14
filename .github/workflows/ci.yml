@@ -6,22 +6,25 @@ on:
   pull_request:
 
 jobs:
-  # One job, matrixed on Neovim stable + nightly, running both lint and test. sqlite3 and the
-  # duckdb static binary are installed so tests/spec/engines_spec.lua's live sqlite/duckdb groups
-  # actually run here; the postgres/mysql/mariadb/mssql live groups need
-  # `DBLENS_TEST_<KIND>_PORT` (unset in CI) and skip cleanly with a MiniTest note, which is not a
-  # failure. A service-container job to stand up postgres + mysql/mariadb and run those groups too
-  # was judged not worth the cost for this repo: it would need throwaway credentials wired through
-  # Actions secrets/services and roughly doubles the job's runtime for coverage `readonly_spec.lua`
-  # already gets from local verification (see `.dm-knowledge/dblens-mvp.md`). Left to local
-  # verification for now; revisit if CI-only regressions on those two engines start showing up.
+  # One job, matrixed on the documented Neovim floor plus stable and nightly, running both lint
+  # and test. sqlite3 and the duckdb binary are installed so tests/spec/engines_spec.lua's live
+  # sqlite/duckdb groups actually run here.
+  #
+  # THE FOUR SERVER ENGINES ARE NOT EXERCISED HERE. postgres, mysql, mariadb and mssql need
+  # `DBLENS_TEST_<KIND>_PORT` (unset in CI), so their live groups skip with a MiniTest note, which
+  # is not a failure but is also not coverage: those proofs run only where a maintainer supplies a
+  # server. The README says so rather than implying CI covers all six. A service-container job was
+  # judged not worth the cost for this repo: throwaway credentials wired through Actions
+  # secrets/services, and roughly double the runtime.
   ci:
     runs-on: ubuntu-latest
     strategy:
-      # Both Neovim versions always report; nightly breaking does not hide a stable failure.
+      # Every version always reports; nightly breaking does not hide a stable failure, and the
+      # 0.10 entry is the documented minimum (plugin/dblens.lua, health.lua, README) — without it
+      # a 0.11+ API creeping in ships green and breaks the version dblens promises to support.
       fail-fast: false
       matrix:
-        neovim: [stable, nightly]
+        neovim: [v0.10.4, stable, nightly]
     name: ci (${{ matrix.neovim }})
     steps:
       - uses: actions/checkout@v4
@@ -31,19 +34,16 @@ jobs:
           neovim: true
           version: ${{ matrix.neovim }}
 
-      - name: Install sqlite3 and duckdb
+      # Pinned, both of them: an unpinned duckdb `latest` turns CI red on an unchanged repo the
+      # day duckdb changes its CLI output, and the decoder is tested against that output.
+      - name: Install sqlite3, duckdb and luacheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y sqlite3 unzip
+          sudo apt-get install -y sqlite3 unzip lua-check
           curl -fsSL -o /tmp/duckdb.zip \
-            https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip
+            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
           sudo unzip -o /tmp/duckdb.zip -d /usr/local/bin
           sudo chmod +x /usr/local/bin/duckdb
-
-      - name: Install luacheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lua-check
 
       - name: Versions
         run: |
@@ -51,10 +51,12 @@ jobs:
           sqlite3 --version
           duckdb --version
 
+      # Pinned for the same reason: a stylua release with a new default turns CI red on code
+      # nobody touched.
       - uses: JohnnyMorganz/stylua-action@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          version: latest
+          version: 2.4.1
           args: --check .
 
       - name: Luacheck

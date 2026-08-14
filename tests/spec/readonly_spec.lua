@@ -239,13 +239,60 @@ describe('mssql: LOCKED is the classifier, and the tests say so', function()
     eq(type(session:gate('SELECT 1\nGO\nDROP TABLE victim')), 'string')
   end)
 
+  --- THE REGRESSION THAT SHIPPED A HOLE. `EXEC(`/`EXECUTE(` is T-SQL's dynamic-SQL STATEMENT, and
+  --- exempting a write verb followed by `(` as a function call exempted exactly it. Live on SQL
+  --- Server 2022 every payload below classified as a READ and landed on a LOCKED connection:
+  --- INSERT, TRUNCATE, DROP TABLE, CREATE DATABASE and a server-level CREATE LOGIN. The
+  --- `COMMIT TRANSACTION` prefix is what got them past the rolled-back wrap as well, with no `GO`
+  --- involved for `client_meta_problem` to see.
+  it('refuses T-SQL dynamic SQL, which is a write verb followed by `(`', function()
+    local sqlmod = require('dblens.sql')
+    local session = locked_session()
+    for _, payload in ipairs({
+      "SELECT 1 EXEC('DROP TABLE victim')",
+      "SELECT 1 EXEC ('DROP TABLE victim')",
+      "SELECT 1 EXECUTE('DROP TABLE victim')",
+      "SELECT 1 EXEC('COMMIT TRANSACTION INSERT INTO victim VALUES (301)')",
+      "SELECT 1 EXEC('COMMIT TRANSACTION TRUNCATE TABLE victim')",
+      "SELECT 1 EXEC('COMMIT TRANSACTION CREATE DATABASE dbl_evil')",
+      "SELECT 1 EXEC('COMMIT TRANSACTION CREATE LOGIN dbl_backdoor WITH PASSWORD = ''x''')",
+    }) do
+      eq(sqlmod.single_statement_problem(payload), nil, {
+        fail_reason = ('%s: the framing rule cannot see this, which is the point'):format(payload),
+      })
+      eq(sqlmod.classify(payload, sqlmod.dialects.mssql).write, true, {
+        fail_reason = ('%s must classify as a write on T-SQL'):format(payload),
+      })
+      eq(type(session:gate(payload)), 'string', {
+        fail_reason = ('%s reached the client on a locked mssql connection'):format(payload),
+      })
+    end
+  end)
+
+  --- The price of the rule above, stated rather than discovered: on T-SQL a write verb is a
+  --- statement wherever it appears, so a call to the FUNCTION of the same name is refused too.
+  --- Every other engine still runs it -- that is what the next case pins.
+  it('refuses a write-verb function call, which no other dialect does', function()
+    local sqlmod = require('dblens.sql')
+    eq(type(locked_session():gate("SELECT REPLACE(name, 'a', 'b') FROM t")), 'string')
+    for _, kind in ipairs({ 'postgres', 'mysql', 'mariadb', 'sqlite', 'duckdb' }) do
+      local d = get(kind).dialect
+      eq(sqlmod.classify("SELECT REPLACE(name, 'a', 'b') FROM t", d).write, false, {
+        fail_reason = ('%s must still read `SELECT REPLACE(...)`'):format(kind),
+      })
+      eq(sqlmod.classify('SELECT COUNT(*) FROM t', d).write, false, {
+        fail_reason = ('%s must still read `SELECT COUNT(*)`'):format(kind),
+      })
+    end
+  end)
+
   it('still lets an ordinary read through', function()
     local session = locked_session()
     for _, statement in ipairs({
       'SELECT * FROM users WHERE a = 1',
       'SELECT TOP 10 name FROM sys.tables ORDER BY name',
-      "SELECT REPLACE(name, 'a', 'b') FROM t",
       'SELECT count(*) AS n FROM "dbo"."my tbl"',
+      'SELECT name, LEN(name) AS n FROM sys.tables ORDER BY name',
     }) do
       eq(session:gate(statement), nil, { fail_reason = statement .. ' was wrongly refused' })
     end

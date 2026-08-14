@@ -88,6 +88,43 @@ describe('layout: an 80x24 terminal', function()
   end)
 end)
 
+--- A failed `open` used to keep everything it had already built: `M.open` threw, the caller had
+--- no layout to close, and the tabpage plus its three scratch buffers stayed for the rest of the
+--- session. Every retry added another set, and `:DbLensClose` reported success without touching
+--- any of them.
+describe('layout.open: the failure path owns what it built', function()
+  local function dblens_buffers()
+    local count = 0
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if
+        vim.api.nvim_buf_is_valid(buf)
+        and vim.api.nvim_buf_get_name(buf):find('dblens: ', 1, true)
+      then
+        count = count + 1
+      end
+    end
+    return count
+  end
+
+  it('leaves no tabpage and no buffers behind, however many times it fails', function()
+    local options = vim.deepcopy(require('dblens.config').defaults)
+    -- The geometry refuses this width; any throw inside `open` exercises the same path.
+    options.ui.sidebar.width = 0
+    local tabs, bufs = #vim.api.nvim_list_tabpages(), dblens_buffers()
+    for attempt = 1, 3 do
+      expect_error(function()
+        layout.open(options)
+      end, 'sidebar_width')
+      eq(#vim.api.nvim_list_tabpages(), tabs, {
+        fail_reason = ('attempt %d stranded a tabpage'):format(attempt),
+      })
+      eq(dblens_buffers(), bufs, {
+        fail_reason = ('attempt %d stranded scratch buffers'):format(attempt),
+      })
+    end
+  end)
+end)
+
 describe('empty.panel', function()
   it('aligns the hint keys into one column', function()
     local lines = empty.panel('no connection', {
