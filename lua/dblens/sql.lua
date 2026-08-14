@@ -5,9 +5,12 @@
 --- code-only view and `strip()` is the blank-the-opaque-spans view. Both exist so that no
 --- later scan for a keyword or a `;` can be fooled by text inside a string or a comment.
 ---
---- This module is BEST-EFFORT, not a security boundary. Read-only is enforced by the server
---- (`dblens.adapters.*.command` opens a read-only connection); classification decides whether
---- the UI asks for confirmation. A miss here costs a missing prompt, not a lost table.
+--- This module is BEST-EFFORT, and on postgres/mysql it is still SECURITY-RELEVANT. A read-only
+--- run is sent inside a server-side read-only TRANSACTION, which no `SET` can escape — but a
+--- statement that ENDS or REPLACES that transaction (`COMMIT`, `ROLLBACK`, `START TRANSACTION
+--- READ WRITE`) can, and the only thing that stops one is classifying the script as a write.
+--- That takes a second top-level `;`, so every divergence about where a statement ENDS is a
+--- potential bypass. Only sqlite's `-readonly` open mode needs no help from here.
 local M = {}
 
 --- The `backtick`/`bracket` flags say what the lexer must RECOGNISE; `ident_quote` says what we
@@ -22,6 +25,7 @@ local M = {}
 ---@field nested_comment boolean   -- /* /* */ */ nests; only postgres does
 ---@field exec_comment boolean     -- /*! ... */ is executed, so its body is code
 ---@field named_commands boolean   -- a bare leading `system`/`source` is a client command
+---@field dash_comment_needs_space boolean -- `--` opens a comment only when whitespace follows
 
 M.dialects = {
   standard = {
@@ -34,6 +38,7 @@ M.dialects = {
     nested_comment = false,
     exec_comment = false,
     named_commands = false,
+    dash_comment_needs_space = false,
   },
   sqlite = {
     ident_quote = '"',
@@ -45,6 +50,7 @@ M.dialects = {
     nested_comment = false,
     exec_comment = false,
     named_commands = false,
+    dash_comment_needs_space = false,
   },
   postgres = {
     ident_quote = '"',
@@ -56,6 +62,7 @@ M.dialects = {
     nested_comment = true,
     exec_comment = false,
     named_commands = false,
+    dash_comment_needs_space = false,
   },
   mysql = {
     ident_quote = '`',
@@ -67,14 +74,15 @@ M.dialects = {
     nested_comment = false,
     exec_comment = true,
     named_commands = true,
+    dash_comment_needs_space = true,
   },
 }
 
 --- Widest dialect, used when no connection context is known.
 ---
 --- "Widest" means the fail-safe direction on every axis, which is not the same as "all true":
---- a scanner that over-consumes hides live SQL, so nesting is OFF here (only postgres nests) and
---- executable comments are ON (their body is code).
+--- a scanner that over-consumes hides live SQL, so nesting is OFF here (only postgres nests),
+--- executable comments are ON (their body is code) and `--x` is code rather than a comment.
 M.dialects.permissive = {
   ident_quote = '"',
   backtick = true,
@@ -85,6 +93,7 @@ M.dialects.permissive = {
   nested_comment = false,
   exec_comment = true,
   named_commands = true,
+  dash_comment_needs_space = true,
 }
 
 ---@class dblens.Token
@@ -126,6 +135,19 @@ local function find_block_comment_end(sql, i, nested)
   return #sql
 end
 
+--- Whether the `--` at `i` opens a comment.
+---
+--- MySQL/MariaDB need whitespace or a control byte after the second dash: `--1` is arithmetic
+--- there, so reading it as a comment swallowed the rest of the line -- a stacked `; DROP TABLE`
+--- included. End of input carries nothing to hide, so it stays a comment.
+local function dash_opens_comment(sql, i, d)
+  if not d.dash_comment_needs_space then
+    return true
+  end
+  local after = sql:sub(i + 2, i + 2)
+  return after == '' or after:match('[%s%c]') ~= nil
+end
+
 --- End offset of a quoted span opened at `i`. `doubling` allows the SQL `''` escape.
 ---@return integer to, boolean closed  -- `closed` false when the input ran out first
 local function find_quoted_end(sql, i, closer, doubling, backslash)
@@ -163,7 +185,7 @@ local function scan_token(sql, i, d)
   if c:match('%s') then
     return tok('space', (sql:find('%S', i) or #sql + 1) - 1)
   end
-  if two == '--' or (d.hash_comment and c == '#') then
+  if (two == '--' and dash_opens_comment(sql, i, d)) or (d.hash_comment and c == '#') then
     return tok('comment', find_eol(sql, i))
   end
   if two == '/*' then
