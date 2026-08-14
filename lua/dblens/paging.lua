@@ -13,7 +13,10 @@ local M = {}
 ---@param total integer?
 ---@return dblens.Paging
 function M.new(size, total)
-  assert(type(size) == 'number' and size >= 1 and size == math.floor(size), 'paging.new: size must be a positive integer')
+  assert(
+    type(size) == 'number' and size >= 1 and size == math.floor(size),
+    'paging.new: size must be a positive integer'
+  )
   assert(total == nil or total >= 0, 'paging.new: total must not be negative')
   return { page = 1, size = size, total = total }
 end
@@ -53,7 +56,10 @@ end
 --- it actually moved, so the caller can avoid a pointless refetch.
 ---@return dblens.Paging, boolean moved
 function M.step(state, delta, rows_on_page)
-  assert(type(delta) == 'number' and delta == math.floor(delta), 'paging.step: delta must be an integer')
+  assert(
+    type(delta) == 'number' and delta == math.floor(delta),
+    'paging.step: delta must be an integer'
+  )
   local target = state.page + delta
   local pages = M.page_count(state)
   if target < 1 then

@@ -123,7 +123,11 @@ function M.parse_relations(result, schema)
   for _, row in ipairs(result.rows) do
     local name = value(row, result.columns, 'name')
     if name then
-      out[#out + 1] = { schema = schema, name = name, kind = value(row, result.columns, 'kind') == 'view' and 'view' or 'table' }
+      out[#out + 1] = {
+        schema = schema,
+        name = name,
+        kind = value(row, result.columns, 'kind') == 'view' and 'view' or 'table',
+      }
     end
   end
   return out
@@ -160,7 +164,10 @@ end
 
 --- Replace one loaded facet of a relation. `part` is 'columns', 'indexes' or 'constraints'.
 function Catalog:set_part(relation, part, items)
-  assert(part == 'columns' or part == 'indexes' or part == 'constraints', 'catalog:set_part: unknown part ' .. tostring(part))
+  assert(
+    part == 'columns' or part == 'indexes' or part == 'constraints',
+    'catalog:set_part: unknown part ' .. tostring(part)
+  )
   assert(vim.islist(items), 'catalog:set_part: expected a list')
   self:info_for(relation)[part] = items
 end

@@ -16,10 +16,38 @@ local M = {}
 ---@field backslash_escape boolean -- backslash escapes inside string literals
 
 M.dialects = {
-  standard = { ident_quote = '"', backtick = false, bracket = false, hash_comment = false, dollar_quote = false, backslash_escape = false },
-  sqlite = { ident_quote = '"', backtick = true, bracket = true, hash_comment = false, dollar_quote = false, backslash_escape = false },
-  postgres = { ident_quote = '"', backtick = false, bracket = false, hash_comment = false, dollar_quote = true, backslash_escape = false },
-  mysql = { ident_quote = '`', backtick = true, bracket = false, hash_comment = true, dollar_quote = false, backslash_escape = true },
+  standard = {
+    ident_quote = '"',
+    backtick = false,
+    bracket = false,
+    hash_comment = false,
+    dollar_quote = false,
+    backslash_escape = false,
+  },
+  sqlite = {
+    ident_quote = '"',
+    backtick = true,
+    bracket = true,
+    hash_comment = false,
+    dollar_quote = false,
+    backslash_escape = false,
+  },
+  postgres = {
+    ident_quote = '"',
+    backtick = false,
+    bracket = false,
+    hash_comment = false,
+    dollar_quote = true,
+    backslash_escape = false,
+  },
+  mysql = {
+    ident_quote = '`',
+    backtick = true,
+    bracket = false,
+    hash_comment = true,
+    dollar_quote = false,
+    backslash_escape = true,
+  },
 }
 
 --- Widest dialect, used when no connection context is known. Accepting every quoting form can
@@ -205,7 +233,14 @@ end
 
 -- verb -> { write, destructive }. Verbs absent from this table are treated as read-only.
 local VERBS = {
-  SELECT = {}, WITH = {}, VALUES = {}, SHOW = {}, EXPLAIN = {}, PRAGMA = {}, DESCRIBE = {}, DESC = {},
+  SELECT = {},
+  WITH = {},
+  VALUES = {},
+  SHOW = {},
+  EXPLAIN = {},
+  PRAGMA = {},
+  DESCRIBE = {},
+  DESC = {},
   INSERT = { write = true },
   CREATE = { write = true },
   COMMENT = { write = true },
@@ -231,9 +266,22 @@ local WHOLE_OBJECT = { DROP = true, TRUNCATE = true, ALTER = true, RENAME = true
 
 --- Noise between a DDL verb and the object it names.
 local DDL_QUALIFIER = {
-  TABLE = true, VIEW = true, INDEX = true, TRIGGER = true, SEQUENCE = true, SCHEMA = true,
-  DATABASE = true, MATERIALIZED = true, TEMP = true, TEMPORARY = true, UNIQUE = true,
-  IF = true, EXISTS = true, NOT = true, ONLY = true, CONCURRENTLY = true,
+  TABLE = true,
+  VIEW = true,
+  INDEX = true,
+  TRIGGER = true,
+  SEQUENCE = true,
+  SCHEMA = true,
+  DATABASE = true,
+  MATERIALIZED = true,
+  TEMP = true,
+  TEMPORARY = true,
+  UNIQUE = true,
+  IF = true,
+  EXISTS = true,
+  NOT = true,
+  ONLY = true,
+  CONCURRENTLY = true,
 }
 
 local function token_name(t)
@@ -261,7 +309,13 @@ end
 
 --- Locate the object a write statement targets.
 local function find_target(toks, verb)
-  local anchor = ({ INSERT = 'INTO', DELETE = 'FROM', UPDATE = 'UPDATE' })[verb]
+  local anchor = ({
+    INSERT = 'INTO',
+    DELETE = 'FROM',
+    UPDATE = 'UPDATE',
+    MERGE = 'INTO',
+    REPLACE = 'INTO',
+  })[verb]
   local skip_qualifiers = anchor == nil
   local start
   if anchor then
@@ -277,7 +331,12 @@ local function find_target(toks, verb)
   if not start then
     return nil
   end
-  while skip_qualifiers and toks[start] and toks[start].type == 'word' and DDL_QUALIFIER[toks[start].text:upper()] do
+  while
+    skip_qualifiers
+    and toks[start]
+    and toks[start].type == 'word'
+    and DDL_QUALIFIER[toks[start].text:upper()]
+  do
     start = start + 1
   end
   return read_qualified_name(toks, start)
@@ -316,6 +375,15 @@ function M.classify(sql, dialect)
     whole_object = destructive and (WHOLE_OBJECT[verb] == true or not has_where),
     target = info.write and find_target(toks, verb) or nil,
   }
+end
+
+--- Whether a bare word is a verb that writes. Used to vet fragments, like a filter predicate,
+--- where there is no leading verb to classify.
+---@param word string
+---@return boolean
+function M.is_write_verb(word)
+  local info = VERBS[tostring(word):upper()]
+  return info ~= nil and info.write == true
 end
 
 --- Classify every statement in a script.

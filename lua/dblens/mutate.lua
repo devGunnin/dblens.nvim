@@ -104,7 +104,12 @@ function M.update(relation, key, column, value, dialect)
     kind = 'update',
     relation = relation,
     where = where,
-    sql = ('UPDATE %s SET %s = %s WHERE %s'):format(target, sql.quote_ident(column, dialect), literal(value, dialect), where),
+    sql = ('UPDATE %s SET %s = %s WHERE %s'):format(
+      target,
+      sql.quote_ident(column, dialect),
+      literal(value, dialect),
+      where
+    ),
     guard = ('SELECT count(*) AS n FROM %s WHERE %s'):format(target, where),
     summary = ('set %s = %s'):format(column, short(value)),
   }

@@ -54,7 +54,11 @@ end
 function M.get(kind)
   local key = M.normalize(kind)
   if not key then
-    return nil, ('unknown database kind `%s` (known: %s)'):format(tostring(kind), table.concat(M.kinds(), ', '))
+    return nil,
+      ('unknown database kind `%s` (known: %s)'):format(
+        tostring(kind),
+        table.concat(M.kinds(), ', ')
+      )
   end
   if not loaded[key] then
     loaded[key] = require(REGISTRY[key])

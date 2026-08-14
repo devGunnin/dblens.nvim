@@ -64,6 +64,10 @@ M.defaults = {
   keymaps = { global = {}, sidebar = {}, results = {}, editor = {} },
 }
 
+--- Options whose default is nil because it is derived from `stdpath` at setup time. They are
+--- absent from `defaults`, so the unknown-key check needs to know they are real.
+local DERIVED = { connections_file = 'string', history_file = 'string', state_file = 'string' }
+
 --- Subtrees whose keys are user-defined rather than fixed by the schema.
 local OPEN_PATHS = {
   ['connections'] = true,
@@ -89,15 +93,13 @@ local function merge(base, user, path)
   for key, value in pairs(user) do
     local at = join(path, key)
     local default = base[key]
-    if default == nil and not OPEN_PATHS[path] then
+    local derived = path == '' and DERIVED[key] or nil
+    if default == nil and not derived and not OPEN_PATHS[path] then
       error(('dblens: unknown option `%s`'):format(at), 0)
     end
-    if default ~= nil and value ~= nil and not OPEN_PATHS[at] then
-      local want, got = type(default), type(value)
-      -- nil-valued defaults are "derive later" slots, so they impose no type.
-      if want ~= got and want ~= 'nil' then
-        error(('dblens: option `%s` expects %s, got %s'):format(at, want, got), 0)
-      end
+    local want = derived or (default ~= nil and type(default) or nil)
+    if want and value ~= nil and not OPEN_PATHS[at] and type(value) ~= want then
+      error(('dblens: option `%s` expects %s, got %s'):format(at, want, type(value)), 0)
     end
     if is_plain_table(default) and is_plain_table(value) and not OPEN_PATHS[at] then
       out[key] = merge(default, value, at)

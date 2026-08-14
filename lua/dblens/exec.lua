@@ -26,7 +26,7 @@ local uv = vim.uv or vim.loop
 ---@field timeout_ms integer
 ---@field max_bytes integer
 
-local function fail_fast(spec, message, on_done)
+local function fail_fast(message, on_done)
   vim.schedule(function()
     on_done({
       ok = false,
@@ -38,9 +38,12 @@ local function fail_fast(spec, message, on_done)
       elapsed_ms = 0,
     })
   end)
-  return { cancel = function() end, is_done = function()
-    return true
-  end }
+  return {
+    cancel = function() end,
+    is_done = function()
+      return true
+    end,
+  }
 end
 
 --- Collector for one stream, capping total bytes.
@@ -76,11 +79,14 @@ end
 function M.run(spec, on_done)
   assert(type(spec.argv) == 'table' and #spec.argv > 0, 'exec.run: argv must be non-empty')
   assert(type(on_done) == 'function', 'exec.run: on_done must be a function')
-  assert(spec.timeout_ms > 0 and spec.max_bytes > 0, 'exec.run: timeout and byte cap must be positive')
+  assert(
+    spec.timeout_ms > 0 and spec.max_bytes > 0,
+    'exec.run: timeout and byte cap must be positive'
+  )
 
   local client = spec.argv[1]
   if vim.fn.executable(client) ~= 1 then
-    return fail_fast(spec, ('client `%s` was not found on PATH'):format(client), on_done)
+    return fail_fast(('client `%s` was not found on PATH'):format(client), on_done)
   end
 
   local started = uv.hrtime()
@@ -141,7 +147,7 @@ function M.run(spec, on_done)
     end)
   end)
   if not spawned then
-    return fail_fast(spec, ('could not start `%s`: %s'):format(client, err), on_done)
+    return fail_fast(('could not start `%s`: %s'):format(client, err), on_done)
   end
 
   timer = uv.new_timer()

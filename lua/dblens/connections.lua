@@ -90,7 +90,11 @@ function M.load(options)
       return
     end
     if seen[copy.name] then
-      problems[#problems + 1] = ('duplicate connection name `%s` (%s and %s)'):format(copy.name, seen[copy.name], source)
+      problems[#problems + 1] = ('duplicate connection name `%s` (%s and %s)'):format(
+        copy.name,
+        seen[copy.name],
+        source
+      )
       return
     end
     if copy.read_only == nil then
@@ -180,7 +184,13 @@ function M.resolve_secret(spec, options, on_done)
   }, function(result)
     if not result.ok then
       -- Report the command's failure, never its output: that output is the secret.
-      on_done(nil, ('connection `%s`: password command failed (%s)'):format(spec.name, result.reason or ('exit ' .. result.code)))
+      on_done(
+        nil,
+        ('connection `%s`: password command failed (%s)'):format(
+          spec.name,
+          result.reason or ('exit ' .. result.code)
+        )
+      )
       return
     end
     local secret = result.stdout:gmatch('[^\r\n]*')()

@@ -1,6 +1,7 @@
 std = 'luajit'
 cache = true
-read_globals = { 'vim' }
+-- `vim` is writable: plugins legitimately set vim.bo/vim.wo/vim.o fields.
+globals = { 'vim' }
 
 -- line length is owned by stylua
 max_line_length = false

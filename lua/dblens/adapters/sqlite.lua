@@ -16,7 +16,13 @@ local M = {
   dialect = dialect,
   --- sqlite has no schema layer we expose (attached databases are out of scope), no plan-row
   --- estimate, and no EXPLAIN ANALYZE.
-  caps = { schemas = false, ddl = 'native', explain = true, explain_analyze = false, estimate_rows = false },
+  caps = {
+    schemas = false,
+    ddl = 'native',
+    explain = true,
+    explain_analyze = false,
+    estimate_rows = false,
+  },
   --- Required connection fields, used by the connection form and by validation.
   fields = { { name = 'path', label = 'Database file', required = true } },
 }
@@ -58,7 +64,7 @@ function M.sql.schemas()
 end
 
 function M.sql.relations(_schema)
-  return "SELECT name AS name, type AS kind FROM sqlite_schema "
+  return 'SELECT name AS name, type AS kind FROM sqlite_schema '
     .. "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' "
     .. 'ORDER BY type DESC, name'
 end
@@ -85,7 +91,9 @@ function M.sql.constraints(_relation)
 end
 
 function M.sql.ddl(relation)
-  return ('SELECT sql AS ddl FROM sqlite_schema WHERE name = %s AND sql IS NOT NULL'):format(lit(relation.name))
+  return ('SELECT sql AS ddl FROM sqlite_schema WHERE name = %s AND sql IS NOT NULL'):format(
+    lit(relation.name)
+  )
 end
 
 function M.sql.page(relation, opts)

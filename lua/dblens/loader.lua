@@ -17,11 +17,16 @@ local function derive_constraints(info)
       pk[#pk + 1] = column.name
     end
     if column.fk then
-      out[#out + 1] = { name = column.name, kind = 'FOREIGN KEY', detail = column.name .. ' -> ' .. column.fk }
+      out[#out + 1] =
+        { name = column.name, kind = 'FOREIGN KEY', detail = column.name .. ' -> ' .. column.fk }
     end
   end
   if #pk > 0 then
-    table.insert(out, 1, { name = 'primary key', kind = 'PRIMARY KEY', detail = table.concat(pk, ', ') })
+    table.insert(
+      out,
+      1,
+      { name = 'primary key', kind = 'PRIMARY KEY', detail = table.concat(pk, ', ') }
+    )
   end
   for _, index in ipairs(info.indexes or {}) do
     if index.unique and not index.primary then
@@ -67,7 +72,10 @@ function M.relations(session, schema, on_done)
       on_done(err)
       return
     end
-    session.catalog:set_relations(schema, catalog.parse_relations(result, schema ~= '' and schema or nil))
+    session.catalog:set_relations(
+      schema,
+      catalog.parse_relations(result, schema ~= '' and schema or nil)
+    )
     on_done(nil)
   end)
 end
@@ -91,7 +99,11 @@ function M.part(session, relation, part, on_done)
 
   local statement = session.adapter.sql[part](relation)
   if not statement then
-    session.catalog:set_part(relation, part, part == 'constraints' and derive_constraints(info) or {})
+    session.catalog:set_part(
+      relation,
+      part,
+      part == 'constraints' and derive_constraints(info) or {}
+    )
     on_done(nil)
     return
   end

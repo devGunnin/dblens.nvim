@@ -18,7 +18,13 @@ local M = {
   label = 'PostgreSQL',
   dialect = dialect,
   --- No native DDL statement, so DDL is reconstructed from the catalog.
-  caps = { schemas = true, ddl = 'reconstructed', explain = true, explain_analyze = true, estimate_rows = true },
+  caps = {
+    schemas = true,
+    ddl = 'reconstructed',
+    explain = true,
+    explain_analyze = true,
+    estimate_rows = true,
+  },
   fields = {
     { name = 'host', label = 'Host', default = 'localhost' },
     { name = 'port', label = 'Port', default = 5432 },
@@ -38,18 +44,27 @@ function M.validate(spec)
 end
 
 function M.describe(spec)
-  return ('%s@%s:%s/%s'):format(spec.user or '$USER', spec.host or 'localhost', spec.port or 5432, spec.database)
+  return ('%s@%s:%s/%s'):format(
+    spec.user or '$USER',
+    spec.host or 'localhost',
+    spec.port or 5432,
+    spec.database
+  )
 end
 
 --- Build the psql invocation. The password never touches argv: psql reads PGPASSWORD.
 function M.command(spec, secret, mode, clients)
-  local argv = { clients.postgres, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-P', 'pager=off', '-P', 'footer=off' }
+  local argv =
+    { clients.postgres, '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-P', 'pager=off', '-P', 'footer=off' }
   if mode == 'records' then
     vim.list_extend(argv, {
       '-A',
-      '-F', protocol.FIELD_SEP,
-      '-R', protocol.RECORD_SEP,
-      '-P', 'null=' .. protocol.NULL_SENTINEL,
+      '-F',
+      protocol.FIELD_SEP,
+      '-R',
+      protocol.RECORD_SEP,
+      '-P',
+      'null=' .. protocol.NULL_SENTINEL,
     })
   else
     vim.list_extend(argv, { '-A', '-t' })
@@ -87,7 +102,9 @@ end
 function M.sql.relations(schema)
   return ([[SELECT table_name AS name,
        CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS kind
-FROM information_schema.tables WHERE table_schema = %s ORDER BY kind DESC, table_name]]):format(lit(schema))
+FROM information_schema.tables WHERE table_schema = %s ORDER BY kind DESC, table_name]]):format(
+    lit(schema)
+  )
 end
 
 function M.sql.columns(relation)
@@ -121,20 +138,32 @@ function M.sql.indexes(relation)
   return ([[SELECT i.relname AS name,
        CASE WHEN ix.indisunique THEN 1 ELSE 0 END AS uniq,
        CASE WHEN ix.indisprimary THEN 'pk' ELSE 'i' END AS origin,
-       pg_get_indexdef(ix.indexrelid) AS cols
+       (SELECT string_agg(a.attname, ', ' ORDER BY k.ord)
+          FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+          JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum) AS cols
 FROM pg_index ix
 JOIN pg_class i ON i.oid = ix.indexrelid
 JOIN pg_class t ON t.oid = ix.indrelid
 JOIN pg_namespace n ON n.oid = t.relnamespace
-WHERE n.nspname = %s AND t.relname = %s ORDER BY i.relname]]):format(lit(relation.schema or 'public'), lit(relation.name))
+WHERE n.nspname = %s AND t.relname = %s ORDER BY i.relname]]):format(
+    lit(relation.schema or 'public'),
+    lit(relation.name)
+  )
 end
 
 function M.sql.constraints(relation)
-  return ([[SELECT conname AS name, contype AS kind, pg_get_constraintdef(c.oid) AS detail
+  -- contype is a single letter; spell it out so `kind` means the same thing across adapters.
+  return ([[SELECT conname AS name,
+       CASE contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'f' THEN 'FOREIGN KEY' WHEN 'u' THEN 'UNIQUE'
+                    WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE' ELSE contype::text END AS kind,
+       pg_get_constraintdef(c.oid) AS detail
 FROM pg_constraint c
 JOIN pg_class t ON t.oid = c.conrelid
 JOIN pg_namespace n ON n.oid = t.relnamespace
-WHERE n.nspname = %s AND t.relname = %s ORDER BY conname]]):format(lit(relation.schema or 'public'), lit(relation.name))
+WHERE n.nspname = %s AND t.relname = %s ORDER BY conname]]):format(
+    lit(relation.schema or 'public'),
+    lit(relation.name)
+  )
 end
 
 --- No native DDL statement; `dblens.ddl` reconstructs it from the catalog.

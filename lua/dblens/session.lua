@@ -41,7 +41,8 @@ function M.new(spec, options)
     secret = nil,
     connected = false,
     jobs = {},
-  }, Session), nil
+  }, Session),
+    nil
 end
 
 function Session:is_read_only()
@@ -252,7 +253,12 @@ function Session:execute_write(request, on_done)
     end
     local count = guard_count(result)
     if count ~= 1 then
-      on_done(nil, ('refusing to apply: the row predicate matches %s rows, not exactly 1'):format(count or 'an unknown number of'))
+      on_done(
+        nil,
+        ('refusing to apply: the row predicate matches %s rows, not exactly 1'):format(
+          count or 'an unknown number of'
+        )
+      )
       return
     end
     proceed()

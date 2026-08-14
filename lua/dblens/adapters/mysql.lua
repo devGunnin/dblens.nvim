@@ -21,7 +21,13 @@ local M = {
   kind = 'mysql',
   label = 'MySQL',
   dialect = dialect,
-  caps = { schemas = true, ddl = 'native', explain = true, explain_analyze = true, estimate_rows = true },
+  caps = {
+    schemas = true,
+    ddl = 'native',
+    explain = true,
+    explain_analyze = true,
+    estimate_rows = true,
+  },
   fields = {
     { name = 'host', label = 'Host', default = 'localhost' },
     { name = 'port', label = 'Port', default = 3306 },
@@ -41,7 +47,12 @@ function M.validate(spec)
 end
 
 function M.describe(spec)
-  return ('%s@%s:%s/%s'):format(spec.user or '$USER', spec.host or 'localhost', spec.port or 3306, spec.database)
+  return ('%s@%s:%s/%s'):format(
+    spec.user or '$USER',
+    spec.host or 'localhost',
+    spec.port or 3306,
+    spec.database
+  )
 end
 
 --- The password goes through MYSQL_PWD, never argv, which would expose it in the process list.
@@ -66,35 +77,61 @@ end
 local ENTITIES = { amp = '&', lt = '<', gt = '>', quot = '"', apos = "'" }
 
 local function unescape(text)
-  return (text:gsub('&(#?[%w]+);', function(name)
-    if ENTITIES[name] then
-      return ENTITIES[name]
-    end
-    local hex = name:match('^#[xX](%x+)$')
-    if hex then
-      return vim.fn.nr2char(tonumber(hex, 16))
-    end
-    local dec = name:match('^#(%d+)$')
-    if dec then
-      return vim.fn.nr2char(tonumber(dec, 10))
-    end
-    return '&' .. name .. ';'
-  end))
+  return (
+    text:gsub('&(#?[%w]+);', function(name)
+      if ENTITIES[name] then
+        return ENTITIES[name]
+      end
+      local hex = name:match('^#[xX](%x+)$')
+      if hex then
+        return vim.fn.nr2char(tonumber(hex, 16))
+      end
+      local dec = name:match('^#(%d+)$')
+      if dec then
+        return vim.fn.nr2char(tonumber(dec, 10))
+      end
+      return '&' .. name .. ';'
+    end)
+  )
 end
 
 --- Parse one `<row>...</row>` block into ordered field names and values.
+---
+--- One ordered scan, not one pass per field shape: a NULL field is self-closing, and matching
+--- the two shapes independently would put a mid-row NULL in the wrong position and let the
+--- body pattern run past it into the following field.
 local function parse_row(block)
-  local names, values = {}, {}
-  for attrs, body in block:gmatch('<field([^>]*)>(.-)</field>') do
+  local names, values, pos = {}, {}, 1
+  while true do
+    local _, open_end = block:find('<field', pos, true)
+    if not open_end then
+      return names, values
+    end
+    local tag_end = block:find('>', open_end + 1, true)
+    if not tag_end then
+      return names, values
+    end
+    local attrs = block:sub(open_end + 1, tag_end - 1)
+    local self_closing = attrs:sub(-1) == '/'
+    if self_closing then
+      attrs = attrs:sub(1, -2)
+    end
+    local is_null = self_closing or attrs:find('xsi:nil%s*=%s*"true"') ~= nil
+
+    local value
+    if self_closing then
+      value, pos = protocol.NULL, tag_end + 1
+    else
+      local body_end = block:find('</field>', tag_end + 1, true)
+      if not body_end then
+        return names, values
+      end
+      value = is_null and protocol.NULL or unescape(block:sub(tag_end + 1, body_end - 1))
+      pos = body_end + 8
+    end
     names[#names + 1] = unescape(attrs:match('name="([^"]*)"') or '')
-    values[#values + 1] = unescape(body)
+    values[#values + 1] = value
   end
-  -- self-closing fields carry xsi:nil and therefore no body
-  for attrs in block:gmatch('<field([^>]-)/>') do
-    names[#names + 1] = unescape(attrs:match('name="([^"]*)"') or '')
-    values[#values + 1] = protocol.NULL
-  end
-  return names, values
 end
 
 --- Decode `mysql --xml` output into a result set.
@@ -136,7 +173,9 @@ end
 function M.sql.relations(schema)
   return ([[SELECT table_name AS name,
        CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS kind
-FROM information_schema.tables WHERE table_schema = %s ORDER BY kind DESC, table_name]]):format(lit(schema))
+FROM information_schema.tables WHERE table_schema = %s ORDER BY kind DESC, table_name]]):format(
+    lit(schema)
+  )
 end
 
 function M.sql.columns(relation)
@@ -160,7 +199,10 @@ function M.sql.indexes(relation)
        CASE WHEN index_name = 'PRIMARY' THEN 'pk' ELSE 'i' END AS origin,
        group_concat(column_name ORDER BY seq_in_index) AS cols
 FROM information_schema.statistics WHERE table_schema = %s AND table_name = %s
-GROUP BY index_name, non_unique ORDER BY index_name]]):format(lit(relation.schema or ''), lit(relation.name))
+GROUP BY index_name, non_unique ORDER BY index_name]]):format(
+    lit(relation.schema or ''),
+    lit(relation.name)
+  )
 end
 
 function M.sql.constraints(relation)
