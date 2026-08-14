@@ -67,6 +67,7 @@ M.dialects.permissive = {
 ---@field from integer  -- 1-based inclusive byte offset
 ---@field to integer    -- 1-based inclusive byte offset
 ---@field value string? -- unquoted name for `ident`, decoded body for `string`
+---@field closed boolean? -- for `string`/`ident`: false when the input ended before the delimiter
 
 local function find_eol(sql, i)
   return (sql:find('\n', i, true) or #sql + 1) - 1
@@ -93,6 +94,7 @@ local function find_block_comment_end(sql, i)
 end
 
 --- End offset of a quoted span opened at `i`. `doubling` allows the SQL `''` escape.
+---@return integer to, boolean closed  -- `closed` false when the input ran out first
 local function find_quoted_end(sql, i, closer, doubling, backslash)
   local j = i + 1
   while j <= #sql do
@@ -103,13 +105,13 @@ local function find_quoted_end(sql, i, closer, doubling, backslash)
       if doubling and sql:sub(j + 1, j + 1) == closer then
         j = j + 2
       else
-        return j
+        return j, true
       end
     else
       j = j + 1
     end
   end
-  return #sql
+  return #sql, false
 end
 
 local function unquote(text, closer, doubling)
@@ -121,8 +123,8 @@ end
 ---@return dblens.Token
 local function scan_token(sql, i, d)
   local c, two = sql:sub(i, i), sql:sub(i, i + 1)
-  local function tok(kind, to, value)
-    return { type = kind, text = sql:sub(i, to), from = i, to = to, value = value }
+  local function tok(kind, to, value, closed)
+    return { type = kind, text = sql:sub(i, to), from = i, to = to, value = value, closed = closed }
   end
 
   if c:match('%s') then
@@ -135,28 +137,28 @@ local function scan_token(sql, i, d)
     return tok('comment', find_block_comment_end(sql, i))
   end
   if c == "'" then
-    local to = find_quoted_end(sql, i, "'", true, d.backslash_escape)
-    return tok('string', to, unquote(sql:sub(i, to), "'", true))
+    local to, closed = find_quoted_end(sql, i, "'", true, d.backslash_escape)
+    return tok('string', to, unquote(sql:sub(i, to), "'", true), closed)
   end
   if d.dollar_quote and c == '$' then
     local tag = sql:match('^%$[%w_]*%$', i)
     if tag then
       local close = sql:find(tag, i + #tag, true)
       local to = close and (close + #tag - 1) or #sql
-      return tok('string', to, sql:sub(i + #tag, (close or #sql + 1) - 1))
+      return tok('string', to, sql:sub(i + #tag, (close or #sql + 1) - 1), close ~= nil)
     end
   end
   if c == '"' then
-    local to = find_quoted_end(sql, i, '"', true, false)
-    return tok('ident', to, unquote(sql:sub(i, to), '"', true))
+    local to, closed = find_quoted_end(sql, i, '"', true, false)
+    return tok('ident', to, unquote(sql:sub(i, to), '"', true), closed)
   end
   if d.backtick and c == '`' then
-    local to = find_quoted_end(sql, i, '`', true, false)
-    return tok('ident', to, unquote(sql:sub(i, to), '`', true))
+    local to, closed = find_quoted_end(sql, i, '`', true, false)
+    return tok('ident', to, unquote(sql:sub(i, to), '`', true), closed)
   end
   if d.bracket and c == '[' then
-    local to = find_quoted_end(sql, i, ']', false, false)
-    return tok('ident', to, unquote(sql:sub(i, to), ']', false))
+    local to, closed = find_quoted_end(sql, i, ']', false, false)
+    return tok('ident', to, unquote(sql:sub(i, to), ']', false), closed)
   end
   if c:match('[%a_]') then
     local _, to = sql:find('^[%w_]+', i)
@@ -231,35 +233,131 @@ function M.split(sql, dialect)
   return out
 end
 
--- verb -> { write, destructive }. Verbs absent from this table are treated as read-only.
-local VERBS = {
-  SELECT = {},
-  WITH = {},
-  VALUES = {},
+-- Verbs that write. This table FLAGS a statement; it never clears one. A statement is a read
+-- only when `analyse` can prove it, so a verb missing from here is still treated as a write.
+local WRITE_VERBS = {
+  INSERT = {},
+  CREATE = {},
+  COMMENT = {},
+  ANALYZE = {},
+  VACUUM = {},
+  REINDEX = {},
+  ATTACH = {},
+  DETACH = {},
+  COPY = {},
+  DO = {},
+  CALL = {},
+  EXEC = {},
+  EXECUTE = {},
+  LOAD = {},
+  IMPORT = {},
+  SET = {},
+  RESET = {},
+  BEGIN = {},
+  COMMIT = {},
+  ROLLBACK = {},
+  SAVEPOINT = {},
+  UPDATE = { destructive = true },
+  DELETE = { destructive = true },
+  REPLACE = { destructive = true },
+  MERGE = { destructive = true },
+  DROP = { destructive = true },
+  TRUNCATE = { destructive = true },
+  ALTER = { destructive = true },
+  RENAME = { destructive = true },
+  GRANT = { destructive = true },
+  REVOKE = { destructive = true },
+}
+
+--- Leading verbs that can begin a provable read. `scan` marks the ones whose tail can carry a
+--- data-modifying CTE or subquery, so the whole statement has to be swept.
+local READ_VERBS = {
+  SELECT = { scan = true },
+  WITH = { scan = true },
+  VALUES = { scan = true },
+  TABLE = { scan = true },
   SHOW = {},
-  EXPLAIN = {},
-  PRAGMA = {},
   DESCRIBE = {},
   DESC = {},
-  INSERT = { write = true },
-  CREATE = { write = true },
-  COMMENT = { write = true },
-  ANALYZE = { write = true },
-  VACUUM = { write = true },
-  REINDEX = { write = true },
-  ATTACH = { write = true },
-  DETACH = { write = true },
-  UPDATE = { write = true, destructive = true },
-  DELETE = { write = true, destructive = true },
-  REPLACE = { write = true, destructive = true },
-  MERGE = { write = true, destructive = true },
-  DROP = { write = true, destructive = true },
-  TRUNCATE = { write = true, destructive = true },
-  ALTER = { write = true, destructive = true },
-  RENAME = { write = true, destructive = true },
-  GRANT = { write = true, destructive = true },
-  REVOKE = { write = true, destructive = true },
 }
+
+--- Words that turn a SELECT into a write by redirecting its output.
+local READ_TAIL_BAN = { INTO = true, OUTFILE = true, DUMPFILE = true }
+
+--- PRAGMAs that only report. Named explicitly because the syntax gives nothing away: `PRAGMA x`
+--- reads for most names but `PRAGMA optimize` runs ANALYZE and `PRAGMA wal_checkpoint` writes.
+--- Introspection pragmas take an argument, so they stay reads in the `PRAGMA x(t)` call form;
+--- for a getter that same form is the SET form, so it is not.
+local PRAGMA_INTROSPECT = {
+  TABLE_INFO = true,
+  TABLE_XINFO = true,
+  TABLE_LIST = true,
+  INDEX_INFO = true,
+  INDEX_XINFO = true,
+  INDEX_LIST = true,
+  FOREIGN_KEY_LIST = true,
+  COLLATION_LIST = true,
+  DATABASE_LIST = true,
+  FUNCTION_LIST = true,
+  MODULE_LIST = true,
+  PRAGMA_LIST = true,
+  COMPILE_OPTIONS = true,
+  INTEGRITY_CHECK = true,
+  QUICK_CHECK = true,
+}
+
+local PRAGMA_GETTERS = {
+  USER_VERSION = true,
+  APPLICATION_ID = true,
+  SCHEMA_VERSION = true,
+  DATA_VERSION = true,
+  PAGE_SIZE = true,
+  PAGE_COUNT = true,
+  FREELIST_COUNT = true,
+  ENCODING = true,
+  JOURNAL_MODE = true,
+  FOREIGN_KEYS = true,
+  CACHE_SIZE = true,
+  BUSY_TIMEOUT = true,
+  SYNCHRONOUS = true,
+}
+
+--- Keywords that may sit between EXPLAIN and the statement it plans.
+local EXPLAIN_OPTION = {
+  ANALYZE = true,
+  VERBOSE = true,
+  QUERY = true,
+  PLAN = true,
+  EXTENDED = true,
+  PARTITIONS = true,
+  FORMAT = true,
+  JSON = true,
+  YAML = true,
+  XML = true,
+  TEXT = true,
+  TREE = true,
+  TRADITIONAL = true,
+  COSTS = true,
+  SETTINGS = true,
+  BUFFERS = true,
+  WAL = true,
+  TIMING = true,
+  SUMMARY = true,
+  MEMORY = true,
+  SERIALIZE = true,
+  GENERIC_PLAN = true,
+  ON = true,
+  OFF = true,
+  TRUE = true,
+  FALSE = true,
+}
+
+--- Punctuation that occurs in real SQL operators. Anything else — notably `\`, which psql runs
+--- as a meta-command, and `;`, which stacks a second statement — leaves a read unprovable.
+M.SAFE_PUNCT = {}
+for char in ('()[]{},.:=<>+-*/%|!~^&@#?$'):gmatch('.') do
+  M.SAFE_PUNCT[char] = true
+end
 
 --- Destructive verbs whose blast radius is a whole object, so a WHERE cannot narrow them.
 local WHOLE_OBJECT = { DROP = true, TRUNCATE = true, ALTER = true, RENAME = true }
@@ -344,20 +442,182 @@ end
 
 ---@class dblens.Statement
 ---@field sql string
----@field verb string          -- upper-cased leading keyword, '' when the statement has none
----@field write boolean        -- mutates data or schema
----@field destructive boolean  -- must pass the confirmation gate
+---@field verb string           -- upper-cased leading keyword, '' when the statement has none
+---@field write boolean         -- not provably a read, so it is gated as a write
+---@field destructive boolean   -- must pass the confirmation gate
+---@field explain_analyze boolean -- an EXPLAIN that executes the statement it plans
 ---@field has_where boolean
----@field whole_object boolean -- destructive with no way to narrow the blast radius
----@field target string?       -- object name, unquoted
+---@field whole_object boolean  -- destructive with no way to narrow the blast radius
+---@field target string?        -- object name, unquoted
 
---- Classify one statement for the safety gate.
+local function slice(list, from)
+  local out = {}
+  for i = from, #list do
+    out[#out + 1] = list[i]
+  end
+  return out
+end
+
+--- Where the statement an EXPLAIN plans begins, and whether the plan executes it.
+---@return integer index, boolean analyzing
+local function explain_inner(toks)
+  local i, analyzing = 2, false
+  if toks[i] and toks[i].type == 'punct' and toks[i].text == '(' then
+    local depth = 0
+    while toks[i] do
+      local t = toks[i]
+      if t.type == 'punct' and t.text == '(' then
+        depth = depth + 1
+      elseif t.type == 'punct' and t.text == ')' then
+        depth = depth - 1
+        if depth == 0 then
+          return i + 1, analyzing
+        end
+      elseif t.type == 'word' and t.text:upper() == 'ANALYZE' then
+        analyzing = true
+      end
+      i = i + 1
+    end
+    return i, analyzing
+  end
+  while toks[i] do
+    local t = toks[i]
+    local is_option = t.type == 'word' and EXPLAIN_OPTION[t.text:upper()]
+    local is_glue = t.type == 'punct' and (t.text == '=' or t.text == ',')
+    if not is_option and not is_glue then
+      break
+    end
+    if is_option and t.text:upper() == 'ANALYZE' then
+      analyzing = true
+    end
+    i = i + 1
+  end
+  return i, analyzing
+end
+
+--- Prove a token stream is a read, or fail closed.
+---
+--- The whole safety model rests on this being a proof and not a guess: `write` false must mean
+--- "this cannot change anything", so every shape that is merely unrecognised comes back a write.
+---@return { read: boolean, destructive: boolean, verb: string, explain_analyze: boolean }
+local function analyse(toks, depth)
+  assert(depth <= 2, 'sql.analyse: EXPLAIN nesting is bounded')
+  local first = toks[1]
+  if not first or first.type ~= 'word' then
+    -- No leading keyword: a client dot-command, a `\` meta-command, or something unparsed.
+    return { read = false, destructive = false, verb = '', explain_analyze = false }
+  end
+  local verb = first.text:upper()
+  local unread = { read = false, destructive = false, verb = verb, explain_analyze = false }
+
+  local write = WRITE_VERBS[verb]
+  if write then
+    unread.destructive = write.destructive == true
+    return unread
+  end
+
+  if verb == 'EXPLAIN' then
+    local at, analyzing = explain_inner(toks)
+    if not analyzing then
+      -- A plan is not an execution: every client dblens drives plans without running.
+      return { read = true, destructive = false, verb = verb, explain_analyze = false }
+    end
+    if depth == 2 then
+      return unread
+    end
+    local inner = analyse(slice(toks, at), depth + 1)
+    return {
+      read = inner.read,
+      destructive = inner.destructive,
+      verb = verb,
+      explain_analyze = true,
+    }
+  end
+
+  if verb == 'PRAGMA' then
+    for _, t in ipairs(toks) do
+      if t.type == 'punct' and t.text == '=' then
+        return unread -- the set form, whatever the pragma is
+      end
+    end
+    -- `PRAGMA main.user_version`: the name is the last word before any argument list.
+    local name, called = nil, false
+    for index = 2, #toks do
+      local t = toks[index]
+      if t.type == 'punct' and t.text == '(' then
+        called = true
+        break
+      end
+      if t.type == 'word' then
+        name = t.text:upper()
+      end
+    end
+    local reads = name ~= nil
+      and (PRAGMA_INTROSPECT[name] or (not called and PRAGMA_GETTERS[name] or false))
+    if not reads then
+      return unread
+    end
+    return { read = true, destructive = false, verb = verb, explain_analyze = false }
+  end
+
+  local read = READ_VERBS[verb]
+  if not read then
+    return unread
+  end
+  for _, t in ipairs(toks) do
+    if t.type == 'word' then
+      local word = t.text:upper()
+      local hidden = read.scan and WRITE_VERBS[word]
+      if hidden then
+        unread.destructive = hidden.destructive == true
+        return unread
+      end
+      if read.scan and READ_TAIL_BAN[word] then
+        return unread
+      end
+    elseif t.type == 'punct' and not M.SAFE_PUNCT[t.text] then
+      return unread
+    elseif (t.type == 'string' or t.type == 'ident') and t.closed == false then
+      return unread
+    end
+  end
+  return { read = true, destructive = false, verb = verb, explain_analyze = false }
+end
+
+--- Classify one statement, or a whole script, for the safety gate.
+---
+--- Fails closed by construction: a script that does not split into exactly one provably-read
+--- statement is reported as a write, so a caller that only asks "is this a write?" is safe.
 ---@return dblens.Statement
 function M.classify(sql, dialect)
+  assert(type(sql) == 'string', 'sql.classify: expected string')
   local toks = M.tokens(sql, dialect)
-  local first = toks[1]
-  local verb = (first and first.type == 'word') and first.text:upper() or ''
-  local info = VERBS[verb] or {}
+  if #toks == 0 then
+    -- Blank, or nothing but comments: there is no statement to run.
+    return {
+      sql = sql,
+      verb = '',
+      write = false,
+      destructive = false,
+      explain_analyze = false,
+      has_where = false,
+      whole_object = false,
+      target = nil,
+    }
+  end
+
+  local pieces = M.split(sql, dialect)
+  local info = analyse(toks, 0)
+  if #pieces > 1 then
+    -- Stacked statements: no proof covers the pair, and every part's danger still counts.
+    info = { read = false, destructive = false, verb = info.verb, explain_analyze = false }
+    for _, piece in ipairs(pieces) do
+      local part = analyse(M.tokens(piece.sql, dialect), 0)
+      info.destructive = info.destructive or part.destructive
+      info.explain_analyze = info.explain_analyze or part.explain_analyze
+    end
+  end
+
   local has_where = false
   for _, t in ipairs(toks) do
     if t.type == 'word' and t.text:upper() == 'WHERE' then
@@ -365,15 +625,16 @@ function M.classify(sql, dialect)
       break
     end
   end
-  local destructive = info.destructive == true
+  local write = not info.read
   return {
     sql = sql,
-    verb = verb,
-    write = info.write == true,
-    destructive = destructive,
+    verb = info.verb,
+    write = write,
+    destructive = info.destructive,
+    explain_analyze = info.explain_analyze,
     has_where = has_where,
-    whole_object = destructive and (WHOLE_OBJECT[verb] == true or not has_where),
-    target = info.write and find_target(toks, verb) or nil,
+    whole_object = info.destructive and (WHOLE_OBJECT[info.verb] == true or not has_where),
+    target = write and find_target(toks, info.verb) or nil,
   }
 end
 
@@ -382,8 +643,35 @@ end
 ---@param word string
 ---@return boolean
 function M.is_write_verb(word)
-  local info = VERBS[tostring(word):upper()]
-  return info ~= nil and info.write == true
+  return WRITE_VERBS[tostring(word):upper()] ~= nil
+end
+
+--- Reject a client meta-command before it reaches a client.
+---
+--- These are not SQL and no `read_only` flag applies to them: `psql` runs `\!` as a shell
+--- command mid-statement, and `sqlite3 -batch` still honours `.shell`. Neither is ever something
+--- dblens legitimately sends, so the check is unconditional rather than part of the read proof.
+---@param text string
+---@param dialect dblens.Dialect?
+---@return string? problem
+function M.client_meta_problem(text, dialect)
+  assert(type(text) == 'string', 'sql.client_meta_problem: expected string')
+  -- sqlite3 reads dot-commands per LINE, so checking the head of the statement is not enough:
+  -- a `.shell` on its own line after a comment is still a dot-command. `strip` blanks comments
+  -- and quoted spans while preserving offsets, so what is left is real code.
+  local stripped = M.strip(text, dialect)
+  for line in (stripped .. '\n'):gmatch('([^\n]*)\n') do
+    local head = line:match('^%s*(%.%S*)')
+    if head then
+      return ('refusing `%s`: client dot-commands are not SQL'):format(head)
+    end
+  end
+  for _, token in ipairs(M.tokens(text, dialect)) do
+    if token.type == 'punct' and token.text == '\\' then
+      return 'refusing a `\\` meta-command: it would run outside the database'
+    end
+  end
+  return nil
 end
 
 --- Classify every statement in a script.

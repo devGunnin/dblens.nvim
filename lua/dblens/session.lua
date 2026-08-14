@@ -1,14 +1,21 @@
 --- A live connection: its adapter, its resolved secret, its schema cache, its transaction.
 ---
---- Every database call in dblens goes through `run`, and every *write* goes through
---- `execute_write`. That single choke point is what enforces the safety model: a read-only
---- connection, an unconfirmed destructive statement, and a predicate that does not match exactly
---- one row are all refused here, not in the UI that happened to ask.
+--- EVERY statement dblens sends — a browsed page, a filter, ad-hoc editor SQL, EXPLAIN, a CRUD
+--- write, a committed batch — goes through `Session:run`, and `run` puts every one of them
+--- through `Session:gate` first. That is the whole safety model: read-only, the destructive
+--- confirmation and the refusal of client meta-commands are enforced at one choke point, not in
+--- whichever part of the UI happened to ask.
+---
+--- The gate fails CLOSED. `sql.classify` only reports a read when it can prove one, so an
+--- unrecognised verb, a stacked script or an EXPLAIN ANALYZE is treated as a write and refused
+--- on a read-only connection rather than waved through.
 local adapters = require('dblens.adapters')
 local catalog = require('dblens.catalog')
 local connections = require('dblens.connections')
 local exec = require('dblens.exec')
+local path_mod = require('dblens.path')
 local protocol = require('dblens.protocol')
+local sqlmod = require('dblens.sql')
 local txn = require('dblens.txn')
 
 local M = {}
@@ -58,7 +65,11 @@ end
 function Session:connect(on_done)
   assert(type(on_done) == 'function', 'session:connect: on_done must be a function')
   if self.spec.kind == 'sqlite' and not self.spec.create then
-    local path = vim.fn.expand(self.spec.path)
+    local path, path_err = path_mod.expand(self.spec.path)
+    if not path then
+      on_done(false, path_err)
+      return
+    end
     if vim.fn.filereadable(path) == 0 then
       -- sqlite3 silently creates a missing file; a typo would open an empty database.
       on_done(false, ('no such database file: %s (set `create = true` to make it)'):format(path))
@@ -103,32 +114,91 @@ function Session:is_busy()
   return next(self.jobs) ~= nil
 end
 
---- Run one statement.
+---@class dblens.WriteApproval
+---@field confirmed boolean  -- the confirmation UI (or the policy) cleared this exact statement
+
+--- A job that is refused before a client is spawned. The callback still fires exactly once.
+local function refused(message, on_done)
+  on_done(nil, message, { reason = 'refused' })
+  return {
+    cancel = function() end,
+    is_done = function()
+      return true
+    end,
+  }
+end
+
+--- The one gate. Returns a refusal message, or nil when the statement may be sent.
+---
+--- `approval` is produced only by a caller that has already been through `refuse_write`
+--- (`execute_write`, `commit`) or by the confirmation UI; without it, a statement that is not
+--- provably a read is judged by the connection's own rules.
+---@param statement string
+---@param approval dblens.WriteApproval?
+---@return string? refusal
+function Session:gate(statement, approval)
+  assert(type(statement) == 'string', 'session:gate: expected a statement')
+  local dialect = self.adapter.dialect
+  local meta = sqlmod.client_meta_problem(statement, dialect)
+  if meta then
+    -- Not SQL at all, so no connection flag covers it: `\!` and `.shell` run on this machine.
+    return meta
+  end
+  local info = sqlmod.classify(statement, dialect)
+  if not info.write then
+    return nil
+  end
+  return self:refuse_write({
+    destructive = info.destructive,
+    confirmed = approval ~= nil and approval.confirmed == true,
+  })
+end
+
+--- Run one statement, through the gate.
 ---
 --- `opts.mode` selects the record protocol ('records', the default) or the client's plain text
 --- output ('raw'). `opts.columns` supplies headers for a result that may come back empty.
+--- `opts.approval` carries an already-cleared write.
 ---@param statement string
----@param opts { mode: string?, columns: string[]?, timeout_ms: integer? }
----@param on_done fun(result: dblens.QueryResult?, err: string?)
+---@param opts { mode: string?, columns: string[]?, timeout_ms: integer?, approval: dblens.WriteApproval? }
+---@param on_done fun(result: dblens.QueryResult?, err: string?, info: table?)
 ---@return dblens.Job
 function Session:run(statement, opts, on_done)
   assert(type(statement) == 'string' and statement ~= '', 'session:run: needs a statement')
   assert(type(on_done) == 'function', 'session:run: on_done must be a function')
   opts = opts or {}
+  local refusal = self:gate(statement, opts.approval)
+  if refusal then
+    return refused(refusal, on_done)
+  end
+
   local mode = opts.mode or 'records'
   local command = self.adapter.command(self.spec, self.secret, mode, self.options.clients)
 
-  local job
-  job = exec.run({
+  -- The handle is registered BEFORE the process starts, so `cancel_all` can never miss a job
+  -- that called back before `exec.run` returned.
+  local handle = {
+    cancel = function() end,
+    is_done = function()
+      return false
+    end,
+  }
+  self.jobs[handle] = true
+
+  local job = exec.run({
     argv = command.argv,
     env = command.env,
     stdin = statement,
     timeout_ms = opts.timeout_ms or self.options.timeout_ms,
     max_bytes = self.options.max_bytes,
   }, function(result)
-    self.jobs[job] = nil
+    self.jobs[handle] = nil
     if not result.ok and not result.truncated then
-      on_done(nil, exec.format_error(result, self.adapter.label))
+      on_done(nil, exec.format_error(result, self.adapter.label), {
+        reason = result.reason,
+        code = result.code,
+        stderr = result.stderr,
+      })
       return
     end
     if mode == 'raw' then
@@ -153,27 +223,33 @@ function Session:run(statement, opts, on_done)
     }, nil)
   end)
 
-  self.jobs[job] = true
-  return job
+  handle.cancel, handle.is_done = job.cancel, job.is_done
+  return handle
 end
 
 --- Run statements in order, stopping at the first failure.
 ---
---- Reports every statement's outcome so the query runner can show per-statement timing, and
---- returns the last result that actually produced columns.
+--- Reports every statement's outcome so the query runner can show per-statement timing. The
+--- returned handle is what makes an editor query cancellable: it stops the client that is
+--- running now AND keeps the script from starting the next statement.
 ---@param statements string[]
+---@param opts { approval: dblens.WriteApproval? }?
 ---@param on_done fun(outcomes: { sql: string, result: dblens.QueryResult?, err: string? }[])
-function Session:run_script(statements, on_done)
+---@return dblens.Job
+function Session:run_script(statements, opts, on_done)
   assert(vim.islist(statements) and #statements > 0, 'session:run_script: needs statements')
-  local outcomes = {}
+  assert(type(on_done) == 'function', 'session:run_script: on_done must be a function')
+  opts = opts or {}
+  local outcomes, cancelled, current = {}, false, nil
+
   local function step(index)
-    if index > #statements then
+    if index > #statements or cancelled then
       on_done(outcomes)
       return
     end
-    self:run(statements[index], {}, function(result, err)
+    current = self:run(statements[index], { approval = opts.approval }, function(result, err)
       outcomes[#outcomes + 1] = { sql = statements[index], result = result, err = err }
-      if err then
+      if err or cancelled then
         on_done(outcomes)
         return
       end
@@ -181,6 +257,18 @@ function Session:run_script(statements, on_done)
     end)
   end
   step(1)
+
+  return {
+    cancel = function()
+      cancelled = true
+      if current then
+        current.cancel()
+      end
+    end,
+    is_done = function()
+      return current == nil or current.is_done()
+    end,
+  }
 end
 
 ---@class dblens.WriteRequest
@@ -227,13 +315,18 @@ function Session:execute_write(request, on_done)
     return
   end
 
+  local approval = { confirmed = request.confirmed == true }
+
   local function proceed()
     if self.txn:is_active() then
-      self.txn:add(request.change or { sql = request.sql, summary = request.summary })
+      local change = request.change or { sql = request.sql, summary = request.summary }
+      -- The guard rides into the queue so commit can re-check it inside the transaction.
+      change.guard = change.guard or request.guard
+      self.txn:add(change)
       on_done({ queued = true }, nil)
       return
     end
-    self:run(self:with_affected(request.sql), {}, function(result, err)
+    self:run(self:with_affected(request.sql), { approval = approval }, function(result, err)
       if err then
         on_done(nil, err)
         return
@@ -292,27 +385,68 @@ function Session:read_affected(result)
   return tonumber(protocol.tostring(first[1]))
 end
 
+--- Kill reasons that leave the batch's fate unknown: the client was stopped mid-script, so the
+--- COMMIT may or may not have run. A `spawn` failure is not one of them — nothing ran.
+local KILLED = { timeout = true, cancelled = true, max_bytes = true }
+
+--- Name the queued change a client blamed, using the line it reported.
+---@return string
+local function describe_failure(owners, info, total, run_err)
+  local line = info and info.stderr and exec.error_line(info.stderr) or nil
+  local owner = line and owners[line] or nil
+  if not owner then
+    return ('the batch failed and was rolled back: %s'):format(run_err)
+  end
+  if owner.guard then
+    return ('change %d of %d no longer matches exactly one row, so nothing was applied'):format(
+      owner.index,
+      total
+    )
+  end
+  return ('change %d of %d failed, so nothing was applied: %s'):format(owner.index, total, run_err)
+end
+
 --- Commit the queued batch as one atomic script.
----@param on_done fun(ok: boolean, err: string?)
+---
+--- On failure the queue is kept ONLY when the client is known to have aborted the batch itself
+--- (a statement error under `-bail`/`ON_ERROR_STOP=1`, so nothing committed). If dblens killed
+--- the client instead, the outcome is unknown and the queue is dropped: replaying it could
+--- apply a committed INSERT twice, or re-run a DELETE whose guard has already been spent.
+---@param on_done fun(ok: boolean, err: string?, queue_kept: boolean)
 function Session:commit(on_done)
-  local script, err = self.txn:script()
-  if not script then
-    on_done(false, err)
-    return
-  end
+  assert(type(on_done) == 'function', 'session:commit: on_done must be a function')
   if self:is_read_only() then
-    on_done(false, ('connection `%s` is read-only'):format(self.spec.name))
+    on_done(false, ('connection `%s` is read-only'):format(self.spec.name), true)
     return
   end
-  self:run(script, {}, function(_, run_err)
-    if run_err then
-      -- The batch is wrapped in BEGIN/COMMIT, so a failure left nothing behind; keep the queue
-      -- so the user can fix and retry.
-      on_done(false, run_err)
+  local assert_one = self.adapter.sql.assert_one
+  assert(type(assert_one) == 'function', 'session:commit: adapter has no row-guard builder')
+  local script, err, owners = self.txn:script(assert_one)
+  if not script then
+    on_done(false, err, true)
+    return
+  end
+
+  local total = self.txn:count()
+  self:run(script, { approval = { confirmed = true } }, function(_, run_err, info)
+    if not run_err then
+      self.txn:reset()
+      on_done(true, nil, false)
       return
     end
-    self.txn:reset()
-    on_done(true, nil)
+    if info and KILLED[info.reason] then
+      self.txn:reset()
+      on_done(
+        false,
+        (
+          'the commit was interrupted (%s); the queue was discarded because it is not known '
+          .. 'whether it landed - verify the table before changing it again'
+        ):format(info.reason),
+        false
+      )
+      return
+    end
+    on_done(false, describe_failure(owners, info, total, run_err), true)
   end)
 end
 
