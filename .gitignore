@@ -1,0 +1,6 @@
+.tests/
+doc/tags
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
