@@ -54,8 +54,11 @@ describe('commands', function()
   end)
 
   it('describes every command it defines', function()
+    -- `nvim_get_commands` reports a callback command's desc via `definition` on 0.10/stable and
+    -- via a separate `desc` field on nightly, so a real description shows up in either.
     for name, command in pairs(defined_commands()) do
-      eq(command.definition ~= nil and command.definition ~= '', true, {
+      local description = command.desc or command.definition or ''
+      eq(description ~= '', true, {
         fail_reason = ':' .. name .. ' has no description',
       })
     end
