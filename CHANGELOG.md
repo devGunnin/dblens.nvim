@@ -3,6 +3,53 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.0] - 2026-08-15
+
+### Added
+
+- **Discovery reads project-prefixed `.env` variable groups.** A group is recognised under
+  whatever prefix a project puts on it, not only the bare `PG*` / `MYSQL_*` names:
+  `TACTICA_POSTGRES_DB` / `_USER` / `_PASSWORD` is one connection, and a standalone
+  `TACTICA_DB_PORT` is the port it answers on here — the shape almost every Python and Django
+  repository has, and one that produced nothing usable before. The generic `<P>_DB_*` and
+  `<P>_DATABASE_*` spellings are read the same way, several prefixes in one file are several
+  connections, and a group is deduplicated against a URL describing the same host, port and
+  database. Nothing is invented: an absent host is `localhost`, an absent port the engine's
+  default, a group naming no database is not a connection, and a group whose variables name no
+  engine is offered only when a URL beside it or a port only one engine uses says which it is.
+- **Driver-suffixed and `jdbc:` URL schemes.** `postgresql+psycopg`, `postgresql+psycopg2`,
+  `postgresql+asyncpg`, `mysql+pymysql`, `mysql+mysqldb`, `mariadb+pymysql`, `mssql+pyodbc`,
+  `cockroachdb+psycopg` and `sqlite+pysqlite` are reduced to the engine they name, and a leading
+  `jdbc:` is stripped and the rest read by the ordinary rules. A driver-specific spelling
+  (`jdbc:sqlserver://host;databaseName=x`) yields no database and is dropped by validation rather
+  than turned into an invented target.
+- **A URL pointing at a compose service now also offers the connection this machine can reach.**
+  `postgresql+psycopg://postgres:postgres@db:5432/tactica` names a host only a sibling container
+  can reach; when the same file publishes a host port for it, the `localhost` candidate is offered
+  beside it, and the provenance line tells them apart. Both are offered — only the user knows
+  whether the stack is up.
+- **Multi-column sorting in the grid.** `s` still cycles the column under the cursor ascending →
+  descending → unsorted and replaces the whole sort; `S` ADDS that column as the next sort key,
+  cycling and then dropping that one key while leaving the others in place; `gs` clears them all.
+  The header marks every key with an arrow (ASCII with `ui.icons = false`) and, once there is more
+  than one, its position, and the winbar lists the keys in order. It is one server-side `ORDER BY`
+  built by the existing paging path, every column name quoted by the dialect, and any change
+  re-reads from page 1 so the page on screen still means what it says. Sort, filter and paging
+  compose into one statement, and an export still carries the grid's whole sort.
+
+### Security
+
+- A password read out of a prefixed group is treated exactly like one from a `DATABASE_URL`: held
+  in memory for the session that found it, never written into a spec and never persisted. The
+  discovery model is unchanged — no auto-connect, discovered connections open LOCKED, nothing
+  found is executed, and the argv and quoting defenses are untouched.
+
+### Changed
+
+- `sql.page`'s `order_by` is a LIST of `{ column, desc }` keys rather than a single key. Internal
+  API; the mssql builder now shares `common.order_keys` with the other engines instead of
+  repeating it.
+
 ## [1.2.0] - 2026-08-15
 
 ### Added

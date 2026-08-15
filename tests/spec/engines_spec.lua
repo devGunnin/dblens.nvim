@@ -378,7 +378,7 @@ describe('mssql statement builders', function()
   it('orders by the requested column when there is one', function()
     local page = mssql.sql.page(
       { schema = 'dbo', name = 't' },
-      { limit = 10, offset = 0, order_by = { column = 'created at', desc = true } }
+      { limit = 10, offset = 0, order_by = { { column = 'created at', desc = true } } }
     )
     eq(page:find('ORDER BY "created at" DESC', 1, true) ~= nil, true, { fail_reason = page })
   end)

@@ -59,10 +59,14 @@ function M.qualify(relation, dialect)
   return name
 end
 
+---@class dblens.SortKey
+---@field column string
+---@field desc boolean?
+
 ---@class dblens.PageOpts
 ---@field limit integer
 ---@field offset integer
----@field order_by { column: string, desc: boolean }?
+---@field order_by dblens.SortKey[]?  -- sort keys, most significant first
 ---@field tiebreak string[]?  -- columns appended ascending, so a sort on a non-unique column is total
 ---@field where string?  -- raw SQL predicate typed by the user
 
@@ -144,30 +148,49 @@ local function where_clause(where, dialect)
   return ' WHERE ' .. vim.trim(where)
 end
 
---- `ORDER BY sort [, tiebreak...]`.
+--- The ORDER BY keys: the user's sort columns in the order they chose them, then the tiebreak.
+---
+--- Every column goes through the dialect's identifier quoting — a column named `select`, or one
+--- with a quote in its name, is a name and never a fragment of the statement.
 ---
 --- The tiebreak exists so a sort on a non-unique column has ONE answer: two rows that compare
 --- equal are otherwise returned in whatever order the plan produced, so the same export run twice
 --- can differ. It is only ever appended to a sort the caller asked for — an unsorted read is left
 --- unsorted rather than paying for a whole-table sort nothing asked for.
----@param order_by { column: string, desc: boolean }?
+---@param order_by dblens.SortKey[]?
 ---@param tiebreak string[]?
 ---@param dialect dblens.Dialect
----@return string
-local function order_clause(order_by, tiebreak, dialect)
-  if not order_by then
+---@return string[]
+function M.order_keys(order_by, tiebreak, dialect)
+  assert(order_by == nil or vim.islist(order_by), 'common: order_by must be a list of sort keys')
+  if not order_by or #order_by == 0 then
     assert(not tiebreak or #tiebreak == 0, 'common: a tiebreak needs a sort to break ties in')
-    return ''
+    return {}
   end
-  assert(type(order_by.column) == 'string', 'common: order_by needs a column')
-  local keys = {
-    ('%s %s'):format(sql.quote_ident(order_by.column, dialect), order_by.desc and 'DESC' or 'ASC'),
-  }
+  local keys, sorted = {}, {}
+  for _, key in ipairs(order_by) do
+    assert(type(key.column) == 'string' and key.column ~= '', 'common: a sort key needs a column')
+    assert(not sorted[key.column], 'common: a column cannot be two sort keys at once')
+    sorted[key.column] = true
+    keys[#keys + 1] = ('%s %s'):format(
+      sql.quote_ident(key.column, dialect),
+      key.desc and 'DESC' or 'ASC'
+    )
+  end
   for _, column in ipairs(tiebreak or {}) do
     assert(type(column) == 'string' and column ~= '', 'common: a tiebreak column needs a name')
-    if column ~= order_by.column then
+    if not sorted[column] then
       keys[#keys + 1] = sql.quote_ident(column, dialect) .. ' ASC'
     end
+  end
+  return keys
+end
+
+---@return string  -- ` ORDER BY ...`, or '' when nothing is sorted
+local function order_clause(order_by, tiebreak, dialect)
+  local keys = M.order_keys(order_by, tiebreak, dialect)
+  if #keys == 0 then
+    return ''
   end
   return ' ORDER BY ' .. table.concat(keys, ', ')
 end

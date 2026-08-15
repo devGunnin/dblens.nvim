@@ -67,6 +67,16 @@ PGPORT=6432
 PGPASSWORD=grouppw
 ]]
 
+local PREFIXED_DOTENV = [[
+TACTICA_POSTGRES_DB=tactica
+TACTICA_POSTGRES_USER=postgres
+TACTICA_POSTGRES_PASSWORD=postgres
+TACTICA_DB_PORT=5433
+TACTICA_DATABASE_URL_DOCKER=postgresql+psycopg://postgres:postgres@db:5432/tactica
+]]
+
+local OPTS = { source = '.env', dir = '/srv/app' }
+
 --- A workspace with every shape the walk has to get right.
 ---@return string root
 local function fixture_workspace()
@@ -397,8 +407,61 @@ describe('discovery: connection URLs', function()
   it('is not fooled by a URL that is not a database', function()
     eq(url.parse('redis://localhost:6379'), nil)
     eq(url.parse('https://example.com/db'), nil)
-    eq(url.parse('jdbc:postgresql://host/db'), nil)
     eq(url.parse('not a url'), nil)
+  end)
+
+  --- SQLAlchemy and Django spell the Python driver into the scheme. The engine is the same one;
+  --- only the library that talks to it differs, and reading the whole scheme as the engine name
+  --- made every Python project's own `.env` unreadable.
+  it('reads a scheme that names its driver as the engine it names', function()
+    local cases = {
+      ['postgresql+psycopg://u:p@h/d'] = 'postgres',
+      ['postgresql+psycopg2://u:p@h/d'] = 'postgres',
+      ['postgresql+asyncpg://u:p@h/d'] = 'postgres',
+      ['cockroachdb+psycopg://u@h:26257/d'] = 'postgres',
+      ['mysql+pymysql://u:p@h/d'] = 'mysql',
+      ['mysql+mysqldb://u:p@h/d'] = 'mysql',
+      ['mariadb+pymysql://u:p@h/d'] = 'mariadb',
+      ['mssql+pyodbc://u:p@h/d'] = 'mssql',
+      ['sqlite+pysqlite:///db/dev.sqlite3'] = 'sqlite',
+    }
+    for text, kind in pairs(cases) do
+      local target = url.parse(text)
+      eq(target ~= nil, true, { fail_reason = text .. ' parsed as nothing' })
+      eq(target.kind, kind, { fail_reason = text })
+    end
+    -- The rest of the URL still splits the same way.
+    local target = url.parse('postgresql+psycopg://postgres:postgres@db:5432/tactica')
+    eq({ target.host, target.port, target.user, target.database, target.secret }, {
+      'db',
+      5432,
+      'postgres',
+      'tactica',
+      'postgres',
+    })
+    eq(url.parse('unknown+driver://u@h/d'), nil)
+  end)
+
+  it('reads a `jdbc:` URL by the engine nested behind it', function()
+    eq(url.parse('jdbc:postgresql://host:6543/shop').kind, 'postgres')
+    eq(url.parse('jdbc:postgresql://host:6543/shop').port, 6543)
+    eq(url.parse('jdbc:mysql://host/metrics').database, 'metrics')
+    eq(url.parse('jdbc:sqlite:/srv/dev.sqlite3').path, '/srv/dev.sqlite3')
+    -- An engine dblens does not speak stays unparsed rather than becoming a guess.
+    eq(url.parse('jdbc:h2:mem:test'), nil)
+  end)
+
+  --- The driver-specific spellings are exactly why `jdbc:` was left out before. They are read the
+  --- ordinary way now, which yields no database rather than an invented target -- and a candidate
+  --- without one never reaches the picker.
+  it('offers nothing for a jdbc URL whose parameters are driver-specific', function()
+    local target = url.parse('jdbc:sqlserver://host:1433;databaseName=shop')
+    eq(target.database, nil)
+    local candidate =
+      { name = 'DB_URL', kind = target.kind, target = { host = target.host, port = target.port } }
+    eq(connections.validate(discovery.to_spec(candidate)) ~= nil, true, {
+      fail_reason = 'a driver-specific jdbc URL became an offerable connection',
+    })
   end)
 end)
 
@@ -461,7 +524,205 @@ describe('discovery: .env files', function()
 
   it('needs a database to be named before a variable group is a connection', function()
     eq(#env.candidates('PGHOST=db\nPGPASSWORD=x\n', { source = '.env', dir = '/srv' }), 0)
+    local nameless = 'X_POSTGRES_USER=u\nX_POSTGRES_PASSWORD=p\nX_DB_PORT=5433\n'
+    eq(#env.candidates(nameless, OPTS), 0, {
+      fail_reason = 'a prefixed group with no database became a candidate',
+    })
   end)
+end)
+
+--- The shape a real Python project's `.env` has: every variable under the project's own prefix,
+--- the published host port named on its own, and a SQLAlchemy URL pointing at the compose service
+--- rather than at anything this machine can reach.
+describe('discovery: project-prefixed .env groups', function()
+  it('reads the group, taking the host port from the `<P>_DB_PORT` beside it', function()
+    local found = by_name(env.candidates(PREFIXED_DOTENV, OPTS), 'tactica')
+    eq(found ~= nil, true, { fail_reason = 'the prefixed group produced no candidate' })
+    eq(found.kind, 'postgres')
+    eq(found.target.host, 'localhost', { fail_reason = 'an absent host must be localhost' })
+    eq(found.target.port, 5433)
+    eq(found.target.user, 'postgres')
+    eq(found.target.database, 'tactica')
+    eq(found.secret, 'postgres')
+    eq(found.source, '.env')
+  end)
+
+  --- The URL names a container: reachable from a sibling service, not from the editor. It is
+  --- still offered -- only the user knows whether the stack is up -- but it must not be the only
+  --- thing offered when the same file says which port that database answers on here.
+  it('offers the localhost connection beside the one naming the container', function()
+    local candidates = env.candidates(PREFIXED_DOTENV, OPTS)
+    local internal = by_name(candidates, 'TACTICA_DATABASE_URL_DOCKER')
+    eq(internal.target.host, 'db')
+    eq(internal.target.port, 5432)
+    local reachable = by_name(candidates, 'tactica')
+    eq({ reachable.target.host, reachable.target.port }, { 'localhost', 5433 })
+  end)
+
+  it('keeps several prefixes in one file apart, postgres and mysql alike', function()
+    local candidates = env.candidates(
+      [[
+SHOP_POSTGRES_DB=shop
+SHOP_POSTGRES_USER=shopper
+SHOP_POSTGRES_PASSWORD=shoppw
+SHOP_DB_PORT=5440
+WAREHOUSE_MYSQL_DATABASE=warehouse
+WAREHOUSE_MYSQL_USER=wh
+WAREHOUSE_MYSQL_PASSWORD=whpw
+WAREHOUSE_DB_PORT=3310
+]],
+      OPTS
+    )
+    eq(#candidates, 2)
+    local shop, warehouse = by_name(candidates, 'shop'), by_name(candidates, 'warehouse')
+    eq({ shop.kind, shop.target.port, shop.secret }, { 'postgres', 5440, 'shoppw' })
+    eq({ warehouse.kind, warehouse.target.port, warehouse.secret }, { 'mysql', 3310, 'whpw' })
+  end)
+
+  --- `PORT` and `HOST` on their own are the web server's, in every framework there is. Reading
+  --- them as a database's would offer a connection to the application itself.
+  it('reads no connection out of a bare PORT or HOST', function()
+    eq(#env.candidates('PORT=8000\nHOST=0.0.0.0\nNAME=my-app\n', OPTS), 0)
+  end)
+
+  it('names no engine it was not told: a generic group needs one from the file', function()
+    local mute = 'APP_DB_HOST=localhost\nAPP_DB_PORT=9999\nAPP_DB_NAME=appdb\n'
+    eq(#env.candidates(mute, OPTS), 0, { fail_reason = 'an engine was invented for a bare group' })
+    -- A URL under the same prefix says which engine it is; so does a port only one engine uses.
+    local told = 'APP_DATABASE_URL=mysql+pymysql://u:p@db:3306/appdb\n' .. mute
+    eq(by_name(env.candidates(told, OPTS), 'appdb').kind, 'mysql')
+    local by_port = mute:gsub('9999', '5432')
+    eq(by_name(env.candidates(by_port, OPTS), 'appdb').kind, 'postgres')
+  end)
+
+  --- The whole pipeline over a real directory: the walk finds the file, the group is read, and
+  --- what comes out is an offerable connection with its provenance on it.
+  it('reaches the picker from a real workspace, provenance and all', function()
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root .. '/.git', 'p')
+    write(root .. '/.env', PREFIXED_DOTENV)
+    local candidates = scan(root)
+    local found = by_name(candidates, 'tactica')
+    eq(found ~= nil, true, { fail_reason = 'the walk offered no localhost candidate' })
+    eq(found.detail, '(postgres, localhost:5433/tactica, from .env)')
+    eq(
+      by_name(candidates, 'TACTICA_DATABASE_URL_DOCKER').detail,
+      '(postgres, db:5432/tactica, from .env)'
+    )
+    eq(connections.validate(discovery.to_spec(found)), nil)
+  end)
+
+  it("never writes a prefixed group's password to the connections file", function()
+    local base = vim.fn.tempname()
+    vim.fn.mkdir(base, 'p')
+    local options =
+      require('dblens.config').setup({ connections_file = base .. '/connections.json' })
+    -- The group alone, so the password under test is the group's own and not a URL's.
+    local text = [[
+TACTICA_POSTGRES_DB=tactica
+TACTICA_POSTGRES_USER=postgres
+TACTICA_POSTGRES_PASSWORD=pref-s3cr3t
+TACTICA_DB_PORT=5433
+]]
+    local candidate = by_name(env.candidates(text, OPTS), 'tactica')
+    eq(candidate.secret, 'pref-s3cr3t')
+    local spec = discovery.to_spec(candidate)
+    eq(spec.password, nil)
+    eq(spec.password_env, nil)
+    eq(spec.password_cmd, nil)
+    eq(h.leaks(spec, 'pref-s3cr3t'), false, { fail_reason = 'the password reached the spec' })
+
+    local ok, err = connections.save(options, { spec })
+    eq(ok, true, { fail_reason = tostring(err) })
+    local written = assert(io.open(options.connections_file, 'r'), 'nothing was written')
+    local stored = written:read('*a')
+    written:close()
+    eq(stored:find('pref-s3cr3t', 1, true), nil, { fail_reason = 'the password was persisted' })
+    eq(stored:find('tactica', 1, true), nil, { fail_reason = 'the connection was persisted' })
+  end)
+end)
+
+--- `tonumber` alone accepts negatives, fractions, hex, `inf`/exponents past 65535, and infinity —
+--- none of those are a port, and unchecked they reach the client's argv verbatim.
+describe('discovery: .env port validation', function()
+  local function port_of(value)
+    local text = ('X_POSTGRES_DB=shop\nX_POSTGRES_HOST=h\nX_POSTGRES_PORT=%s\n'):format(value)
+    return by_name(env.candidates(text, OPTS), 'shop').target.port
+  end
+
+  it('drops an out-of-range or non-integer port, falling back to the engine default', function()
+    local DEFAULT_POSTGRES_PORT = 5432
+    for _, bad in ipairs({ '-1', 'inf', '1e999', '999999999999', '5432.5' }) do
+      eq(port_of(bad), DEFAULT_POSTGRES_PORT, { fail_reason = 'accepted bad port ' .. bad })
+    end
+  end)
+
+  it('keeps a valid port written in hex or scientific notation', function()
+    eq(port_of('0x1F'), 31)
+    eq(port_of('5e3'), 5000)
+  end)
+
+  it('drops an out-of-range port parsed out of a URL too, not just a PORT variable', function()
+    local text = 'DATABASE_URL=postgres://u:p@h:999999999999/shop\n'
+    eq(by_name(env.candidates(text, OPTS), 'DATABASE_URL').target.port, 5432)
+  end)
+end)
+
+--- `inferred_kind` used to scan every URL for every engine-less group (O(groups x urls)); it now
+--- looks its own prefix up in a table built once. Both properties are tested: the lookup stays
+--- correct on the fixtures above, and a large adversarial file (many groups, none matching any of
+--- many URLs — the previous worst case) still resolves quickly.
+describe('discovery: inferred_kind stays correct and fast on many groups and urls', function()
+  it(
+    'is not O(groups x urls): a large adversarial .env resolves well under the quadratic cost',
+    function()
+      local n = 1500
+      local lines = {}
+      for i = 1, n do
+        -- Every group's prefix is unique and shares none with the URLs below, so the old linear
+        -- scan would run to the end of `vars.urls` on every single one of these.
+        lines[#lines + 1] = ('G%d_DB_HOST=localhost\n'):format(i)
+        lines[#lines + 1] = ('G%d_DB_PORT=9999\n'):format(i) -- not a single-engine port either
+        lines[#lines + 1] = ('G%d_DB_NAME=db%d\n'):format(i, i)
+        lines[#lines + 1] = ('U%d_URL=postgres://u:p@host%d:5432/u%d\n'):format(i, i, i)
+      end
+      local text = table.concat(lines)
+
+      local started = vim.uv.hrtime()
+      local candidates = env.candidates(text, OPTS)
+      local elapsed_ms = (vim.uv.hrtime() - started) / 1e6
+
+      eq(#candidates, n, { fail_reason = 'expected exactly one candidate per unmatched group' })
+      -- Quadratic here (n=1500 groups x 1500 urls) would cost hundreds of ms; bucketed lookup does
+      -- not, so a generous bound still catches a regression back to the linear scan.
+      eq(elapsed_ms < 500, true, {
+        fail_reason = ('inferred_kind took %.1fms for n=%d — looks quadratic again'):format(
+          elapsed_ms,
+          n
+        ),
+      })
+    end
+  )
+
+  it(
+    'yields the same candidate the linear scan would: URL under the matching prefix wins',
+    function()
+      local text = 'P_URL=mysql://u:p@h:3306/pdb\n'
+        .. 'P_DB_HOST=localhost\nP_DB_PORT=9999\nP_DB_NAME=pdb2\n'
+        .. 'Q_DB_HOST=localhost\nQ_DB_PORT=5432\nQ_DB_NAME=qdb\n' -- no URL under Q_, falls to PORT_KINDS
+      local candidates = env.candidates(text, OPTS)
+      eq(
+        by_name(candidates, 'pdb2').kind,
+        'mysql',
+        { fail_reason = 'prefix-matched URL not found' }
+      )
+      eq(
+        by_name(candidates, 'qdb').kind,
+        'postgres',
+        { fail_reason = 'single-engine port fallback broke' }
+      )
+    end
+  )
 end)
 
 describe('discovery: what a candidate becomes', function()

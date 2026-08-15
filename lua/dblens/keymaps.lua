@@ -162,6 +162,14 @@ M.specs = {
     { action = 'last_page', lhs = ']P', desc = 'Last page', mode = 'n', group = 'inspect' },
     { action = 'goto_page', lhs = 'gp', desc = 'Go to page N', mode = 'n', group = 'inspect' },
     { action = 'sort', lhs = 's', desc = 'Sort by this column', mode = 'n', group = 'inspect' },
+    {
+      action = 'add_sort',
+      lhs = 'S',
+      desc = 'Add this column to the sort',
+      mode = 'n',
+      group = 'inspect',
+    },
+    { action = 'clear_sort', lhs = 'gs', desc = 'Clear the sort', mode = 'n', group = 'inspect' },
     { action = 'filter', lhs = 'f', desc = 'Filter rows (WHERE)', mode = 'n', group = 'inspect' },
     {
       action = 'filter_cell',

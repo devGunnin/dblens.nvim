@@ -114,7 +114,8 @@ local CLASS_HL = {
 ---@field null_display string
 ---@field separator string
 ---@field truncation string
----@field sort { column: string, desc: boolean }?
+---@field sort dblens.SortKey[]?          -- sort keys, most significant first
+---@field sort_glyphs { asc: string, desc: string }?  -- header arrows; ASCII when the set is plain
 ---@field dirty table<string, boolean>?   -- keys `row .. ':' .. col`, marking queued edits
 ---@field search table<string, boolean>?  -- same keys, marking in-result search matches
 
@@ -125,11 +126,40 @@ local CLASS_HL = {
 ---@field widths integer[]
 ---@field header_lines integer
 
---- Precompute display text and class for every cell, and the resulting column widths.
-local function measure(input)
-  local widths, texts, classes = {}, {}, {}
+local ASCII_GLYPHS = { asc = '^', desc = 'v' }
+
+--- The header text of every column: its name, and the sort marker when it is a sort key.
+---
+--- The key's POSITION is printed only when there is more than one — with a single sort the arrow
+--- already says everything, and `id ▲1` on its own reads like part of the column name.
+---@param input dblens.GridInput
+---@return string[]
+local function header_texts(input)
+  local out = {}
   for index, name in ipairs(input.columns) do
-    widths[index] = math.min(math.max(width_of(name), 1), input.max_col_width)
+    out[index] = name
+  end
+  local keys = input.sort or {}
+  local glyphs = input.sort_glyphs or ASCII_GLYPHS
+  for at, key in ipairs(keys) do
+    local index = protocol.column_index(input.columns, key.column)
+    if index then
+      out[index] = ('%s %s%s'):format(
+        out[index],
+        key.desc and glyphs.desc or glyphs.asc,
+        #keys > 1 and tostring(at) or ''
+      )
+    end
+  end
+  return out
+end
+
+--- Precompute display text and class for every cell, and the resulting column widths.
+---@param heads string[]  -- header text per column, sort marker included
+local function measure(input, heads)
+  local widths, texts, classes = {}, {}, {}
+  for index in ipairs(input.columns) do
+    widths[index] = math.min(math.max(width_of(heads[index]), 1), input.max_col_width)
   end
   for r, row in ipairs(input.rows) do
     texts[r], classes[r] = {}, {}
@@ -184,18 +214,19 @@ function M.render(input)
     return { lines = {}, marks = {}, spans = {}, widths = {}, header_lines = 0 }
   end
 
-  local widths, texts, classes = measure(input)
+  local texts_for_head = header_texts(input)
+  local widths, texts, classes = measure(input, texts_for_head)
   local lines, marks = {}, {}
 
   local heads = {}
-  for index, name in ipairs(input.columns) do
-    heads[index] = fit(name, widths[index], 'left', input.truncation)
+  for index, text in ipairs(texts_for_head) do
+    heads[index] = fit(text, widths[index], 'left', input.truncation)
   end
   local header, head_ranges = compose(heads, input.separator)
   lines[1] = header
   marks[#marks + 1] = { line = 0, col = 0, end_col = #header, hl = 'DbLensHeader' }
-  if input.sort then
-    local at = protocol.column_index(input.columns, input.sort.column)
+  for _, key in ipairs(input.sort or {}) do
+    local at = protocol.column_index(input.columns, key.column)
     if at then
       marks[#marks + 1] =
         { line = 0, col = head_ranges[at].from, end_col = head_ranges[at].to, hl = 'DbLensSortKey' }

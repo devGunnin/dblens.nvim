@@ -427,7 +427,7 @@ describe('export: the grid writes the whole table, not the page on screen', func
       state.grid.source = { kind = 'relation', relation = RELATION, label = 'orders' }
       state.grid.result = { columns = { 'id', 'name' }, rows = {}, malformed = 0 }
       state.grid.filter = "id > '3'"
-      state.grid.sort = { column = 'name', desc = true }
+      state.grid.sort = { { column = 'name', desc = true } }
       -- A loaded catalog, so the primary key is there to break ties with.
       state.session.catalog:set_part(RELATION, 'columns', {
         { name = 'id', type = 'int', notnull = true, pk = 1 },
