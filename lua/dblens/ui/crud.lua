@@ -1,4 +1,4 @@
---- The editing flows: cell edit, row insert, row delete, ad-hoc write confirmation, and export.
+--- The editing flows: cell edit, row insert, row delete, and ad-hoc write confirmation.
 ---
 --- Each flow builds a statement, shows it, and only then asks the session to apply it. The
 --- session enforces the rules; this module's job is to make what will happen legible first.
@@ -330,31 +330,6 @@ function M.confirm_script(state, statements, writes, on_confirm)
     }
   end
   ask()
-end
-
---- Write the current result to a file, choosing the format from the extension.
-function M.export(state)
-  local result = state.grid.result
-  if not result or #result.columns == 0 then
-    app().notify('there is no result to export')
-    return
-  end
-  local default = ('%s/%s.csv'):format(
-    vim.fn.getcwd(),
-    (state.grid.source and state.grid.source.label or 'result'):gsub('%W', '_')
-  )
-  vim.ui.input({ prompt = 'Export to ', default = default, completion = 'file' }, function(path)
-    if not path or vim.trim(path) == '' then
-      return
-    end
-    local format = path:lower():match('%.(%w+)$') == 'json' and 'json' or 'csv'
-    local ok, err = export.write(result, path, format)
-    if not ok then
-      app().error(err)
-      return
-    end
-    app().notify(('exported %d row(s) to %s'):format(#result.rows, path))
-  end)
 end
 
 return M

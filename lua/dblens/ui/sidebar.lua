@@ -234,6 +234,9 @@ local function handlers(state, app)
     ddl = with_relation(function(node)
       require('dblens.ui.detail').ddl(state, node.relation)
     end),
+    export = with_relation(function(node)
+      require('dblens.ui.exporter').prompt_relation(state, node.relation)
+    end),
     refresh = function()
       if not state.session then
         return

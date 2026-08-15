@@ -153,6 +153,13 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   and on demand ([Discovery](#discovery)).
 - Schema tree: connection -> schema -> table/view -> columns, indexes, constraints.
 - Primary key, foreign key, NOT NULL and type shown per column.
+- **Follow a foreign key** (`gf`) from the cell under the cursor to the row it references, and
+  see where you came from in the winbar.
+- **Filter to the cell under the cursor** (`F`), or away from it (`!`), with the value quoted for
+  the dialect rather than retyped. `C` clears the filter.
+- Jump to the first, last, or an arbitrary page (`[P`, `]P`, `gp`).
+- **Search the loaded result** (`g/`, then `gn` / `gN`), matching the underlying values, so a hit
+  inside a value the grid clipped is still found and highlighted.
 - `SHOW CREATE TABLE` / `sqlite_schema` DDL where the server has it, reconstructed from the
   catalog where it does not (PostgreSQL).
 - Row counts on demand, and a schema reload.
@@ -163,7 +170,8 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   buffer. Multiple statements run in order and stop at the first error.
 - `EXPLAIN` and, where the server supports it, `EXPLAIN ANALYZE`.
 - Cancel a running query.
-- Query history and named snippets, persisted to disk.
+- Query history and named snippets, persisted to disk. `<CR>` in either picker puts the statement
+  in the editor; `<C-r>` runs it straight away, through the same gate as one you typed.
 - Schema-aware completion: keywords, tables, views, and columns qualified by table name or
   FROM/JOIN alias. Works through `omnifunc`, nvim-cmp or blink.cmp.
 
@@ -171,7 +179,11 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 - Edit a cell, insert a row (by editing the generated `INSERT`), delete a row.
 - Every change is previewed as the exact SQL that will run before it runs.
-- Yank a cell, a row as CSV, as JSON, or as an `INSERT`; export the whole result to CSV or JSON.
+- Yank a cell, a row as CSV, as JSON, or as an `INSERT`.
+- Export to CSV, JSON or `.sql` `INSERT` statements — the whole result from the grid (`X`), or a
+  whole table from the tree (`X`). Rows are streamed page by page, the file is renamed into place
+  only once the run completes, and a run stopped by the `export.max_rows` cap says so loudly
+  instead of writing a short file that looks complete.
 
 **Safety**
 
@@ -381,6 +393,11 @@ require('dblens').setup({
     max_entries = 20000,          -- directory entries examined before the scan stops and says so
   },
 
+  export = {
+    max_rows   = 1000000,         -- hard cap on a streamed export; reaching it STOPS it and says so
+    batch_size = 5000,            -- rows fetched per round trip while streaming an export
+  },
+
   history = {
     enabled     = true,           -- record executed statements
     max_entries = 500,            -- oldest entries drop past this
@@ -519,6 +536,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `o` | `open` | Open the table in the grid |
 | `c` | `row_count` | Count rows |
 | `D` | `ddl` | Show the DDL |
+| `X` | `export` | Export the table to a file |
 | `R` | `refresh` | Reload the schema |
 | `?` | `help` | This help |
 | `q` | `close` | Close dblens |
@@ -530,9 +548,19 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<CR>` / `K` | `detail` | Row detail |
 | `]p` | `next_page` | Next page |
 | `[p` | `prev_page` | Previous page |
+| `[P` | `first_page` | First page |
+| `]P` | `last_page` | Last page |
+| `gp` | `goto_page` | Go to page N |
 | `s` | `sort` | Sort by this column |
 | `f` | `filter` | Filter rows (WHERE) |
+| `F` | `filter_cell` | Filter to this value |
+| `!` | `filter_not_cell` | Filter out this value |
+| `C` | `clear_filter` | Clear the filter |
 | `R` | `refresh` | Re-run the query |
+| `gf` | `follow_fk` | Go to the referenced row |
+| `g/` | `search` | Search the result |
+| `gn` | `next_match` | Next match |
+| `gN` | `prev_match` | Previous match |
 | `e` | `edit_cell` | Edit this cell |
 | `i` | `insert_row` | Insert a row |
 | `dd` | `delete_row` | Delete this row |
@@ -1113,6 +1141,11 @@ error reporting have much thinner live coverage everywhere — please report wha
   still does the full work. Client output is capped at `max_bytes`.
 - Sorting and filtering apply to a browsed table only. For a query result, put `ORDER BY` /
   `WHERE` in the query.
+- Foreign-key navigation is FORWARD only: it goes to the row a cell references, not to the rows
+  that reference this one. Where the key spans several columns it follows the one column under
+  the cursor and says so, so the result may hold more rows than the single referenced one.
+- The grid's `?` overlay lists 38 bindings, which no longer fit an 80x24 screen — it scrolls
+  there (`j`/`k`) rather than cutting any of them off.
 - SQLite exposes no schema level (attached databases are out of scope) and has no
   `EXPLAIN ANALYZE` or row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so `D` shows a DDL reconstructed from

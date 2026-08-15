@@ -169,6 +169,47 @@ function M.count(relation, where, dialect)
   )
 end
 
+--- `col = value`, `col <> value`, or the NULL-safe form of either.
+---
+--- `<>` rather than `!=`: both are accepted by all six engines, `<>` is the standard spelling.
+---@param column string
+---@param value any        -- a cell value, or protocol.NULL / nil for SQL NULL
+---@param op '='|'<>'
+---@param dialect dblens.Dialect
+---@return string
+function M.compare_where(column, value, op, dialect)
+  assert(op == '=' or op == '<>', 'common.compare_where: op must be `=` or `<>`')
+  local ident = sql.quote_ident(column, dialect)
+  if value == nil or value == vim.NIL then
+    return ident .. (op == '=' and ' IS NULL' or ' IS NOT NULL')
+  end
+  return ('%s %s %s'):format(ident, op, sql.quote_literal(tostring(value), dialect))
+end
+
+--- A filter predicate built from a cell the user put the cursor on.
+---
+--- The value is QUOTED, never concatenated, and the result then goes through the same
+--- `check_predicate` vetting as a hand-typed filter — which is what makes the refusal a message
+--- rather than the assertion in `where_clause`. A value the vetting cannot express (a backslash,
+--- whose meaning depends on a server setting) is reported here instead of reaching the server.
+---@param column string
+---@param value any
+---@param op '='|'<>'
+---@param dialect dblens.Dialect
+---@return string? predicate, string? error
+function M.cell_predicate(column, value, op, dialect)
+  assert(type(column) == 'string' and column ~= '', 'common.cell_predicate: needs a column')
+  if type(value) == 'string' and value:find('%z') then
+    return nil, ('cannot filter on `%s`: the value contains a NUL byte'):format(column)
+  end
+  local predicate = M.compare_where(column, value, op, dialect)
+  local problem = M.check_predicate(predicate, dialect)
+  if problem then
+    return nil, ('cannot filter on this value (%s)'):format(problem)
+  end
+  return predicate, nil
+end
+
 --- Predicate matching exactly the given column values, for row-targeted CRUD.
 ---@param values { column: string, value: any }[]
 ---@param dialect dblens.Dialect

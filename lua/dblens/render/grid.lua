@@ -115,7 +115,8 @@ local CLASS_HL = {
 ---@field separator string
 ---@field truncation string
 ---@field sort { column: string, desc: boolean }?
----@field dirty table<string, boolean>?  -- keys `row .. ':' .. col`, marking queued edits
+---@field dirty table<string, boolean>?   -- keys `row .. ':' .. col`, marking queued edits
+---@field search table<string, boolean>?  -- same keys, marking in-result search matches
 
 ---@class dblens.GridOutput
 ---@field lines string[]
@@ -214,7 +215,7 @@ function M.render(input)
     at = at + width + 3
   end
 
-  local dirty = input.dirty or {}
+  local dirty, search = input.dirty or {}, input.search or {}
   for r = 1, #input.rows do
     local cells = {}
     for c = 1, #input.columns do
@@ -229,7 +230,12 @@ function M.render(input)
     local index = #lines + 1
     lines[index] = line
     for c = 1, #input.columns do
-      local hl = dirty[r .. ':' .. c] and 'DbLensDirty' or CLASS_HL[classes[r][c]]
+      -- A search match wins over everything: it is transient and the user just asked for it, and
+      -- a match hiding behind a type colour is a match they cannot see.
+      local key = r .. ':' .. c
+      local hl = (search[key] and 'DbLensMatch')
+        or (dirty[key] and 'DbLensDirty')
+        or CLASS_HL[classes[r][c]]
       if hl then
         marks[#marks + 1] =
           { line = index - 1, col = ranges[c].from, end_col = ranges[c].to, hl = hl }

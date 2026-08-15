@@ -132,11 +132,18 @@ local function make_window(buf, config)
 end
 
 --- Open the picker.
+---
+--- `on_alt` is a second thing the picked item can be used for, on its own key — how the history
+--- and snippet pickers offer "run it now" without taking `<CR>` away from what it already does.
 ---@param state dblens.State
----@param opts { title: string, items: dblens.PickerItem[], on_choose: fun(value: any) }
+---@param opts { title: string, items: dblens.PickerItem[], on_choose: fun(value: any), on_alt: fun(value: any)?, choose_hint: string?, alt_hint: string? }
 function M.select(state, opts)
   assert(vim.islist(opts.items), 'picker.select: items must be a list')
   assert(type(opts.on_choose) == 'function', 'picker.select: on_choose must be a function')
+  assert(
+    opts.on_alt == nil or type(opts.on_alt) == 'function',
+    'picker.select: on_alt must be a function'
+  )
   if #opts.items == 0 then
     require('dblens.app').notify('nothing to choose from')
     return
@@ -168,6 +175,9 @@ function M.select(state, opts)
   vim.bo[self.prompt_buf].bufhidden = 'wipe'
   vim.bo[self.prompt_buf].buftype = 'prompt'
   vim.fn.prompt_setprompt(self.prompt_buf, '  ')
+  local footer = (' <CR> %s · '):format(opts.choose_hint or 'open')
+    .. (opts.on_alt and ('<C-r> %s · '):format(opts.alt_hint or 'alternate') or '')
+    .. '<C-n>/<C-p> move · <Esc> cancel '
   self.prompt_win = make_window(self.prompt_buf, {
     relative = 'editor',
     width = width,
@@ -176,7 +186,7 @@ function M.select(state, opts)
     col = col,
     style = 'minimal',
     border = options.ui.border,
-    footer = ' <CR> open · <C-n>/<C-p> move · <Esc> cancel ',
+    footer = footer,
     footer_pos = 'center',
   })
 
@@ -192,13 +202,15 @@ function M.select(state, opts)
     end,
   })
 
-  local function accept()
+  --- Close first, then hand the picked value to `handler` on the next tick, so the handler can
+  --- open a float or focus a pane without racing this picker's own teardown.
+  local function accept(handler)
     local entry = self.matches[self.index]
     self:close()
     vim.cmd('stopinsert')
     if entry then
       vim.schedule(function()
-        opts.on_choose(entry.item.value)
+        handler(entry.item.value)
       end)
     end
   end
@@ -215,7 +227,18 @@ function M.select(state, opts)
       { buffer = self.prompt_buf, nowait = true, silent = true }
     )
   end
-  map('<CR>', accept)
+  map('<CR>', function()
+    accept(opts.on_choose)
+  end)
+  if opts.on_alt then
+    local function alternate()
+      accept(opts.on_alt)
+    end
+    -- `<C-CR>` is the natural key but many terminals do not send it; `<C-r>` is the one that
+    -- always arrives, and inside a fuzzy prompt its register insert is no loss.
+    map('<C-r>', alternate)
+    map('<C-CR>', alternate)
+  end
   map('<Esc>', cancel)
   map('<C-c>', cancel)
   map('q', cancel, { 'n' })
@@ -359,6 +382,17 @@ local function put_in_editor(state, sql)
   require('dblens.ui.layout').focus(state.layout, 'editor')
 end
 
+--- Run a picked statement immediately.
+---
+--- Through `app.run_sql`, never `session:run_script` — so a stored DELETE re-run from the picker
+--- meets the same classification, the same read-only refusal and the same confirmation float as
+--- one typed into the editor. The picker is a shortcut to the editor's <CR>, not around it.
+local function run_now(label)
+  return function(sql)
+    require('dblens.app').run_sql(sql, { label = label })
+  end
+end
+
 --- Browse query history for the current connection.
 function M.history(state)
   local session = state.session
@@ -374,9 +408,12 @@ function M.history(state)
   M.select(state, {
     title = 'History',
     items = items,
+    choose_hint = 'to editor',
+    alt_hint = 'run',
     on_choose = function(sql)
       put_in_editor(state, sql)
     end,
+    on_alt = run_now('history'),
   })
 end
 
@@ -390,9 +427,12 @@ function M.snippets(state)
   M.select(state, {
     title = 'Snippets',
     items = items,
+    choose_hint = 'to editor',
+    alt_hint = 'run',
     on_choose = function(sql)
       put_in_editor(state, sql)
     end,
+    on_alt = run_now('snippet'),
   })
 end
 

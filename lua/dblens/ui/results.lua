@@ -171,8 +171,23 @@ function M.render_winbar(state)
       hl = 'DbLensSortKey',
     }
   end
+  -- Where the view came from, when it was navigated to rather than opened: without it a table
+  -- that appeared because a foreign key was followed looks like one the user opened themselves.
+  if source and source.origin then
+    segments[#segments + 1] = { text = '<- ' .. source.origin, hl = 'DbLensFK' }
+  end
   if state.grid.filter then
     segments[#segments + 1] = { text = 'where ' .. state.grid.filter, hl = 'DbLensAccent' }
+  end
+  if state.grid.search then
+    segments[#segments + 1] = {
+      text = ('/%s %d/%d'):format(
+        state.grid.search.term,
+        state.grid.search.index,
+        #state.grid.search.matches
+      ),
+      hl = 'DbLensMatch',
+    }
   end
   if state.grid.elapsed_ms then
     segments[#segments + 1] = { text = status.duration(state.grid.elapsed_ms), hl = 'DbLensDim' }
@@ -228,6 +243,25 @@ function M.current_cell(state)
     nil
 end
 
+--- Put the cursor on a match, so a hit inside a clipped cell can still be read (`<CR>` opens the
+--- row detail, which shows the value in full).
+---@param match dblens.Match?
+function M.focus_match(state, match)
+  local win = state.layout.wins.results
+  if not match or not api.nvim_win_is_valid(win) then
+    return
+  end
+  local line = match.row + state.grid.header_lines
+  local span = state.grid.spans[match.column]
+  if line > api.nvim_buf_line_count(state.layout.bufs.results) or not span then
+    return
+  end
+  -- Spans are DISPLAY columns; the cursor takes a byte column, and a multibyte cell above makes
+  -- those differ.
+  local byte = vim.fn.virtcol2col(win, line, span.from)
+  api.nvim_win_set_cursor(win, { line, math.max(0, byte - 1) })
+end
+
 --- Run `fn` with the current cell, reporting why not when there is none.
 local function with_cell(state, app, fn)
   return function()
@@ -265,6 +299,25 @@ local function handlers(state, app)
     prev_page = function()
       app.page(-1)
     end,
+    first_page = function()
+      app.page_edge('first')
+    end,
+    last_page = function()
+      app.page_edge('last')
+    end,
+    goto_page = function()
+      vim.ui.input({ prompt = 'Go to page ' }, function(input)
+        if input == nil or vim.trim(input) == '' then
+          return
+        end
+        local page = tonumber(vim.trim(input))
+        if not page or page ~= math.floor(page) then
+          app.notify(('`%s` is not a page number'):format(vim.trim(input)))
+          return
+        end
+        app.goto_page(page)
+      end)
+    end,
     sort = with_cell(state, app, function(cell)
       app.sort_by(cell.name)
     end),
@@ -275,8 +328,37 @@ local function handlers(state, app)
         end
       end)
     end,
+    filter_cell = with_cell(state, app, function(cell)
+      app.filter_by_cell(cell, '=')
+    end),
+    filter_not_cell = with_cell(state, app, function(cell)
+      app.filter_by_cell(cell, '<>')
+    end),
+    clear_filter = function()
+      app.clear_filter()
+    end,
     refresh = function()
       app.refresh_grid()
+    end,
+    follow_fk = with_cell(state, app, function(cell)
+      app.follow_fk(cell)
+    end),
+    search = function()
+      vim.ui.input({
+        prompt = 'Search ',
+        default = state.grid.search and state.grid.search.term or '',
+      }, function(input)
+        if input == nil then
+          return
+        end
+        M.focus_match(state, app.search_result(input))
+      end)
+    end,
+    next_match = function()
+      M.focus_match(state, app.step_match(1))
+    end,
+    prev_match = function()
+      M.focus_match(state, app.step_match(-1))
     end,
     edit_cell = with_cell(state, app, function(cell)
       crud.edit_cell(state, cell)
@@ -315,7 +397,7 @@ local function handlers(state, app)
       )
     end),
     export = function()
-      crud.export(state)
+      require('dblens.ui.exporter').prompt_current(state)
     end,
     help = function()
       require('dblens.ui.help').show(state, 'results')

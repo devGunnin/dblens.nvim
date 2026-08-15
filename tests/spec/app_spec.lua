@@ -183,6 +183,57 @@ describe('app: results are routed to the request that asked for them', function(
     end)
   end)
 
+  --- `count_rows` read `state.grid.filter`, so counting a table from the TREE applied whatever
+  --- WHERE the grid happened to be showing for a different table: either an error on a column
+  --- that table does not have, or a wrong count stored in the catalog and drawn in the tree as
+  --- that table's own row count.
+  it('counts a table from the tree without the grid WHERE that belongs to another one', function()
+    h.with_fake_exec(function(call)
+      if call.stdin:find('count(*)', 1, true) then
+        return { stdout = h.wire({ h.record('n'), h.record('42') }) }
+      end
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      local orders = { name = 'orders', kind = 'table' }
+      local customers = { name = 'customers', kind = 'table' }
+      state.grid.source = { kind = 'relation', relation = orders, label = 'orders' }
+      state.grid.filter = "status = 'shipped'"
+
+      app.count_rows(customers)
+
+      local sent = calls[#calls].stdin
+      eq(sent:find('customers', 1, true) ~= nil, true, { fail_reason = sent })
+      eq(sent:find('status', 1, true), nil, {
+        fail_reason = "the tree's count carried the grid's WHERE: " .. sent,
+      })
+      eq(state.session.catalog:info_for(customers).row_count, 42)
+      app.close()
+    end)
+  end)
+
+  it('keeps a filtered total out of the catalog, where it would read as the table count', function()
+    h.with_fake_exec(function(call)
+      if call.stdin:find('count(*)', 1, true) then
+        return { stdout = h.wire({ h.record('n'), h.record('3') }) }
+      end
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      local orders = { name = 'orders', kind = 'table' }
+      state.grid.source = { kind = 'relation', relation = orders, label = 'orders' }
+
+      app.count_rows(orders, "status = 'shipped'")
+
+      eq(calls[#calls].stdin:find('status', 1, true) ~= nil, true)
+      eq(state.grid.paging.total, 3, { fail_reason = 'the pager must show the filtered total' })
+      eq(state.session.catalog:info_for(orders).row_count, nil, {
+        fail_reason = 'a filtered total was cached as the row count of the whole table',
+      })
+      app.close()
+    end)
+  end)
+
   it('cancels the page fetch already in flight before starting another', function()
     h.with_fake_exec(function()
       return { pending = true }
@@ -275,11 +326,57 @@ describe('ui: the help overlay fits the screen', function()
   local help = require('dblens.ui.help')
   local keymaps = require('dblens.keymaps')
 
-  it('never runs below the fold, down to 80x24', function()
+  --- v1.2 put 38 bindings in the grid, which cannot fit an 80x24 screen in two columns however
+  --- they are laid out. So the promise the overlay keeps is the one that still means something:
+  --- it never DROPS or CUTS a binding, it fits whenever the screen has the room, and where it
+  --- does not it reports that, so the caller offers scrolling instead of a panel ending mid-list.
+  it('shows every binding in full at any size, and reports whether it fits', function()
     local options = require('dblens.config').setup(scratch_options())
     for _, scope in ipairs({ 'sidebar', 'results', 'editor' }) do
-      -- 80x24 leaves 17 rows inside the float at the default max_height.
-      local available = math.floor(24 * options.ui.float.max_height) - 2
+      local blocks = help.blocks(scope, options)
+      for _, available in ipairs({ 6, 17, 40 }) do
+        local lines, _, fits = help.layout(blocks, available)
+        local text = table.concat(lines, '\n')
+        for _, block in ipairs(blocks) do
+          for _, row in ipairs(block.rows) do
+            eq(text:find(row.left, 1, true) ~= nil, true, {
+              fail_reason = ('%s at %d rows lost the key %s'):format(scope, available, row.left),
+            })
+            eq(text:find(row.right, 1, true) ~= nil, true, {
+              fail_reason = ('%s at %d rows lost the description of %s'):format(
+                scope,
+                available,
+                row.left
+              ),
+            })
+          end
+        end
+        eq(fits, #lines <= available, {
+          fail_reason = ('%s at %d rows reported fits=%s for %d lines'):format(
+            scope,
+            available,
+            tostring(fits),
+            #lines
+          ),
+        })
+      end
+    end
+  end)
+
+  it('fits without scrolling on a screen with the room for it', function()
+    local options = require('dblens.config').setup(scratch_options())
+    for _, scope in ipairs({ 'sidebar', 'results', 'editor' }) do
+      -- 120x40 is an ordinary editor window; `budget` leaves it 34 rows.
+      local rows, columns = help.budget(40, 120)
+      local lines, _, fits = help.layout(help.blocks(scope, options), rows, columns)
+      eq(fits, true, { fail_reason = ('%s: %d lines into %d rows'):format(scope, #lines, rows) })
+    end
+  end)
+
+  it('still fits an 80x24 screen everywhere but the crowded grid', function()
+    local options = require('dblens.config').setup(scratch_options())
+    local available = math.floor(24 * options.ui.float.max_height) - 2
+    for _, scope in ipairs({ 'sidebar', 'editor' }) do
       local lines = help.layout(help.blocks(scope, options), available)
       eq(
         #lines <= available,
