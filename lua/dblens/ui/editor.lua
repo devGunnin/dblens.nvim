@@ -218,8 +218,8 @@ local function handlers(state, app)
     help = function()
       require('dblens.ui.help').show(state, 'editor')
     end,
-    close = function()
-      app.close()
+    hide = function()
+      app.hide()
     end,
   }
 end

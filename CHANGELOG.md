@@ -3,6 +3,77 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.4.0] - 2026-08-15
+
+### Added
+
+- **A connections manager.** `:DbLensConnections` (`<leader>dc`) is no longer just a picker: it
+  lists every connection dblens knows about with its engine, target, LOCKED/EDIT default, where
+  its password comes from, and whether it could be opened RIGHT NOW. A flagged row carries the
+  reason under it — `$PGPASSWORD_PROD is not set`, a host with the port glued on, whatever
+  validation refused. `<CR>` connects, `e` edits, `dd` deletes after a confirmation, `a` adds,
+  `D` runs discovery, `R` re-checks. The health check resolves the REFERENCE and never opens the
+  database; a `password_cmd` is deliberately not run for it (running one to draw a list could
+  raise a passphrase prompt), so those rows report as unchecked and are proved on connect.
+  Deleting removes the connection from the file, drops a live session on it and clears the saved
+  session, so it cannot be restored back into existence.
+- **Hiding, instead of losing the session.** `q` in any dblens window and `<leader>dd` toggling
+  off now HIDE: the windows go and your layout comes back, the instance stays. Toggling on again
+  re-shows the same connection and mode, the same tree expansion, every result tab with its
+  filter, sort, search and page, and the SQL buffer as you left it — the same buffers, no
+  reconnect, no second UI. A query running when you hide keeps running and its rows land in their
+  tab. `:DbLensClose` is now the deliberate teardown, and leaving Neovim still releases
+  everything.
+- **Editing a saved connection** (`e` in the manager): the add form's questions, answered with
+  what the connection holds today, written back in place. It reaches an entry validation refuses
+  as well as a usable one, because that is the entry that needs fixing.
+
+### Fixed
+
+- **A misconfigured connection no longer errors on every start.** A connection whose secret
+  cannot resolve, or whose config is malformed, is now skipped with ONE quiet, dismissable line
+  naming the reason and pointing at the manager — never an error on every open, and never during
+  session restore. A saved session naming a connection that no longer exists is simply nothing to
+  restore, silently. Connections the loader refuses are reported as one line ("2 connections need
+  attention"), not one error each. Secrets are resolved only when actually connecting; the
+  manager's health flag resolves the reference to a boolean and surfaces no error.
+- **An entry the loader refuses can be seen and deleted.** It used to be dropped from the list
+  entirely: not listed, not connectable, not removable by name, and shouting on every start. It
+  is now listed with its reason, editable and deletable — and deleting or adding a connection
+  leaves every other stored entry with the same fields and the same position, instead of quietly
+  dropping the ones that failed validation. (The file is re-encoded on every write, so key order
+  and hand formatting are not preserved; the content of every untouched entry is.)
+- **The manager renders a connections file no matter what is in it.** A stray scalar, a JSON
+  `null`, an entry with no `name`, or one whose `name` is a number: each is listed as a flagged
+  row saying which position in the file it is and what is wrong with it, and each can be deleted
+  from there. `:DbLensConnections` used to throw a traceback on exactly these — the files it
+  exists to repair. `e` on an entry with an unusable name asks for one and stores the repair.
+- **Two entries under one name are two entries.** The manager acts on the row the cursor is on,
+  addressed by its position in the file, so deleting one duplicate removes one (it used to remove
+  both) and editing one replaces one (it used to write the edited entry once per match).
+- **Editing keeps a field you hand-wrote.** `e` used to rebuild the entry from the questions it
+  asks, silently dropping every other key in it. The answers are now merged over the stored entry.
+- **The connections file is written atomically.** A temp file in the same directory, flushed to
+  disk, renamed into place, with the write and the flush both checked. A crash or a full disk
+  mid-write used to leave a truncated file — every saved connection gone, with "saved connection
+  `x`" reported over it. A failed write now leaves the original file exactly as it was and says
+  so. The `rw-------` mode is applied at creation, so there is no window where it is world-readable.
+- **The add form refuses the mistake that caused this.** A host typed as `host:port` is split
+  into host and port (and a host that disagrees with a separately given port is refused);
+  `password_env` must be a variable NAME, so `.env` is refused with what to do instead (a `.env`
+  FILE is `:DbLensDiscover`'s input) and so is a password typed as a value; read-only is the
+  first and default access answer, and anything but an explicit read-write choice leaves the
+  connection LOCKED.
+
+### Security
+
+- Unchanged where it counts: a discovered connection is still session-only and is now REFUSED by
+  the store rather than silently skipped, a password value is still never written to disk, the
+  manager shows a password's SOURCE and never its value, the connections file is still written
+  `rw-------`, and the argv option-injection defenses are untouched. The file writer additionally
+  refuses to rewrite a connections file that holds a plaintext password, rather than authoring
+  one itself.
+
 ## [1.3.0] - 2026-08-15
 
 ### Added

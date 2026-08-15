@@ -632,11 +632,15 @@ TACTICA_DB_PORT=5433
     eq(spec.password_cmd, nil)
     eq(h.leaks(spec, 'pref-s3cr3t'), false, { fail_reason = 'the password reached the spec' })
 
-    local ok, err = connections.save(options, { spec })
-    eq(ok, true, { fail_reason = tostring(err) })
-    local written = assert(io.open(options.connections_file, 'r'), 'nothing was written')
-    local stored = written:read('*a')
-    written:close()
+    -- Asked to STORE it, the store refuses: a discovered connection is session-only.
+    local ok, err = connections.put(options, spec.name, spec)
+    eq(ok, false, { fail_reason = 'a discovered connection was accepted for the file' })
+    eq(type(err), 'string')
+    local written = io.open(options.connections_file, 'r')
+    local stored = written and written:read('*a') or ''
+    if written then
+      written:close()
+    end
     eq(stored:find('pref-s3cr3t', 1, true), nil, { fail_reason = 'the password was persisted' })
     eq(stored:find('tactica', 1, true), nil, { fail_reason = 'the connection was persisted' })
   end)
@@ -759,11 +763,14 @@ describe('discovery: what a candidate becomes', function()
       require('dblens.config').setup({ connections_file = base .. '/connections.json' })
     local spec = discovery.to_spec(url_candidate())
 
-    local ok, err = connections.save(options, { spec })
-    eq(ok, true, { fail_reason = tostring(err) })
-    local written = assert(io.open(options.connections_file, 'r'), 'nothing was written')
-    local text = written:read('*a')
-    written:close()
+    local ok, err = connections.put(options, spec.name, spec)
+    eq(ok, false, { fail_reason = 'a discovered connection was accepted for the file' })
+    eq(type(err), 'string')
+    local written = io.open(options.connections_file, 'r')
+    local text = written and written:read('*a') or ''
+    if written then
+      written:close()
+    end
     eq(text:find('s3cr3t', 1, true), nil, { fail_reason = 'the password was persisted' })
     eq(text:find('appdb', 1, true), nil, { fail_reason = 'the connection was persisted' })
   end)
@@ -914,12 +921,16 @@ describe('discovery: connecting what was found', function()
         fail_reason = 'the password reached the spec',
       })
 
-      -- Even asked to save the WHOLE live list, the file gets nothing discovered.
-      local ok, err = connections.save(options, state.specs)
-      eq(ok, true, { fail_reason = tostring(err) })
-      local written = assert(io.open(options.connections_file, 'r'))
-      local text = written:read('*a')
-      written:close()
+      -- Asked to store the live connection, the store refuses it and writes nothing at all.
+      local live = connections.find(state.specs, 'DATABASE_URL')
+      eq(live.source, 'discovered')
+      local ok = connections.put(options, live.name, live)
+      eq(ok, false, { fail_reason = 'the discovered connection was written to the file' })
+      local written = io.open(options.connections_file, 'r')
+      local text = written and written:read('*a') or ''
+      if written then
+        written:close()
+      end
       eq(text:find('urlsecret', 1, true), nil, { fail_reason = 'the password was persisted' })
       eq(text:find('DATABASE_URL', 1, true), nil, {
         fail_reason = 'the discovered connection was persisted',

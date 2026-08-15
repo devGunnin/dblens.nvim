@@ -35,6 +35,12 @@ function M.is_open()
   return state ~= nil and layout_mod.is_open(state.layout)
 end
 
+--- Whether a UI exists but is off screen: its connection, its result tabs and its SQL are all
+--- still here, waiting for the next `:DbLens`.
+function M.is_hidden()
+  return state ~= nil and not layout_mod.is_open(state.layout)
+end
+
 ---@param message string
 ---@param level integer?
 function M.notify(message, level)
@@ -205,6 +211,15 @@ function M.open(name, opts)
     layout_mod.focus(state.layout, 'sidebar')
     return
   end
+  if M.is_hidden() then
+    if M.show(name, opts) then
+      return
+    end
+    -- Its buffers are gone (wiped by hand, or by a session restore), so there is nothing to show
+    -- again. The instance still owns a session, a spinner and an augroup: release them, then
+    -- build a fresh one rather than stranding what the old one was holding.
+    M.close()
+  end
 
   state = build_state(options)
   local ok, err = pcall(start_instance, options)
@@ -221,10 +236,15 @@ end
 --- the lifecycle autocmds. Called only by `M.open`, which owns the failure path.
 function start_instance(options)
   local specs, problems = connections.load(options)
-  for _, problem in ipairs(problems) do
-    M.error(problem)
-  end
   state.specs = specs
+  if #problems > 0 then
+    -- ONE line, not one ERROR per bad connection on every single start. A hand-edited connection
+    -- used to shout on every open with nowhere to see it: the manager lists it with the reason.
+    M.notify(
+      ('%d connection(s) need attention - :DbLensConnections shows why'):format(#problems),
+      vim.log.levels.WARN
+    )
+  end
 
   state.layout = layout_mod.open(options)
   state.spinner = status.spinner(
@@ -238,14 +258,15 @@ function start_instance(options)
   require('dblens.ui.editor').attach(state)
 
   local group = vim.api.nvim_create_augroup('DbLensLifecycle', { clear = true })
-  --- `:q` on one dblens window leaves the rest of the layout stranded and the session, its
-  --- resolved secret and any running client alive, so a half-closed layout closes the rest.
+  --- `:q` on one dblens window leaves the rest of the layout stranded, so a half-closed layout
+  --- takes the rest of the windows down with it. It HIDES: the session, the tabs and the SQL are
+  --- kept, and `:DbLens` puts them straight back.
   vim.api.nvim_create_autocmd({ 'TabClosed', 'WinClosed' }, {
     group = group,
     callback = function()
       vim.schedule(function()
         if state and not layout_mod.is_open(state.layout) then
-          M.close()
+          M.hide()
         end
       end)
     end,
@@ -260,18 +281,37 @@ function start_instance(options)
       end
     end,
   })
+  --- Leaving Neovim ends the session however dblens was left: hidden counts, so the history a
+  --- hidden instance collected is written out here rather than only by `:DbLensClose`.
   vim.api.nvim_create_autocmd('VimLeavePre', {
     group = group,
     callback = function()
       M.save_session()
-      if state and state.session then
+      if not state then
+        return
+      end
+      local saved, err = history.save(state.history, state.options)
+      if not saved then
+        M.error(err)
+      end
+      if state.session then
         state.session:close()
       end
-      if state and state.spinner then
+      if state.spinner then
         state.spinner:stop()
       end
     end,
   })
+end
+
+--- The one line a connection dblens picked ITSELF gets when it cannot be opened. The manager is
+--- named in it because seeing and deleting the bad connection is what the user needs next.
+local function unusable(what, name, reason)
+  return ('could not %s `%s`: %s - :DbLensConnections to fix or remove it'):format(
+    what,
+    name,
+    reason or 'the connection is not usable'
+  )
 end
 
 --- Decide what to connect to when the UI opens.
@@ -290,11 +330,16 @@ function M.choose_connection(name, opts)
     M.discover()
     return
   end
-  if (opts.restore or state.options.session.restore) and M.restore_saved() then
-    return
-  end
-  if opts.restore then
-    M.notify('no saved session to restore')
+  if opts.restore or state.options.session.restore then
+    local outcome = M.restore_saved()
+    if outcome ~= 'nothing' then
+      -- `skipped` already said why in one line; picking something else on top of it would connect
+      -- to a database the user did not ask for.
+      return
+    end
+    if opts.restore then
+      M.notify('no saved session to restore')
+    end
   end
 
   local specs = state.specs
@@ -309,6 +354,13 @@ function M.choose_connection(name, opts)
     return
   end
   if #specs == 1 then
+    -- Nobody asked for THIS connection: it is the only one there is. Opening dblens must not turn
+    -- a connection whose secret cannot resolve into an error on every start.
+    local health = connections.health(specs[1])
+    if health.state == 'broken' then
+      M.notify(unusable('open', specs[1].name, health.reason), vim.log.levels.WARN)
+      return
+    end
     M.connect(specs[1].name)
     return
   end
@@ -318,19 +370,31 @@ function M.choose_connection(name, opts)
 end
 
 --- Reopen the last session, table included.
----@return boolean started, false when there is nothing usable to restore
+---
+--- Never a raise and never an error on every start: a saved connection that has been removed is
+--- simply nothing to restore, and one that cannot resolve its secret is skipped with a single
+--- line naming the reason.
+---@return 'started'|'nothing'|'skipped'
 function M.restore_saved()
   local saved, err = state_mod.load(state.options)
   if err then
-    M.error(err)
-    return false
+    -- Restoring is optional, so a session file that cannot be read is worth one line, not an
+    -- error dialog on every start.
+    M.notify(err, vim.log.levels.WARN)
+    return 'skipped'
   end
   if not saved or not saved.connection then
-    return false
+    return 'nothing'
   end
-  if not connections.find(state.specs, saved.connection) then
-    M.notify(('the saved connection `%s` no longer exists'):format(saved.connection))
-    return false
+  local spec = connections.find(state.specs, saved.connection)
+  if not spec then
+    -- Removed, renamed, or refused by validation. Nothing to restore, and nothing to say.
+    return 'nothing'
+  end
+  local health = connections.health(spec)
+  if health.state == 'broken' then
+    M.notify(unusable('restore', spec.name, health.reason), vim.log.levels.WARN)
+    return 'skipped'
   end
   M.connect(saved.connection, function()
     if not saved.relation or not state.session then
@@ -344,7 +408,7 @@ function M.restore_saved()
     end
     M.notify(('`%s` is no longer in the schema'):format(saved.relation))
   end)
-  return true
+  return 'started'
 end
 
 --- Remember the connection and table currently open.
@@ -360,6 +424,56 @@ function M.save_session()
   if not ok then
     M.error(err)
   end
+end
+
+--- Take the UI off screen, keeping everything it holds.
+---
+--- The hidden instance is the SAME instance: the connection stays open in whatever mode it was in,
+--- the tree keeps its expansion, every result tab keeps its rows, filter, sort and page, and the
+--- SQL buffer keeps what was typed into it. A query still running keeps running and its result
+--- lands in the tab that asked for it — showing again draws what arrived meanwhile.
+---
+--- `:DbLensClose` is the other path, and the deliberate one: it ends the session and releases
+--- everything.
+function M.hide()
+  -- `tabpage`, not `is_open`: a layout half-taken-down by `:q` on one of its windows still has
+  -- windows to release, and that is one of the ways this is reached.
+  if not state or not state.layout or not state.layout.tabpage then
+    return
+  end
+  M.save_session()
+  -- The spinner is left alone deliberately. It only ticks while a query is in flight, its frame
+  -- callback draws nothing into a window that is not there, and restarting it on show would reset
+  -- the elapsed time of a query that never stopped running.
+  layout_mod.hide(state.layout)
+end
+
+--- Put the hidden UI back on screen, exactly as it was.
+---@param name string?  -- a connection asked for by name is still honoured
+---@param opts { restore: boolean?, discover: boolean? }?
+---@return boolean shown  -- false when the preserved buffers are gone, so a fresh open is due
+function M.show(name, opts)
+  assert(state ~= nil, 'app.show: nothing is hidden')
+  local ok, shown = pcall(layout_mod.show, state.layout, state.options)
+  if not ok then
+    -- The layout tore its own half-built windows down; the instance behind it still has to go, or
+    -- `is_hidden` keeps offering to show something that cannot be built.
+    M.close()
+    error(shown, 0)
+  end
+  if not shown then
+    return false
+  end
+  M.render()
+  opts = opts or {}
+  -- Re-showing must not reconnect: the session is the one that was here. Only an explicit ask —
+  -- `:DbLens <name>`, `:DbLensRestore`, `:DbLensDiscover` — changes what is connected.
+  if name or opts.restore or opts.discover then
+    M.choose_connection(name, opts)
+    return true
+  end
+  layout_mod.focus(state.layout, 'sidebar')
+  return true
 end
 
 --- Close the UI, releasing everything it owns.
@@ -389,9 +503,10 @@ function M.close()
   pcall(vim.api.nvim_del_augroup_by_name, 'DbLensLifecycle')
 end
 
+--- Toggling OFF hides; toggling back on shows the same UI, connection and results included.
 function M.toggle()
   if M.is_open() then
-    M.close()
+    M.hide()
   else
     M.open()
   end
@@ -419,6 +534,37 @@ local function warn_if_best_effort(session)
       .. '(:h dblens-safety-mssql)',
     vim.log.levels.WARN
   )
+end
+
+--- Drop every live reference to a connection that has just been deleted.
+---
+--- Deleting it from the file is not enough on its own: the live list would still offer it, the
+--- open session would keep running against it, and `save_session` on close would write its name
+--- back into the session file — restoring, on the next start, exactly what was deleted.
+---@param name string
+function M.forget_connection(name)
+  assert(type(name) == 'string' and name ~= '', 'app.forget_connection: expected a name')
+  if not state then
+    return
+  end
+  local kept = {}
+  for _, spec in ipairs(state.specs) do
+    if spec.name ~= name then
+      kept[#kept + 1] = spec
+    end
+  end
+  state.specs = kept
+  state.secrets[name] = nil
+  if not state.session or state.session.spec.name ~= name then
+    return
+  end
+  state.session:close()
+  state.session = nil
+  state.tree = { expanded = {}, loading = {}, nodes = {} }
+  M.cancel_tab_jobs()
+  state.tabs = tabs.new(state.options)
+  activate(1)
+  M.render()
 end
 
 --- Connect by name, replacing any current session.

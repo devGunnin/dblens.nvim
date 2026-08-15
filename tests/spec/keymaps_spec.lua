@@ -7,7 +7,7 @@ local keymaps = require('dblens.keymaps')
 
 local eq, expect_error = h.eq, h.expect_error
 
-local SCOPES = { 'global', 'sidebar', 'results', 'editor' }
+local SCOPES = { 'global', 'connections', 'sidebar', 'results', 'editor' }
 
 --- Every (lhs, mode) a scope binds, as a flat list.
 local function bound_keys(scope)
@@ -227,6 +227,7 @@ end
 describe('keymaps: the README describes what is bound', function()
   local SECTIONS = {
     { scope = 'global', heading = 'Global', mode = false },
+    { scope = 'connections', heading = 'Connections manager', mode = false },
     { scope = 'sidebar', heading = 'Sidebar', mode = false },
     { scope = 'results', heading = 'Results grid', mode = false },
     { scope = 'editor', heading = 'SQL editor', mode = true },

@@ -6,6 +6,7 @@
 --- resolved value is never written back, logged, or persisted.
 local adapters = require('dblens.adapters')
 local exec = require('dblens.exec')
+local path_mod = require('dblens.path')
 
 local M = {}
 
@@ -56,6 +57,47 @@ local function validate_password_cmd(spec)
     end
   end
   return nil
+end
+
+--- Why `name` cannot be an environment variable name, or nil.
+---
+--- The mistake this exists for: `password_env = ".env"`. A `.env` FILE is discovery's input, not a
+--- variable, and stored as one it produced `$.env is not set` on every start.
+---@param name any
+---@return string? problem
+function M.env_name_problem(name)
+  if type(name) ~= 'string' or name == '' then
+    return 'the environment variable name is empty'
+  end
+  if name:find('[/\\]') or name:sub(1, 1) == '.' then
+    return ('`%s` is a file name, not an environment variable: dblens reads a `.env` FILE '):format(
+      name
+    ) .. 'through :DbLensDiscover; `password_env` wants the VARIABLE name, e.g. PGPASSWORD'
+  end
+  if not name:find('^[%a_][%w_]*$') then
+    return ('`%s` is not an environment variable name: give the NAME of the variable holding '):format(
+      name
+    ) .. 'the password (dblens never stores the password itself)'
+  end
+  return nil
+end
+
+--- Split a `host:port` value typed into a single field.
+---
+--- Only the unambiguous shape: one colon before a port number. A bare IPv6 literal carries two or
+--- more colons and a libpq socket directory carries none, so neither is mistaken for this.
+---@param value any
+---@return string? host, integer? port  -- nil when the value is not `host:port`
+function M.split_host_port(value)
+  if type(value) ~= 'string' then
+    return nil, nil
+  end
+  local host, port = value:match('^([^:]+):(%d+)$')
+  local number = tonumber(port)
+  if not host or not number or number < 1 or number > 65535 then
+    return nil, nil
+  end
+  return host, number
 end
 
 --- Validate one spec.
@@ -109,76 +151,183 @@ local function read_json_file(path)
   return decoded, nil
 end
 
---- Load specs from `setup{}` and from the connections file.
+--- Which forbidden key a stored entry carries a plaintext password under, or nil.
 ---
---- Duplicate names are rejected rather than silently shadowed, so `:DbLens` can never open a
---- different database than the one the name suggests.
+--- dblens never writes one, but the file is hand-editable, so the manager has to be able to say
+--- that the one on disk is a plaintext secret rather than "no password".
+---@param spec any
+---@return string? key
+function M.plaintext_password_key(spec)
+  if type(spec) ~= 'table' then
+    return nil
+  end
+  for key in pairs(FORBIDDEN) do
+    if spec[key] ~= nil then
+      return key
+    end
+  end
+  return nil
+end
+
+---@class dblens.ConnectionEntry
+---@field spec dblens.ConnectionSpec  -- as configured or stored; usable only when `problem` is nil
+---@field source 'config'|'file'
+---@field index integer?  -- position in the connections FILE; nil for a config spec
+---@field problem string?  -- why this entry cannot be used at all
+
+--- Every configured and stored connection, the unusable ones included.
+---
+--- `load` drops what it cannot validate, which is how a bad hand-edit became invisible: it could
+--- not be listed, connected or removed, and only announced itself as an error on every start. The
+--- manager needs those entries, so they are reported here with the reason instead of dropped.
+---
+--- Duplicate names are a problem on the SECOND entry, so the first one stays usable — `:DbLens`
+--- can never open a different database than the one the name suggests.
+---
+--- A file entry carries its `index`: the position it occupies in the connections file, which is
+--- the only identity a stored entry has. Names repeat, and the entry that most needs fixing may
+--- have no usable name at all.
+---@param options table  resolved config
+---@return dblens.ConnectionEntry[] entries, string? file_error
+function M.entries(options)
+  assert(type(options) == 'table', 'connections.entries: expected resolved options')
+  local entries, seen = {}, {}
+
+  local function accept(raw, source, position)
+    local index = source == 'file' and position or nil
+    if type(raw) ~= 'table' then
+      local problem = ('%s connection %d is not an object'):format(source, position)
+      entries[#entries + 1] =
+        { spec = { source = source }, source = source, index = index, problem = problem }
+      return
+    end
+    local spec = vim.deepcopy(raw)
+    spec.source = source
+    local problem = M.validate(spec)
+    if not problem and seen[spec.name] then
+      problem = ('duplicate connection name `%s` (%s and %s)'):format(
+        spec.name,
+        seen[spec.name],
+        source
+      )
+    end
+    if not problem then
+      if spec.read_only == nil then
+        spec.read_only = options.safety.read_only_default
+      end
+      -- Normalised here so every reader agrees. The connections file is hand-editable JSON, and a
+      -- truthy non-boolean used to read as "read-only" in the UI while enforcement saw `~= true`.
+      spec.read_only = spec.read_only ~= false
+      seen[spec.name] = source
+    end
+    entries[#entries + 1] = { spec = spec, source = source, index = index, problem = problem }
+  end
+
+  for position, spec in ipairs(options.connections) do
+    accept(spec, 'config', position)
+  end
+  local stored, file_error = read_json_file(options.connections_file)
+  for position, spec in ipairs(stored or {}) do
+    accept(spec, 'file', position)
+  end
+  return entries, file_error
+end
+
+--- Load the usable specs from `setup{}` and from the connections file.
 ---@param options table  resolved config
 ---@return dblens.ConnectionSpec[] specs, string[] problems, string? file_error
 --- `file_error` is set only when the connections file itself could not be read as JSON. Callers
 --- that intend to WRITE the file must refuse on it, or they would overwrite unreadable content.
 function M.load(options)
-  local specs, problems, seen = {}, {}, {}
-
-  local function accept(spec, source)
-    local copy = vim.deepcopy(spec)
-    copy.source = source
-    local err = M.validate(copy)
-    if err then
-      problems[#problems + 1] = err
-      return
-    end
-    if seen[copy.name] then
-      problems[#problems + 1] = ('duplicate connection name `%s` (%s and %s)'):format(
-        copy.name,
-        seen[copy.name],
-        source
-      )
-      return
-    end
-    if copy.read_only == nil then
-      copy.read_only = options.safety.read_only_default
-    end
-    -- Normalised here so every reader agrees. The connections file is hand-editable JSON, and a
-    -- truthy non-boolean used to read as "read-only" in the UI while enforcement saw `~= true`.
-    copy.read_only = copy.read_only ~= false
-    seen[copy.name] = source
-    specs[#specs + 1] = copy
-  end
-
-  for _, spec in ipairs(options.connections) do
-    accept(spec, 'config')
-  end
-  local stored, file_error = read_json_file(options.connections_file)
+  local entries, file_error = M.entries(options)
+  local specs, problems = {}, {}
   if file_error then
     problems[#problems + 1] = file_error
   end
-  for _, spec in ipairs(stored or {}) do
-    accept(spec, 'file')
+  for _, entry in ipairs(entries) do
+    if entry.problem then
+      problems[#problems + 1] = entry.problem
+    else
+      specs[#specs + 1] = entry.spec
+    end
   end
   return specs, problems, file_error
 end
 
---- Persist the file-sourced specs.
+--- Specs are not secret, but they name hosts and users; keep them owner-only. Set at CREATE time
+--- so the file is never briefly world-readable.
+local OWNER_ONLY = tonumber('600', 8)
+
+--- Write `text` into a temp file beside `path`, flushed to disk. Returns the temp path.
 ---
---- A WHITELIST, not a blacklist: only `source = 'file'` is written. Config-sourced specs are owned
---- by the user's `setup{}` call, and a DISCOVERED spec exists only for the session that found it —
---- writing one would persist a connection whose password was never stored and cannot be resolved
---- again. A caller that means to keep a connection sets `source = 'file'` on it first.
----@param options table
----@param specs dblens.ConnectionSpec[]
+--- Every failure here removes the temp file and leaves `path` untouched.
+---@return string? temp, string? error
+local function write_temp(path, text)
+  local temp = ('%s.%d.tmp'):format(path, vim.uv.os_getpid())
+  local fd, open_err = vim.uv.fs_open(temp, 'w', OWNER_ONLY)
+  if not fd then
+    return nil, ('could not write %s: %s'):format(temp, tostring(open_err))
+  end
+  local written, write_err = vim.uv.fs_write(fd, text, 0)
+  -- fsync before the rename: a rename the kernel has recorded over data it has not is exactly the
+  -- empty-file-after-power-loss this replaces.
+  local flushed, sync_err = nil, nil
+  if written == #text then
+    flushed, sync_err = vim.uv.fs_fsync(fd)
+  end
+  vim.uv.fs_close(fd)
+  if written ~= #text then
+    vim.uv.fs_unlink(temp)
+    return nil,
+      ('could not write %s: %s'):format(
+        temp,
+        write_err or ('wrote %s of %d bytes'):format(tostring(written), #text)
+      )
+  end
+  if not flushed then
+    vim.uv.fs_unlink(temp)
+    return nil, ('could not flush %s: %s'):format(temp, tostring(sync_err))
+  end
+  return temp, nil
+end
+
+--- Replace `path` with `text` atomically: temp file, fsync, rename.
+---
+--- The connections file is the only record of every saved connection and there is no backup, so a
+--- truncating write that dies halfway loses all of them. A rename is all-or-nothing.
 ---@return boolean ok, string? error
-function M.save(options, specs)
-  local keep = {}
-  for _, spec in ipairs(specs) do
-    if spec.source == 'file' then
-      local copy = vim.deepcopy(spec)
-      copy.source = nil
-      local err = M.validate(vim.tbl_extend('force', copy, { source = 'file' }))
-      if err then
-        return false, err
-      end
-      keep[#keep + 1] = copy
+local function write_atomic(path, text)
+  local temp, temp_err = write_temp(path, text)
+  if not temp then
+    return false, temp_err
+  end
+  local renamed, rename_err = vim.uv.fs_rename(temp, path)
+  if not renamed then
+    vim.uv.fs_unlink(temp)
+    return false, ('could not replace %s: %s'):format(path, tostring(rename_err))
+  end
+  return true, nil
+end
+
+--- Write the stored list.
+---
+--- Refuses to author a plaintext password: an entry holding one is already on disk, but rewriting
+--- the file around it would make dblens itself the thing that wrote it, which it never is.
+---@param options table
+---@param list table[]  -- entries exactly as they are to appear in the file
+---@return boolean ok, string? error
+local function write_stored(options, list)
+  assert(vim.islist(list), 'connections.write_stored: expected a list of entries')
+  for _, entry in ipairs(list) do
+    local key = M.plaintext_password_key(entry)
+    if key then
+      return false,
+        ('%s holds a plaintext `%s` for `%s` — remove it in the file first: %s'):format(
+          options.connections_file,
+          key,
+          tostring(entry.name),
+          FORBIDDEN[key]
+        )
     end
   end
 
@@ -187,15 +336,136 @@ function M.save(options, specs)
   if vim.fn.isdirectory(dir) == 0 and vim.fn.mkdir(dir, 'p') == 0 then
     return false, ('could not create %s'):format(dir)
   end
-  local file, open_err = io.open(path, 'w')
-  if not file then
-    return false, ('could not write %s: %s'):format(path, open_err)
+  return write_atomic(path, vim.json.encode(list))
+end
+
+--- The spec as it is to be stored, or why it cannot be.
+---
+--- `at` is the position it replaces, so the entry being edited is not counted as its own name
+--- collision. An entry KEEPING a name a second entry already holds is allowed: that duplicate is
+--- already on disk and already flagged, and refusing here would make it unfixable.
+---@param stored table[]
+---@param at integer?  -- nil when appending
+---@param spec table
+---@return table? entry, string? problem
+local function storable(stored, at, spec)
+  if spec.source ~= nil and spec.source ~= 'file' then
+    return nil,
+      ('connection `%s` is %s, not a saved connection: it is never written to disk'):format(
+        tostring(spec.name),
+        spec.source
+      )
   end
-  file:write(vim.json.encode(keep))
-  file:close()
-  -- Specs are not secret, but they name hosts and users; keep them owner-only.
-  pcall(vim.fn.setfperm, path, 'rw-------')
-  return true, nil
+  local entry = vim.deepcopy(spec)
+  entry.source = nil
+  local problem = M.validate(vim.tbl_extend('force', entry, { source = 'file' }))
+  if problem then
+    return nil, problem
+  end
+  local current = stored[at]
+  if type(current) == 'table' and current.name == entry.name then
+    return entry, nil
+  end
+  for position, other in ipairs(stored) do
+    if position ~= at and type(other) == 'table' and other.name == entry.name then
+      return nil, ('a connection named `%s` already exists'):format(entry.name)
+    end
+  end
+  return entry, nil
+end
+
+--- Apply ONE change to the stored list and write it back: replace the entry at `at`, delete it
+--- when `spec` is nil, or append when `at` is nil.
+---@param at integer?  -- nil appends
+---@return boolean ok, string? error
+local function apply(options, stored, at, spec)
+  local entry = nil
+  if spec then
+    local problem
+    entry, problem = storable(stored, at, spec)
+    if not entry then
+      return false, problem
+    end
+  end
+  local list = {}
+  for position, other in ipairs(stored) do
+    if position ~= at then
+      list[#list + 1] = other
+    elseif entry then
+      list[#list + 1] = entry
+    end
+  end
+  if not at and entry then
+    list[#list + 1] = entry
+  end
+  return write_stored(options, list)
+end
+
+--- The position of the FIRST stored entry named `name`, or nil.
+local function index_of(stored, name)
+  for position, other in ipairs(stored) do
+    if type(other) == 'table' and other.name == name then
+      return position
+    end
+  end
+  return nil
+end
+
+--- Replace or delete the stored entry at `index` — the position it occupies in the connections
+--- file, and the only identity a stored entry has.
+---
+--- This is what the manager acts through: it addresses the row the cursor is on, so a duplicate
+--- name changes or deletes exactly the one entry meant, and an entry with a broken name (or no
+--- name, or that is not an object at all) is still reachable. Every other stored entry is written
+--- back as the user wrote it.
+---@param options table
+---@param index integer  -- 1-based position in the connections file
+---@param spec dblens.ConnectionSpec?  -- nil deletes
+---@return boolean ok, string? error
+function M.put_at(options, index, spec)
+  assert(
+    type(index) == 'number' and index >= 1 and index % 1 == 0,
+    'connections.put_at: needs a 1-based stored position'
+  )
+  assert(spec == nil or type(spec) == 'table', 'connections.put_at: spec must be a table or nil')
+  local stored, file_error = read_json_file(options.connections_file)
+  if file_error then
+    return false, file_error
+  end
+  stored = stored or {}
+  if index > #stored then
+    return false, ('no saved connection at position %d'):format(index)
+  end
+  return apply(options, stored, index, spec)
+end
+
+--- Add, replace or delete ONE stored connection, keyed by the name it is stored under.
+---
+--- Keyed by name over the file's RAW entries, so an entry `load` refuses can still be fixed or
+--- deleted — that entry is exactly the one the user has to get at. The FIRST entry under the name
+--- is the one acted on: with two entries sharing a name, deleting removes one, not both.
+---
+--- A WHITELIST, not a blacklist: only a spec the caller means to STORE is accepted. A
+--- config-sourced spec belongs to the user's `setup{}` call, and a DISCOVERED one exists only for
+--- the session that found it — writing one would persist a connection whose password was never
+--- stored and cannot be resolved again.
+---@param options table
+---@param name string   -- the stored entry to replace or delete; appended when it is not there
+---@param spec dblens.ConnectionSpec?  -- nil deletes
+---@return boolean ok, string? error
+function M.put(options, name, spec)
+  assert(type(name) == 'string' and name ~= '', 'connections.put: needs the stored name')
+  assert(spec == nil or type(spec) == 'table', 'connections.put: spec must be a table or nil')
+  local stored, file_error = read_json_file(options.connections_file)
+  if file_error then
+    return false, file_error
+  end
+  stored = stored or {}
+  local index = index_of(stored, name)
+  if not index and not spec then
+    return false, ('no saved connection named `%s`'):format(name)
+  end
+  return apply(options, stored, index, spec)
 end
 
 --- Resolve a spec's password.
@@ -246,6 +516,70 @@ function M.resolve_secret(spec, options, on_done)
     end
     on_done(secret, nil)
   end)
+end
+
+---@class dblens.ConnectionHealth
+---@field state 'ok'|'broken'|'unknown'
+---@field reason string?  -- why it is broken, or what is deferred; nil when it is fine
+
+local OK = { state = 'ok' }
+
+--- Whether a connection could be opened right now, without opening it.
+---
+--- Reference resolution only, and only the side-effect-free half of it: an environment variable is
+--- read, a `password_cmd` is NOT run — running one at list time would fire a pinentry (or anything
+--- else the user put there) just for drawing a row. That one reports as `unknown` and is proved on
+--- connect. Nothing here talks to a database, and nothing here raises: a broken connection is a
+--- flag in the manager, never an error on every start.
+---@param spec dblens.ConnectionSpec
+---@param problem string?  -- the entry's validation problem, when the caller already has it
+---@return dblens.ConnectionHealth
+function M.health(spec, problem)
+  assert(type(spec) == 'table', 'connections.health: expected a spec')
+  local invalid = problem or M.validate(spec)
+  if invalid then
+    return { state = 'broken', reason = invalid }
+  end
+
+  local adapter = adapters.get(spec.kind)
+  local host, port = M.split_host_port(spec.host)
+  if host and adapter and adapter.fields then
+    for _, field in ipairs(adapter.fields) do
+      if field.name == 'port' then
+        return {
+          state = 'broken',
+          reason = ('host `%s` has the port in it: host `%s`, port %d'):format(
+            spec.host,
+            host,
+            port
+          ),
+        }
+      end
+    end
+  end
+
+  if spec.password_env then
+    local named = M.env_name_problem(spec.password_env)
+    if named then
+      return { state = 'broken', reason = named }
+    end
+    local value = vim.env[spec.password_env]
+    if value == nil or value == '' then
+      return { state = 'broken', reason = ('$%s is not set'):format(spec.password_env) }
+    end
+  end
+
+  if adapter and adapter.file and not spec.create then
+    local file = path_mod.expand(spec.path)
+    if file and vim.fn.filereadable(file) == 0 then
+      return { state = 'broken', reason = ('no such database file: %s'):format(spec.path) }
+    end
+  end
+
+  if spec.password_cmd then
+    return { state = 'unknown', reason = 'password comes from a command, checked on connect' }
+  end
+  return OK
 end
 
 --- Find a spec by name.

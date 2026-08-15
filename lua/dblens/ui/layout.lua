@@ -8,9 +8,10 @@ local api = vim.api
 local M = {}
 
 ---@class dblens.Layout
----@field tabpage integer?  -- nil only while `open` is still building it
+---@field tabpage integer?  -- nil while `open` is still building it, and while it is hidden
 ---@field wins table<string, integer>
----@field bufs table<string, integer>
+---@field bufs table<string, integer>  -- outlive the windows: hiding keeps them, closing deletes
+---@field views table<string, table>?  -- per-pane `winsaveview`, kept from hide to show
 
 local PANES = { 'sidebar', 'editor', 'results' }
 
@@ -152,6 +153,130 @@ function M.open(options)
   return layout
 end
 
+--- A buffer the user can be left looking at when dblens had the only tabpage, so the surviving
+--- window does not keep showing a dblens pane that is no longer live.
+---@return integer?  -- nil when there is nothing else loaded
+local function other_buffer(layout)
+  local mine = {}
+  for _, buf in pairs(layout.bufs or {}) do
+    mine[buf] = true
+  end
+  for _, buf in ipairs(api.nvim_list_bufs()) do
+    if not mine[buf] and api.nvim_buf_is_valid(buf) and vim.bo[buf].buflisted then
+      return buf
+    end
+  end
+  return nil
+end
+
+--- Drop every dblens window but one, for the case where closing the tabpage is not possible.
+---
+--- The survivor is handed back to the user, so the window options that do NOT revert with the
+--- buffer are undone here. `winfixwidth` is the one that bites: left set, the window silently
+--- refuses to be resized by `:vsplit` or `<C-w>=` long after dblens is gone.
+local function collapse_windows(layout)
+  local wins = {}
+  for _, pane in ipairs(PANES) do
+    local win = layout.wins[pane]
+    if win and api.nvim_win_is_valid(win) then
+      wins[#wins + 1] = win
+    end
+  end
+  for index = 2, #wins do
+    pcall(api.nvim_win_close, wins[index], true)
+  end
+  local survivor = wins[1]
+  if not survivor or not api.nvim_win_is_valid(survivor) then
+    return
+  end
+  vim.wo[survivor].winfixwidth = false
+  vim.wo[survivor].winfixheight = false
+  -- Hiding keeps the dblens buffers alive, so the survivor has to be moved off one of them or the
+  -- user is left staring at a pane that nothing is driving any more.
+  local other = other_buffer(layout)
+  if other then
+    pcall(api.nvim_win_set_buf, survivor, other)
+    return
+  end
+  pcall(api.nvim_win_call, survivor, function()
+    vim.cmd('enew')
+  end)
+end
+
+--- Close the dblens windows, leaving the buffers alone.
+---
+--- Restoring the user's windows is just dropping the tabpage: dblens never took one of theirs.
+local function release_windows(layout)
+  if not layout.tabpage or not api.nvim_tabpage_is_valid(layout.tabpage) then
+    layout.tabpage, layout.wins = nil, {}
+    return
+  end
+  -- Leaving the tab first avoids a redraw into a half-closed layout.
+  local ok, err = pcall(function()
+    if #api.nvim_list_tabpages() > 1 then
+      api.nvim_set_current_tabpage(layout.tabpage)
+      vim.cmd('tabclose')
+      return
+    end
+    collapse_windows(layout)
+  end)
+  if not ok then
+    vim.notify('dblens: could not close the layout windows: ' .. tostring(err), vim.log.levels.WARN)
+  end
+  layout.tabpage, layout.wins = nil, {}
+end
+
+--- Put the preserved buffers back on screen in a fresh tabpage.
+---
+--- The buffers are the state: the tree, every result tab's rows and the SQL the user typed all
+--- live in them, so showing again is a new set of WINDOWS over the same buffers — never new
+--- buffers, which would duplicate the UI and lose what was in it.
+---@param layout dblens.Layout
+---@param options table
+---@return boolean shown  -- false when a preserved buffer no longer exists, so a fresh open is due
+function M.show(layout, options)
+  assert(layout and layout.bufs, 'layout.show: expected a layout')
+  for _, pane in ipairs(PANES) do
+    local buf = layout.bufs[pane]
+    if not buf or not api.nvim_buf_is_valid(buf) then
+      return false
+    end
+  end
+  local views = layout.views or {}
+  local ok, err = pcall(build, layout, options)
+  if not ok then
+    M.close(layout)
+    error(err, 0)
+  end
+  for _, pane in ipairs(PANES) do
+    local view = views[pane]
+    if view and api.nvim_win_is_valid(layout.wins[pane]) then
+      api.nvim_win_call(layout.wins[pane], function()
+        vim.fn.winrestview(view)
+      end)
+    end
+  end
+  layout.views = nil
+  return true
+end
+
+--- Take the windows down and keep the buffers, so the layout can be shown again as it was.
+---@param layout dblens.Layout
+function M.hide(layout)
+  if not layout or not layout.tabpage then
+    return
+  end
+  local views = {}
+  for _, pane in ipairs(PANES) do
+    local win = layout.wins[pane]
+    if win and api.nvim_win_is_valid(win) then
+      views[pane] = api.nvim_win_call(win, vim.fn.winsaveview)
+    end
+  end
+  layout.views = views
+  release_windows(layout)
+end
+
 --- Apply the configured sidebar width and results share to the space actually available.
 function M.resize(layout, options)
   if not M.is_open(layout) then
@@ -206,29 +331,7 @@ function M.focus(layout, pane)
   return true
 end
 
---- Drop every dblens window but one, for the case where closing the tabpage is not possible.
----
---- The survivor is handed back to the user, so the window options that do NOT revert with the
---- buffer are undone here. `winfixwidth` is the one that bites: left set, the window silently
---- refuses to be resized by `:vsplit` or `<C-w>=` long after dblens is gone.
-local function collapse_windows(layout)
-  local wins = {}
-  for _, pane in ipairs(PANES) do
-    local win = layout.wins[pane]
-    if win and api.nvim_win_is_valid(win) then
-      wins[#wins + 1] = win
-    end
-  end
-  for index = 2, #wins do
-    pcall(api.nvim_win_close, wins[index], true)
-  end
-  if wins[1] and api.nvim_win_is_valid(wins[1]) then
-    vim.wo[wins[1]].winfixwidth = false
-    vim.wo[wins[1]].winfixheight = false
-  end
-end
-
---- Close the layout, restoring the user's windows by simply dropping the tabpage.
+--- Close the layout for good: the windows go, and so do the buffers holding its state.
 ---
 --- When dblens owns the only tabpage there is nothing to close back to, so the panes are
 --- collapsed to one window instead of leaving a three-way split of dead scratch buffers.
@@ -236,25 +339,7 @@ function M.close(layout)
   if not layout then
     return
   end
-  if layout.tabpage and api.nvim_tabpage_is_valid(layout.tabpage) then
-    -- Leaving the tab first avoids a redraw into a half-closed layout.
-    local ok, err = pcall(function()
-      if #api.nvim_list_tabpages() > 1 then
-        api.nvim_set_current_tabpage(layout.tabpage)
-        vim.cmd('tabclose')
-        return
-      end
-      collapse_windows(layout)
-    end)
-    -- The buffers still go, so the failure is partial rather than a hang; saying so beats
-    -- leaving the user with windows they cannot account for.
-    if not ok then
-      vim.notify(
-        'dblens: could not close the layout windows: ' .. tostring(err),
-        vim.log.levels.WARN
-      )
-    end
-  end
+  release_windows(layout)
   for _, buf in pairs(layout.bufs or {}) do
     if api.nvim_buf_is_valid(buf) then
       pcall(api.nvim_buf_delete, buf, { force = true })

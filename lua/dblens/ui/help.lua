@@ -7,7 +7,8 @@ local keymaps = require('dblens.keymaps')
 
 local M = {}
 
-local TITLE = { sidebar = 'Schema', results = 'Results', editor = 'SQL editor' }
+local TITLE =
+  { sidebar = 'Schema', results = 'Results', editor = 'SQL editor', connections = 'Connections' }
 local GUTTER = 4
 --- Screen cells left around the panel, so it reads as an overlay rather than a takeover.
 local MARGIN = 6

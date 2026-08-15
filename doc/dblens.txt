@@ -165,13 +165,62 @@ IN SETUP()                                          *dblens-connections-setup*
       },
     })
 <
+MANAGING CONNECTIONS                              *dblens-connections-manage*
+
+|:DbLensConnections| (`<leader>dc`) lists every connection dblens knows about:
+its engine, target, LOCKED/EDIT default, where its password comes from, and
+whether it could be opened RIGHT NOW. A flagged row carries the reason next to
+it — `$PGPASSWORD_PROD is not set`, `host `db:5432` has the port in it`, or
+whatever validation refused.
+
+The health check resolves the reference; it never opens the database. A
+`password_cmd` is NOT run for it (running one to draw a row could raise a
+passphrase prompt), so those rows report as unchecked and are proved when the
+connection opens.
+
+In the list: `<CR>` connects, `e` edits, `dd` deletes after a confirmation, `a`
+adds, `D` runs discovery, `R` re-checks, `?` shows the bindings. Deleting takes
+the connection out of the connections file, drops any live session on it, and
+clears the saved session so that it cannot be restored back into existence.
+
+A connection from `setup()` is listed but not editable there, and a discovered
+one is marked as such: it lives for this session only and is never written to
+disk. An entry the loader REFUSES is listed too — that is the one that has to
+be deleted, and it used to be invisible.
+
+The list holds whatever the connections file holds. An element that is not an
+object at all, a JSON `null`, an entry with no `name` or with a `name` that is
+not usable as one: each is a flagged row saying which position in the file it
+is and what is wrong, and `dd` deletes it from there. `e` on an entry with an
+unusable name asks for one and stores the repair; `<CR>` needs a name, so it
+says so instead of connecting to nothing.
+
+`e` and `dd` act on the row the cursor is on, addressed by its position in the
+file. Two entries under one name are two entries: deleting one leaves the
+other, and editing one changes only that one. `e` keeps every field of the
+entry it edits, including keys the form has no question for.
+
+|:DbLensRemove| takes a NAME, so it refuses a name two stored entries share —
+pick the one you mean in the manager.
+
 INTERACTIVELY                                        *dblens-connections-form*
 
 |:DbLensAdd| asks for the kind, a name, the adapter's fields, where the
-password comes from (none, an environment variable, or a command) and whether
-the connection is read-only, then saves it to the connections file.
-|:DbLensRemove| deletes it again. A connection declared in `setup()` cannot be
-removed there; remove it from your config.
+password comes from (none, the NAME of an environment variable, or a command)
+and whether the connection is read-only, then saves it to the connections
+file. |:DbLensRemove| deletes it again, and `e` in the manager edits one.
+A connection declared in `setup()` cannot be removed there; remove it from
+your config.
+
+The form normalises and refuses what cannot work:
+
+    - a host typed as `host:port` is split into the two fields; a host that
+      disagrees with a port given separately is refused rather than stored.
+    - `password_env` must be a variable NAME. `.env` is a file — discovery
+      reads those (|dblens-discovery|) — and a password typed there would be a
+      value dblens never stores, so both are refused with what to do instead.
+    - read-only is the first and default answer, and anything but an explicit
+      read-write choice leaves the connection LOCKED.
 
 PASSWORDS                                         *dblens-connections-secrets*
 
@@ -191,9 +240,12 @@ failure but never the command's output, because that output is the secret.
 Omitting both is correct for SQLite and for ambient authentication (.pgpass,
 peer, socket).
 
-The connections file is written with `rw-------` permissions. `:checkhealth`
-reports whether a connection has a password reference, never which variable
-and never its value.
+The connections file is written with `rw-------` permissions, set when the file
+is created rather than after. It is replaced atomically — a temp file beside
+it, flushed, renamed into place — so an interrupted or failed write leaves the
+file it had, never a truncated one, and never reports that it saved.
+`:checkhealth` reports whether a connection has a password reference, never
+which variable and never its value.
 
 DISCOVERY                                                   *dblens-discovery*
 
@@ -295,6 +347,19 @@ works.
 `:DbLens` opens a dedicated tab page with three panes: the schema tree on the
 left, the result grid top right, the SQL scratch buffer below it. With exactly
 one connection configured, dblens connects to it; with several, it asks.
+
+HIDING AND CLOSING                                       *dblens-usage-hiding*
+
+`q` in any dblens window, and |:DbLensToggle| turning it off, HIDE dblens: the
+windows go and your own layout comes back, but the instance stays. The
+connection stays open in whatever mode it was in, the schema tree keeps its
+expansion, every result tab keeps its rows, filter, sort and page, and the SQL
+buffer keeps what you typed. `<leader>dd` or `:DbLens` puts all of it back on
+screen — the same buffers, no reconnect, no second UI. A query still running
+when you hide keeps running, and its result is waiting in its tab.
+
+|:DbLensClose| is the other one, and the deliberate one: it ends the session,
+drops the buffers and releases everything. Leaving Neovim does the same.
 
 BROWSING                                               *dblens-usage-browsing*
 
@@ -480,7 +545,7 @@ GLOBAL                                                *dblens-mappings-global*
 Bound by `setup()`, in normal mode, reachable from anywhere.
 
     `<leader>dd`      toggle           Toggle dblens
-    `<leader>dc`      connections      Pick a connection
+    `<leader>dc`      connections      Manage connections
     `<leader>dq`      query            Focus the SQL editor
     `<leader>dt`      tables           Find a table
     `<leader>dh`      history          Query history
@@ -491,6 +556,19 @@ Bound by `setup()`, in normal mode, reachable from anywhere.
     `<leader>dC`      txn_commit       Commit transaction
     `<leader>dR`      txn_rollback     Roll back transaction
     `<leader>dP`      txn_pending      Show pending changes
+
+CONNECTIONS                                      *dblens-mappings-connections*
+
+Normal mode, in the connections manager (|dblens-connections-manage|).
+
+    `<CR>`            connect          Connect to this one
+    `e`               edit             Edit this connection
+    `dd`              delete           Delete this connection
+    `a`               add              Add a connection
+    `D`               discover         Find databases in this project
+    `R`               refresh          Re-check every connection
+    `?`               help             This help
+    `q`               close            Close the manager
 
 SIDEBAR                                              *dblens-mappings-sidebar*
 
@@ -508,7 +586,7 @@ Normal mode, in the schema tree.
     `I`               import           Import a CSV into the table
     `R`               refresh          Reload the schema
     `?`               help             This help
-    `q`               close            Close dblens
+    `q`               hide             Hide dblens, keeping the session
 
 RESULTS                                              *dblens-mappings-results*
 
@@ -546,7 +624,7 @@ Normal mode, in the result grid.
     `gi`              yank_insert      Yank the row as INSERT
     `X`               export           Export to a file
     `?`               help             This help
-    `q`               close            Close dblens
+    `q`               hide             Hide dblens, keeping the session
 
 EDITOR                                                *dblens-mappings-editor*
 
@@ -564,7 +642,7 @@ In the SQL scratch buffer. Normal mode unless marked.
     `<localleader>s`  save_snippet     Save as a snippet
     `<localleader>h`  history          Query history
     `<localleader>?`  help             This help
-    `<localleader>q`  close            Close dblens
+    `<localleader>q`  hide             Hide dblens, keeping the session
 
 ==============================================================================
 7. Commands                                                  *dblens-commands*
@@ -574,14 +652,17 @@ In the SQL scratch buffer. Normal mode unless marked.
                         Completes connection names.
 
                                                                 *:DbLensClose*
-:DbLensClose            Close dblens and restore the previous layout.
+:DbLensClose            Close dblens for good: end the session, drop its
+                        buffers and release everything. `q` and |:DbLensToggle|
+                        HIDE instead; see |dblens-usage-hiding|.
 
                                                                *:DbLensToggle*
-:DbLensToggle           Toggle dblens.
+:DbLensToggle           Show dblens, or hide it again with everything it
+                        holds. See |dblens-usage-hiding|.
 
                                                           *:DbLensConnections*
-:DbLensConnections      Open dblens, or show the connection picker if it is
-                        already open.
+:DbLensConnections      Manage saved connections: health, connect, edit,
+                        delete, add. See |dblens-connections-manage|.
 
                                                                   *:DbLensAdd*
 :DbLensAdd              Add a connection interactively. See
@@ -593,7 +674,9 @@ In the SQL scratch buffer. Normal mode unless marked.
 
                                                                *:DbLensRemove*
 :DbLensRemove {name}    Remove a saved connection. Completes connection names.
-                        A connection from `setup()` cannot be removed here.
+                        A connection from `setup()` cannot be removed here,
+                        and a name two stored entries share is refused: delete
+                        the one you mean in |:DbLensConnections|.
 
                                                                 *:DbLensWrite*
 :DbLensWrite            Open the active connection for editing. The next run
