@@ -316,3 +316,55 @@ describe('ui: the help overlay fits the screen', function()
     eq(found, true)
   end)
 end)
+
+--- The word LOCKED is identical on every engine, so the sentence next to it must not be. On the
+--- five strong engines the SERVER refuses the write; on mssql it does not, and telling the user it
+--- does is the one overclaim the whole best-effort framing exists to prevent.
+describe('app: what LOCKED is said to mean depends on the engine', function()
+  local function lock_message(session_mod, spec)
+    local app = require('dblens.app')
+    require('dblens.config').setup(scratch_options())
+    app.open()
+    local state = app.state()
+    assert(state, 'app.open left no state')
+    state.session = h.fake_session(session_mod, spec)
+    local said = {}
+    local notify = vim.notify
+    vim.notify = function(message)
+      said[#said + 1] = message
+    end
+    local ok, err = pcall(app.set_locked, true)
+    vim.notify = notify
+    app.close()
+    assert(ok, tostring(err))
+    return table.concat(said, '\n')
+  end
+
+  it('credits the server on a strong engine', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod)
+      local said = lock_message(session_mod, { kind = 'sqlite', path = '/tmp/dblens-test.db' })
+      eq(said:find('the server refuses every write', 1, true) ~= nil, true, {
+        fail_reason = 'a strong engine must still say the server refuses the write: ' .. said,
+      })
+    end)
+  end)
+
+  it('does not credit the server on mssql, and points at the hard boundary', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod)
+      local said = lock_message(session_mod, { kind = 'mssql', database = 'app' })
+      eq(said:find('the server refuses every write', 1, true), nil, {
+        fail_reason = 'mssql must never claim the server refuses the write: ' .. said,
+      })
+      eq(said:find('dblens refuses the writes it recognises', 1, true) ~= nil, true, {
+        fail_reason = 'mssql must say who is actually refusing: ' .. said,
+      })
+      eq(said:find('dblens%-safety%-mssql') ~= nil, true, {
+        fail_reason = 'mssql must point at the read-only-login section: ' .. said,
+      })
+    end)
+  end)
+end)

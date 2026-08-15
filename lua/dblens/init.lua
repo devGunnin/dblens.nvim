@@ -245,7 +245,8 @@ function M.write_mode()
   require('dblens.app').set_locked(false)
 end
 
---- Lock the active connection: the server refuses every write again.
+--- Lock the active connection: the server refuses every write again -- on mssql, where there is no
+--- such server switch, dblens refuses the writes it recognises instead (`:h dblens-safety-mssql`).
 function M.lock()
   M.ensure_setup()
   require('dblens.app').set_locked(true)

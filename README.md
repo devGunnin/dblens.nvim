@@ -66,7 +66,7 @@ write — see [Safety model](#safety-model).
 | PostgreSQL | `postgres` | `psql` | a pinned read-only transaction + session default | **strong** | live, 18.4 |
 | MySQL | `mysql` | `mysql` | a read-only transaction + read-only session | **strong** | live, 8.4 |
 | MariaDB | `mariadb` | `mariadb` | a read-only transaction + read-only session | **strong** | live, 11.8 |
-| SQL Server | `mssql` | `sqlcmd` | **dblens's own classifier** — see below | **best-effort** | live, 2022 |
+| SQL Server | `mssql` | `sqlcmd` | **dblens's own classifier** — see below | **best-effort (beta)** | live, 2022 |
 
 "Strength" is the one thing that is not the same across engines, so dblens states it everywhere it
 matters: `:checkhealth dblens`, the `:DbLensAdd` picker, and this table.
@@ -74,9 +74,19 @@ matters: `:checkhealth dblens`, the `:DbLensAdd` picker, and this table.
 **SQL Server is the exception, and it is not a small one.** SQL Server has no read-only
 transaction and no read-only connection mode, so a LOCKED `mssql` connection is enforced by
 dblens's classifier rather than by the engine — a bug in that classifier is a write, not a
-prompt. Read [SQL Server: a weaker lock](#sql-server-a-weaker-lock) before pointing a locked
-`mssql` connection at anything you care about. Every other engine's LOCKED mode is refused by the
-engine itself, where no classifier mistake can produce a write.
+prompt. Every other engine's LOCKED mode is refused by the engine itself, where no classifier
+mistake can produce a write.
+
+That classifier is a **blocklist of write verbs**, and dblens does not claim it is complete: it is
+a lexer, not SQL Server's parser, so an administrative statement it has not been taught about
+classifies as a read. `mssql` is therefore marked **best-effort (beta)** rather than strong, and
+that word is deliberate — it will not be promoted by adding more verbs, because no blocklist over
+a language this size can be proven exhaustive.
+
+**On SQL Server, connect as a read-only SQL login.** That is the only hard boundary, the server
+enforces it, and it is what dblens recommends for anything past an accidental keystroke — the
+recipe is in [SQL Server: a weaker lock](#sql-server-a-weaker-lock), which you should read before
+pointing a locked `mssql` connection at anything you care about.
 
 ## Requirements
 
@@ -240,7 +250,8 @@ require('dblens').setup({
 
     -- mssql: needs `database`. `trust_server_certificate` is for a dev server whose certificate
     -- is self-signed; ODBC Driver 18 encrypts by default and verifies it.
-    -- A LOCKED mssql connection is best-effort -- connect as a read-only SQL login.
+    -- A LOCKED mssql connection is best-effort (beta): the lock is dblens's own classifier, not
+    -- the engine. Connect as a read-only SQL login for a boundary the server enforces.
     {
       name = 'crm',
       kind = 'mssql',
@@ -538,7 +549,7 @@ statement is spelled:
 | DuckDB | nothing extra — `duckdb -readonly` is the file's open mode, so a write answers `Cannot execute statement of type "INSERT" … attached in read-only mode`. `-safe` is added too, and is **not** decoration: under `-readonly` alone, `COPY (SELECT 1) TO '/tmp/x.csv'` still wrote the file. Read-only covers the database; `-safe` covers the filesystem |
 | PostgreSQL | `BEGIN READ ONLY; DECLARE … CURSOR …;` around the run, plus `PGOPTIONS=-c default_transaction_read_only=on`. A write answers `cannot execute … in a read-only transaction` |
 | MySQL / MariaDB | `START TRANSACTION READ ONLY;` around the run, plus `--init-command=SET SESSION TRANSACTION READ ONLY`. A write answers `ERROR 1792 … Cannot execute statement in a READ ONLY transaction` |
-| SQL Server | there is no such switch — see [SQL Server: a weaker lock](#sql-server-a-weaker-lock) |
+| SQL Server | there is no such switch. LOCKED is best-effort (beta) here — see [SQL Server: a weaker lock](#sql-server-a-weaker-lock), and connect as a [read-only SQL login](#connect-as-a-read-only-sql-login) for a boundary the server enforces |
 
 On MySQL and MariaDB **both** the transaction and the session switch are load-bearing, and
 neither alone is enough. Inside a bare `START TRANSACTION READ ONLY`, `CREATE TABLE` and
@@ -564,6 +575,13 @@ locked connection.
 
 ### SQL Server: a weaker lock
 
+> **`mssql` locked mode is best-effort, and beta.** dblens does not claim it blocks every write on
+> SQL Server, and it will not make that claim later: the lock is a blocklist of verbs over a
+> language dblens does not parse, so an administrative or DBCC statement it has not been taught
+> about is a write rather than a refusal. **For a hard read-only boundary on SQL Server, connect
+> as a read-only SQL login** ([recipe below](#connect-as-a-read-only-sql-login)) — the server
+> enforces that one, the way it does on the other five engines.
+
 **A LOCKED `mssql` connection is enforced by dblens, not by SQL Server.** Everything above rests
 on the engine refusing the write. SQL Server gives no way to ask for that:
 
@@ -573,7 +591,7 @@ on the engine refusing the write. SQL Server gives no way to ask for that:
   connection because it is the truthful thing to declare, **not** because it enforces anything:
   verified live on SQL Server 2022 that an `INSERT` sent under it lands.
 
-So on `mssql`, LOCKED is three client-side refusals, and a bug in any of them is a write rather
+So on `mssql`, LOCKED is four client-side refusals, and a bug in any of them is a write rather
 than a prompt:
 
 1. **the classifier** — anything dblens cannot prove is a read is refused as a write. This is the
@@ -602,6 +620,21 @@ than a prompt:
 **What none of that covers:** anything the classifier does not recognise as a write. It is a
 lexer, not SQL Server's parser, and on this engine there is no second layer that refuses.
 
+That is not hypothetical. `SELECT 1 DBCC TRACEON(3999,-1)` classified as a *read*, ran clean on a
+LOCKED connection and flipped a global trace flag from 0 to 1 — server-wide, across databases, and
+still set on a brand-new connection. It survived the rolled-back wrap below because DBCC is not
+transactional, so the trailing `ROLLBACK` had nothing to undo. `DBCC FREEPROCCACHE` and `DBCC
+DROPCLEANBUFFERS` landed the same way; `BACKUP`, `RESTORE`, `DENY` and `CHECKPOINT` reached the
+server and were saved only by the wrap.
+
+dblens now refuses the administrative verbs it knows — `DBCC`, `BACKUP`, `RESTORE`, `DENY`,
+`CHECKPOINT`, `RECONFIGURE`, `KILL`, `SHUTDOWN`, `WRITETEXT`, `UPDATETEXT`, `DISABLE`, `ENABLE`
+and `RECEIVE`, on top of the ordinary write verbs — and every payload above is refused at the gate
+(re-verified live on 2022: the trace flag stays 0). **Read that as defence in depth, not as a
+completeness claim.** T-SQL has more state-changing verbs than dblens knows about, and the next
+one dblens has not been taught behaves exactly the way `DBCC` did. This is why `mssql` is
+best-effort and stays best-effort. If that matters to you, the next section is the answer.
+
 Underneath those, a locked run is wrapped in `SET XACT_ABORT ON; BEGIN TRANSACTION; … IF
 @@TRANCOUNT > 0 ROLLBACK TRANSACTION;`. That is a **net, not a guarantee**, and its limit was
 measured rather than assumed:
@@ -619,14 +652,31 @@ is not, so a run that committed its own net away is reported as an error instead
 Where the net simply holds, `sqlcmd` exits 0 and dblens reports success for a write that was
 rolled back: the safe failure, not a correct one.
 
-**Connect as a read-only SQL login.** That is the boundary SQL Server does have, and it is the
-only one:
+#### Connect as a read-only SQL login
+
+That is the boundary SQL Server does have, it is the only one, and on this engine it is the
+recommended way to run dblens rather than a hardening extra. The server refuses the write, so no
+classifier gap — the DBCC one above included — can produce one:
 
 ```sql
 CREATE LOGIN dblens_ro WITH PASSWORD = '…';
 CREATE USER dblens_ro FOR LOGIN dblens_ro;
+
+-- either the role, which covers every table and view in the database:
 ALTER ROLE db_datareader ADD MEMBER dblens_ro;
+-- or, narrower, just what this user should see:
+GRANT SELECT ON SCHEMA::dbo TO dblens_ro;
+
 DENY EXECUTE TO dblens_ro;   -- also blocks the procedures below
+```
+
+Point the connection at it and keep `read_only = true`: the login is what makes the write
+impossible, and dblens's own lock stays on as the layer that catches the keystroke before it is
+sent.
+
+```lua
+{ name = 'crm', kind = 'mssql', host = 'sql.internal', user = 'dblens_ro',
+  database = 'crm', password_env = 'MSSQL_RO_PASSWORD', read_only = true },
 ```
 
 Two more things differ on `mssql` and are worth knowing before you trust a cell:
@@ -1014,6 +1064,11 @@ error reporting have much thinner live coverage everywhere — please report wha
   side-channel refusal matches names and a `SECURITY DEFINER` wrapper defeats it; a database
   [read-only role](#a-database-read-only-role-the-hard-boundary) is the hard boundary. Both are
   spelled out, with what each does and does not cover, in the safety model above.
+- **SQL Server's locked mode is best-effort (beta)**, enforced by dblens rather than the engine:
+  a verb blocklist over a language dblens does not parse, so it cannot be proven complete against
+  every administrative statement. Connect as a
+  [read-only SQL login](#connect-as-a-read-only-sql-login) for a hard boundary, and read
+  [SQL Server: a weaker lock](#sql-server-a-weaker-lock) first.
 
 ## Troubleshooting
 

@@ -374,6 +374,27 @@ end
 -- ---------------------------------------------------------------------------
 -- connection
 
+--- Said once, on connecting a LOCKED connection whose lock is not the engine's own refusal.
+---
+--- The sidebar, winbar and statusline all print `LOCKED` identically on every engine, and on SQL
+--- Server that word is a client-side verb blocklist rather than a promise. A user who never runs
+--- `:checkhealth` would otherwise never learn the difference. Not a startup notification: it
+--- fires only for the connection it is true of, and only when that connection is opened locked.
+local function warn_if_best_effort(session)
+  local enforcement = session.adapter.read_only_enforcement
+  if not session:is_read_only() or enforcement.strength == 'strong' then
+    return
+  end
+  M.notify(
+    ('`%s`: LOCKED is best-effort here - dblens refuses the writes it recognises, the '):format(
+      session.spec.name
+    )
+      .. 'server does not. Connect as a read-only login for a hard boundary '
+      .. '(:h dblens-safety-mssql)',
+    vim.log.levels.WARN
+  )
+end
+
 --- Connect by name, replacing any current session.
 ---@param name string
 ---@param on_ready fun()?  runs once the schema and its first level of relations are loaded
@@ -411,6 +432,7 @@ function M.connect(name, on_ready)
       return
     end
     state.session = session
+    warn_if_best_effort(session)
     state.tree.expanded[tree.connection_id()] = true
     loader.schemas(
       session,
@@ -901,8 +923,17 @@ function M.set_locked(locked)
     M.error(err)
     return
   end
+  -- Not one message with the engine's name swapped in: on a best-effort engine the SERVER is not
+  -- the one refusing, so saying it does would be the overclaim `LOCKED` already invites.
+  local strong = session.adapter.read_only_enforcement.strength == 'strong'
+  local locked_message = strong
+      and ('`%s` is locked - the server refuses every write'):format(session.spec.name)
+    or ('`%s` is locked - dblens refuses the writes it recognises; the server does not '):format(
+        session.spec.name
+      )
+      .. '(:h dblens-safety-mssql)'
   M.notify(
-    want and ('`%s` is locked - the server refuses every write'):format(session.spec.name)
+    want and locked_message
       or ('`%s` is open for editing - writes still confirm'):format(session.spec.name)
   )
   M.render()

@@ -457,6 +457,49 @@ local WRITE_VERBS = {
   REVOKE = { destructive = true },
 }
 
+--- T-SQL statement verbs that change server or database state and are NOT verbs on any other
+--- engine dblens drives. Kept apart from `WRITE_VERBS` because on T-SQL a write verb counts
+--- ANYWHERE but the head (`statement_separator_optional`), so listing them globally would refuse
+--- an ordinary column named `backup` or `enable` on five engines that have no such statement.
+---
+--- Several of these are NON-TRANSACTIONAL, which is why they matter more here than the rest:
+--- `DBCC TRACEON(3999,-1)` flipped a global trace flag on a LOCKED connection and the wrap's
+--- trailing ROLLBACK did not undo it (verified live on SQL Server 2022). Defence in depth for the
+--- verbs we know; the classifier is a blocklist and can never be proven complete, which is why
+--- mssql's `read_only_enforcement.strength` is `best-effort`.
+---
+--- Non-writing T-SQL words (`PRINT`, `THROW`, `RAISERROR`, `DECLARE`, `OPEN`, `FETCH`, `WAITFOR`)
+--- are deliberately absent: refusing them buys nothing and costs ordinary reads.
+local TSQL_WRITE_VERBS = {
+  DBCC = {},
+  BACKUP = {},
+  CHECKPOINT = {},
+  RECONFIGURE = {},
+  ENABLE = {},
+  RESTORE = { destructive = true },
+  DENY = { destructive = true },
+  KILL = { destructive = true },
+  SHUTDOWN = { destructive = true },
+  WRITETEXT = { destructive = true },
+  UPDATETEXT = { destructive = true },
+  DISABLE = { destructive = true },
+  RECEIVE = { destructive = true },
+}
+
+--- A verb's write entry under `dialect`, or nil when the verb does not write there.
+---@param verb string  already upper-cased
+---@param dialect dblens.Dialect?
+local function write_verb(verb, dialect)
+  local entry = WRITE_VERBS[verb]
+  if entry then
+    return entry
+  end
+  if dialect and dialect.statement_separator_optional == true then
+    return TSQL_WRITE_VERBS[verb]
+  end
+  return nil
+end
+
 --- Leading verbs that can begin a provable read. `scan` marks the ones whose tail can carry a
 --- data-modifying CTE or subquery, so the whole statement has to be swept.
 ---
@@ -765,7 +808,7 @@ local function analyse(toks, depth, d)
   local verb = first.text:upper()
   local unread = { read = false, destructive = false, verb = verb, explain_analyze = false }
 
-  local write = WRITE_VERBS[verb]
+  local write = write_verb(verb, d)
   if write then
     unread.destructive = write.destructive == true
     return unread
@@ -825,7 +868,7 @@ local function analyse(toks, depth, d)
   for index, t in ipairs(toks) do
     if t.type == 'word' then
       local word = t.text:upper()
-      local hidden = read.scan and WRITE_VERBS[word]
+      local hidden = read.scan and write_verb(word, d)
       if hidden and M.opens_statement(toks, index, d) then
         unread.destructive = hidden.destructive == true
         return unread
@@ -916,10 +959,13 @@ end
 
 --- Whether a bare word is a verb that writes. Used to vet fragments, like a filter predicate,
 --- where there is no leading verb to classify.
+---
+--- Dialect-sensitive: the T-SQL admin verbs write only on T-SQL, and are names elsewhere.
 ---@param word string
+---@param dialect dblens.Dialect?
 ---@return boolean
-function M.is_write_verb(word)
-  return WRITE_VERBS[tostring(word):upper()] ~= nil
+function M.is_write_verb(word, dialect)
+  return write_verb(tostring(word):upper(), dialect) ~= nil
 end
 
 --- mysql client commands that reach the filesystem, a shell, or the lexer's own framing. They

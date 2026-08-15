@@ -110,12 +110,20 @@ end
 --- What a LOCKED connection means PER ENGINE. Reported as a warning where it is best-effort,
 --- because the word "read-only" reads the same in the UI for all of them and is not the same
 --- promise: on SQL Server the refusal is dblens's own classifier, not the engine.
+---
+--- The STRENGTH is in the line, not only in the ok/warn colour, so a copied `:checkhealth` report
+--- still says which engines are guaranteed and which are best-effort.
 local function check_read_only()
   health.start('Read-only enforcement')
   for _, kind in ipairs(adapters.kinds()) do
     local adapter = assert(adapters.get(kind), 'health: a registered kind must resolve')
     local enforcement = adapter.read_only_enforcement
-    local line = ('%s [%s]: %s'):format(adapter.label, enforcement.mechanism, enforcement.summary)
+    local line = ('%s [%s, %s]: %s'):format(
+      adapter.label,
+      enforcement.strength,
+      enforcement.mechanism,
+      enforcement.summary
+    )
     if enforcement.strength == 'strong' then
       health.ok(line)
     else
@@ -162,6 +170,7 @@ local function check_connections(options)
   local from_config, from_file = by_source.config or 0, by_source.file or 0
   local counts = ('%d from setup{}, %d from file'):format(from_config, from_file)
   health.ok(('%d connection(s): %s'):format(#specs, counts))
+  local best_effort = {}
   for _, spec in ipairs(specs) do
     local adapter = adapters.get(spec.kind)
     local strength = adapter and adapter.read_only_enforcement.strength or 'unknown'
@@ -169,6 +178,20 @@ local function check_connections(options)
     -- them, and on SQL Server it is a classifier rather than the engine.
     local access = spec.read_only and ('read-only (%s)'):format(strength) or 'writable'
     health.info(('%s [%s] %s, %s'):format(spec.name, spec.kind, access, describe_secret(spec)))
+    if spec.read_only and strength ~= 'strong' then
+      best_effort[#best_effort + 1] = spec.name
+    end
+  end
+  -- Named per connection rather than per engine: the user reads their own connection here, and a
+  -- locked one whose lock is a client-side blocklist should not look like the guaranteed ones.
+  if #best_effort > 0 then
+    health.warn(
+      ("locked but only best-effort: %s -- the lock is dblens's verb classifier, a blocklist "):format(
+        table.concat(best_effort, ', ')
+      )
+        .. 'that cannot be proven complete against every administrative statement. Connect as a '
+        .. 'read-only database login for a boundary the server enforces (:h dblens-safety-mssql)'
+    )
   end
   -- Surfaced where a user reviews their connections, because "read-only" above reads stronger
   -- than it is: it stops every ordinary write, not a deliberate dblink/UDF one.

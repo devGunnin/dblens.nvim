@@ -94,7 +94,8 @@ function Session:is_read_only()
   return self.locked == true
 end
 
---- The one label for the connection's mode. LOCKED means the server refuses every write.
+--- The one label for the connection's mode. LOCKED means the server refuses every write -- except
+--- on mssql, where it means dblens does and the server does not (see the header).
 ---@return 'LOCKED'|'EDIT'
 function Session:mode()
   return self:is_read_only() and 'LOCKED' or 'EDIT'

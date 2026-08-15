@@ -298,6 +298,91 @@ describe('mssql: LOCKED is the classifier, and the tests say so', function()
     end
   end)
 
+  --- THE VERBS THAT LANDED. Every payload here classified as a READ, ran clean through
+  --- `Session:run` on a LOCKED connection and reached SQL Server 2022 -- and the three DBCC ones
+  --- LANDED, because DBCC is not transactional so the wrap's trailing ROLLBACK is a no-op against
+  --- it: `SELECT 1 DBCC TRACEON(3999,-1)` flipped global trace flag 3999 from 0 to 1 and it
+  --- survived a brand-new connection. Re-verified live against 2022 after the fix: refused at the
+  --- gate, flag still 0, and no backup file written.
+  it(
+    'refuses the T-SQL administrative verbs, which are writes with no transaction to undo them',
+    function()
+      local sqlmod = require('dblens.sql')
+      local session = locked_session()
+      for _, payload in ipairs({
+        'SELECT 1 DBCC TRACEON(3999,-1)',
+        'SELECT 1 DBCC FREEPROCCACHE',
+        'SELECT 1 DBCC DROPCLEANBUFFERS',
+        "SELECT 1 BACKUP DATABASE app TO DISK='/var/opt/mssql/x.bak'",
+        "SELECT 1 RESTORE DATABASE app FROM DISK='/var/opt/mssql/x.bak'",
+        'SELECT 1 DENY SELECT ON victim TO probeuser',
+        'SELECT 1 CHECKPOINT',
+        'SELECT 1 RECONFIGURE',
+        'SELECT 1 KILL 55',
+        'SELECT 1 SHUTDOWN',
+        'SELECT 1 WRITETEXT victim.note @p 0x41',
+        'SELECT 1 UPDATETEXT victim.note @p 0 0 0x41',
+        'SELECT 1 DISABLE TRIGGER tr ON victim',
+        'SELECT 1 ENABLE TRIGGER tr ON victim',
+        'SELECT 1 RECEIVE * FROM q',
+        'DBCC TRACEON(3999,-1)',
+      }) do
+        eq(sqlmod.single_statement_problem(payload), nil, {
+          fail_reason = ('%s: the framing rule cannot see this, which is the point'):format(
+            payload
+          ),
+        })
+        eq(sqlmod.classify(payload, sqlmod.dialects.mssql).write, true, {
+          fail_reason = ('%s must classify as a write on T-SQL'):format(payload),
+        })
+        eq(type(session:gate(payload)), 'string', {
+          fail_reason = ('%s reached the client on a locked mssql connection'):format(payload),
+        })
+      end
+    end
+  )
+
+  --- The verb list above is T-SQL's, and none of these words is a statement on the five engines
+  --- whose lock is the ENGINE's. Sweeping them everywhere would refuse an ordinary column named
+  --- `backup` or `enable` and buy nothing, so this pins the scoping rather than the intent.
+  it('leaves the same words as ordinary names on every other engine', function()
+    local sqlmod = require('dblens.sql')
+    for _, kind in ipairs({ 'postgres', 'mysql', 'mariadb', 'sqlite', 'duckdb' }) do
+      local d = get(kind).dialect
+      for _, payload in ipairs({
+        'SELECT backup FROM t',
+        'SELECT enable, disable FROM t',
+        'SELECT kill FROM t WHERE receive = 1',
+        'SELECT checkpoint, dbcc FROM t',
+      }) do
+        eq(sqlmod.classify(payload, d).write, false, {
+          fail_reason = ('%s must still read `%s`'):format(kind, payload),
+        })
+      end
+    end
+  end)
+
+  --- THE HONEST LABEL, pinned as a test so it cannot drift back. Adding the verbs above is
+  --- DEFENCE IN DEPTH, not a completeness claim: the classifier is a blocklist over a language
+  --- dblens does not parse, and SQL Server offers no read-only transaction to fall back on. If a
+  --- later change calls this lock `strong`, this fails -- which is the point.
+  it(
+    'still calls the mssql lock best-effort, because a blocklist cannot be proven complete',
+    function()
+      local enforcement = get('mssql').read_only_enforcement
+      eq(enforcement.strength, 'best-effort')
+      h.neq(enforcement.strength, 'strong')
+      eq(enforcement.mechanism, 'classifier')
+      -- The summary is what `:checkhealth` and the picker print, so the caveat has to live in it.
+      eq(enforcement.summary:find('BETA', 1, true) ~= nil, true, {
+        fail_reason = 'the mssql summary must say it is beta: ' .. enforcement.summary,
+      })
+      eq(enforcement.summary:find('read-only SQL login', 1, true) ~= nil, true, {
+        fail_reason = 'the mssql summary must name the hard boundary: ' .. enforcement.summary,
+      })
+    end
+  )
+
   --- Defence in depth, and named as such: the wrap ROLLS BACK rather than refusing, so it is what
   --- catches a classifier miss, not what makes the connection read-only.
   it('wraps a locked run in a transaction it rolls back', function()

@@ -2,6 +2,10 @@
 ---
 --- READ THIS BEFORE TRUSTING A LOCKED mssql CONNECTION. It is the ONE engine dblens supports
 --- whose LOCKED mode is not enforced by the engine, and it must never be presented as if it were.
+--- Its lock is BEST-EFFORT (beta) and dblens does not claim it is complete: the classifier is a
+--- blocklist of verbs, so an unlisted state-changing verb is a write rather than a refusal. For a
+--- hard read-only boundary on SQL Server, connect as a read-only SQL login (recipe at the bottom
+--- of this header). Everything below is what best-effort buys, and where it stops.
 ---
 --- Every other adapter can point at something the SERVER does: sqlite and duckdb open the file
 --- read-only, postgres/mysql/mariadb send the run inside a read-only transaction the server
@@ -32,6 +36,12 @@
 ---
 --- WHAT IT STILL DOES NOT COVER: anything the classifier does not recognise as a write. It is a
 --- lexer, not SQL Server's parser, and on this engine there is no second layer that refuses.
+--- The known administrative verbs are listed (`TSQL_WRITE_VERBS` in `sql.lua`: DBCC, BACKUP,
+--- RESTORE, DENY, CHECKPOINT, RECONFIGURE, KILL, SHUTDOWN, WRITETEXT, UPDATETEXT, DISABLE,
+--- ENABLE, RECEIVE) because `SELECT 1 DBCC TRACEON(3999,-1)` classified as a READ and flipped a
+--- global trace flag on a LOCKED connection -- verified live on 2022, and the wrap below did not undo
+--- it because DBCC is not transactional. That list is DEFENCE IN DEPTH, not a completeness
+--- claim: T-SQL has more verbs than dblens knows, and the next unlisted one behaves the same way.
 ---
 --- `read_only_script` additionally wraps a locked run in a transaction that is ROLLED BACK. That
 --- is defence in depth, not the guarantee, and the limit was measured rather than assumed:
@@ -45,9 +55,15 @@
 ---    them. The batch THROWs when it finds the transaction gone, so such a run is reported as a
 ---    failure rather than a success.
 ---
---- THE HARD BOUNDARY IS A READ-ONLY SQL LOGIN. Connect as a login granted `db_datareader` and
---- denied everything else when the threat model is anything more than an accidental keystroke.
---- See README and `:h dblens-safety-mssql`.
+--- THE HARD BOUNDARY IS A READ-ONLY SQL LOGIN, and it is the one dblens recommends here:
+---
+---     CREATE LOGIN dblens_ro WITH PASSWORD = '...';
+---     CREATE USER dblens_ro FOR LOGIN dblens_ro;
+---     ALTER ROLE db_datareader ADD MEMBER dblens_ro;   -- or: GRANT SELECT TO dblens_ro;
+---     DENY EXECUTE TO dblens_ro;
+---
+--- The server then refuses the write, which is what every other engine gives for free. See README
+--- and `:h dblens-safety-mssql`.
 local common = require('dblens.adapters.common')
 local protocol = require('dblens.protocol')
 local sql = require('dblens.sql')
@@ -75,9 +91,10 @@ local M = {
   read_only_enforcement = {
     mechanism = 'classifier',
     strength = 'best-effort',
-    summary = 'SQL Server has no read-only transaction or connection mode, so LOCKED is dblens'
-      .. "'s own classifier plus a rolled-back transaction -- connect as a read-only SQL login "
-      .. 'for a real boundary',
+    summary = 'BETA. SQL Server has no read-only transaction or connection mode, so LOCKED is '
+      .. "dblens's own verb classifier plus a rolled-back transaction. It is a blocklist, so it "
+      .. 'cannot guarantee every administrative or DBCC statement is refused -- connect as a '
+      .. 'read-only SQL login (db_datareader, DENY EXECUTE) for a boundary the server enforces',
   },
   fields = {
     { name = 'host', label = 'Host', default = 'localhost' },
