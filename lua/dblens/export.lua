@@ -15,12 +15,17 @@ local protocol = require('dblens.protocol')
 local M = {}
 
 --- RFC 4180: quote when the value contains a delimiter, quote or newline; double inner quotes.
+---
+--- An EMPTY STRING is quoted and NULL is not. RFC 4180 has no NULL, so quoting is the only thing
+--- that can tell the two apart — the convention sqlite3, psql and `COPY ... CSV` all follow, and
+--- what `dblens.csv` reads back on import. Written the other way round, a table holding an empty
+--- string came back from its own export as NULL.
 local function csv_field(cell)
   if cell == protocol.NULL or cell == nil then
     return ''
   end
   local text = tostring(cell)
-  if text:find('[",\r\n]') then
+  if text == '' or text:find('[",\r\n]') then
     return '"' .. text:gsub('"', '""') .. '"'
   end
   return text

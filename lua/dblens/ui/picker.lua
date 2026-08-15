@@ -348,7 +348,8 @@ function M.discovered(state, candidates, report)
 end
 
 --- Fuzzy-find a table across every loaded schema.
-function M.tables(state)
+---@param on_choose fun(relation: dblens.Relation)?  -- browses the table by default
+function M.tables(state, on_choose)
   local session = state.session
   if not session then
     require('dblens.app').notify('not connected')
@@ -365,7 +366,7 @@ function M.tables(state)
   M.select(state, {
     title = 'Tables',
     items = items,
-    on_choose = function(relation)
+    on_choose = on_choose or function(relation)
       require('dblens.app').open_relation(relation)
     end,
   })

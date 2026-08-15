@@ -90,6 +90,13 @@ local COMMANDS = {
     { desc = 'Reopen the last dblens session' },
   },
   {
+    'DbLensImport',
+    function()
+      require('dblens').import()
+    end,
+    { desc = 'Import a CSV file into a table' },
+  },
+  {
     'DbLensFormat',
     function(args)
       -- A range is only honoured when one was typed: `:DbLensFormat` alone must not format the

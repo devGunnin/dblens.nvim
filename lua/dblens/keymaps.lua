@@ -136,6 +136,13 @@ M.specs = {
       mode = 'n',
       group = 'table',
     },
+    {
+      action = 'import',
+      lhs = 'I',
+      desc = 'Import a CSV into the table',
+      mode = 'n',
+      group = 'table',
+    },
     { action = 'refresh', lhs = 'R', desc = 'Reload the schema', mode = 'n', group = 'table' },
     { action = 'help', lhs = '?', desc = 'This help', mode = 'n', group = 'window' },
     { action = 'close', lhs = 'q', desc = 'Close dblens', mode = 'n', group = 'window' },

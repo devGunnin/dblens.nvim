@@ -407,6 +407,39 @@ as a complete one. Where a query result cannot be re-read
 safely - several statements, or one that writes - the rows already fetched are
 written and the shortfall is stated the same way.
 
+An empty string is written QUOTED (`""`) and SQL NULL is written empty, which
+is the only thing that tells the two apart in CSV and what the import below
+reads back. sqlite3, psql and `COPY ... CSV` write them the same way.
+
+                                                       *dblens-usage-import*
+`I` in the tree imports a CSV file into that table; `:DbLensImport` does the
+same for the table in the grid, or one picked from the list. This is the only
+place data from OUTSIDE the database is written into it, so it is the most
+guarded thing dblens does:
+
+  * EDIT MODE ONLY. A LOCKED connection is refused before a file is even
+    asked for, and the session gate refuses every statement again anyway.
+  * The path substitutes `~` and `$VAR` textually and evaluates nothing - no
+    shell sees it - and the file is parsed by dblens itself, to RFC 4180:
+    quoted fields, embedded commas, newlines and doubled quotes. A malformed
+    file is an error naming the line, and nothing runs.
+  * CSV columns are matched to table columns by HEADER NAME (case-insensitively
+    where that is unambiguous). A header naming a column the table does not
+    have is refused, never dropped or guessed at; columns the file does not
+    mention keep their default, and the preview says which those are.
+  * Every value becomes a QUOTED LITERAL. A cell holding `'); DROP TABLE x;--`
+    is imported as that string - it is data, not syntax.
+  * The row count, the mapping and a sample of the generated INSERTs are shown
+    and must be confirmed before anything runs.
+  * The run is ONE transaction (the deferred batch |dblens-transactions| uses).
+    If any row fails, NOTHING is imported and the message names the row. There
+    is no partial import.
+
+`import.max_rows` caps the rows one import may insert and `import.max_bytes`
+the size of the file that will be read; both refuse rather than importing part
+of a file. An import cannot start while other changes are queued - commit or
+roll those back first, so the two are never tied together.
+
 ==============================================================================
 6. Mappings                                                  *dblens-mappings*
 
@@ -449,6 +482,7 @@ Normal mode, in the schema tree.
     `c`               row_count        Count rows
     `D`               ddl              Show the DDL
     `X`               export           Export the table to a file
+    `I`               import           Import a CSV into the table
     `R`               refresh          Reload the schema
     `?`               help             This help
     `q`               close            Close dblens
@@ -574,6 +608,11 @@ In the SQL scratch buffer. Normal mode unless marked.
 :DbLensHelp             Show every binding that applies in the current pane.
                         The same overlay `?` opens.
 
+                                                               *:DbLensImport*
+:DbLensImport           Import a CSV file into a table: the one the grid is
+                        browsing, or one picked from the list. EDIT mode only.
+                        See |dblens-usage-import|.
+
                                                                *:DbLensFormat*
 :DbLensFormat           Format the SQL buffer through the detected formatter.
                         Takes a range: `:'<,'>DbLensFormat` formats those lines
@@ -638,6 +677,13 @@ Every option with its default: >lua
         -- {} detects sqlfluff, pg_format or sqlformat, in that order. An argv
         -- ARRAY picks one; never a shell string. See |dblens-usage-format|.
         command = {},
+      },
+
+      import = {
+        -- Rows one CSV import may insert, and the largest file that is read
+        -- at all. Both REFUSE rather than importing part of a file.
+        max_rows  = 10000,
+        max_bytes = 16 * 1024 * 1024,
       },
 
       history = {

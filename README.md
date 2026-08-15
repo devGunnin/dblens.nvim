@@ -192,6 +192,12 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 - Edit a cell, insert a row (by editing the generated `INSERT`), delete a row.
 - Every change is previewed as the exact SQL that will run before it runs.
 - Yank a cell, a row as CSV, as JSON, or as an `INSERT`.
+- **Import a CSV into a table** (`I` in the tree, or `:DbLensImport`) — EDIT mode only, refused on
+  a LOCKED connection. The file is parsed by dblens (RFC 4180: quoted fields, embedded commas,
+  newlines and quotes), mapped to the table's columns by header name, and every value becomes a
+  QUOTED literal — a cell holding `'); DROP TABLE x;--` is imported as that string. The row count,
+  the mapping and a sample of the generated `INSERT`s are shown for confirmation first, and the
+  run is ONE transaction: if any row fails, nothing is imported and the failing row is named.
 - Export to CSV, JSON or `.sql` `INSERT` statements — the whole result from the grid (`X`), or a
   whole table from the tree (`X`). A table export is ONE statement in one client invocation, so
   the file is a SNAPSHOT: a write that lands while it runs belongs to the next export, never to
@@ -414,6 +420,11 @@ require('dblens').setup({
     command = {},
   },
 
+  import = {
+    max_rows  = 10000,            -- rows one CSV import may insert; past it the import is refused
+    max_bytes = 16 * 1024 * 1024, -- largest CSV file that will be read at all
+  },
+
   export = {
     max_rows   = 1000000,         -- hard cap on a streamed export; reaching it STOPS it and says so
   },
@@ -514,6 +525,7 @@ pane it belongs to is first opened.
 | `:DbLensCommit` | Commit the transaction |
 | `:DbLensRollback` | Roll back the transaction |
 | `:DbLensPending` | Show the pending changes |
+| `:DbLensImport` | Import a CSV file into a table (EDIT mode only, previewed, one transaction) |
 | `:DbLensFormat` | Format the SQL buffer, or the `:'<,'>` range, through the detected formatter |
 | `:DbLensRestore` | Reopen the last saved session |
 | `:DbLensHelp` | Show every binding for the current pane |
@@ -560,6 +572,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `c` | `row_count` | Count rows |
 | `D` | `ddl` | Show the DDL |
 | `X` | `export` | Export the table to a file |
+| `I` | `import` | Import a CSV into the table |
 | `R` | `refresh` | Reload the schema |
 | `?` | `help` | This help |
 | `q` | `close` | Close dblens |

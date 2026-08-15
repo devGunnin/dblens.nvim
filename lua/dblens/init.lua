@@ -259,6 +259,30 @@ function M.lock()
   require('dblens.app').set_locked(true)
 end
 
+--- Import a CSV file into a table: the one the grid is browsing, or one picked from the list.
+---
+--- EDIT mode only, previewed and confirmed, and run as a single transaction — see
+--- `dblens.ui.importer` for what each of those means.
+function M.import()
+  M.ensure_setup()
+  local app = require('dblens.app')
+  if not app.is_open() then
+    app.open()
+  end
+  local state = app.state()
+  if not state then
+    return
+  end
+  local source = state.grid.source
+  if source and source.kind == 'relation' then
+    require('dblens.ui.importer').start(state, source.relation)
+    return
+  end
+  require('dblens.ui.picker').tables(state, function(relation)
+    require('dblens.ui.importer').start(state, relation)
+  end)
+end
+
 --- Format the SQL editor buffer, or the given line range of it, through the detected formatter.
 ---
 --- Does not open dblens: there is no editor buffer to format until it is open, and opening one to

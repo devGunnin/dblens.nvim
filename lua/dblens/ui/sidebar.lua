@@ -240,6 +240,9 @@ local function handlers(state, app)
     export = with_relation(function(node)
       require('dblens.ui.exporter').prompt_relation(state, node.relation)
     end),
+    import = with_relation(function(node)
+      require('dblens.ui.importer').start(state, node.relation)
+    end),
     refresh = function()
       if not state.session then
         return

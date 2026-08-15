@@ -45,6 +45,11 @@ M.defaults = {
   --- is spawned directly, gets the SQL on stdin, and only reformats text.
   format = { command = {} },
 
+  --- Importing a CSV into a table (`:DbLensImport`). EDIT mode only. `max_rows` caps the rows one
+  --- import may insert, `max_bytes` the file it will read: both refuse loudly rather than
+  --- importing part of a file.
+  import = { max_rows = 10000, max_bytes = 16 * 1024 * 1024 },
+
   history = { enabled = true, max_entries = 500 },
   --- Restoring reconnects, so it is opt-in: nothing reaches a database on startup by default.
   session = { restore = false, auto_save = true },
@@ -272,6 +277,8 @@ local function validate(options)
   positive_int(options.max_bytes, 'max_bytes')
   positive_int(options.timeout_ms, 'timeout_ms')
   positive_int(options.export.max_rows, 'export.max_rows')
+  positive_int(options.import.max_rows, 'import.max_rows')
+  positive_int(options.import.max_bytes, 'import.max_bytes')
   positive_int(options.history.max_entries, 'history.max_entries')
   positive_int(options.discovery.max_depth, 'discovery.max_depth')
   positive_int(options.discovery.max_entries, 'discovery.max_entries')
