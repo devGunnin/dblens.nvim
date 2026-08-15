@@ -580,6 +580,16 @@ end
 ---@param report dblens.DiscoveryReport
 local function offer(candidates, report)
   local root = vim.fn.fnamemodify(report.root, ':~')
+  -- A drop is never silent: a workspace file describing something dblens refuses to open (a path
+  -- above the root, a value a client would read as an option) is exactly what a user wants told.
+  if report.skipped > 0 then
+    M.notify(
+      ('%d thing%s this project describes could not be offered safely'):format(
+        report.skipped,
+        report.skipped == 1 and '' or 's'
+      )
+    )
+  end
   if #candidates == 0 then
     M.notify(('found no databases under %s - add one with :DbLensAdd'):format(root))
     return

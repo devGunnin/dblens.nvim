@@ -325,7 +325,9 @@ The scan is bounded and asynchronous: at most `discovery.max_depth` levels deep 
 `discovery.max_entries` directory entries, skipping `.git`, `node_modules`, `vendor`, `target`,
 `dist`, `build`, `.venv`, `__pycache__` and the other heavy directories, a few directories per
 tick so the editor stays responsive, and cancellable with the usual cancel key. It never follows a
-symlink, so it cannot read anything outside the project.
+symlink, so it cannot read anything outside the project — and a database file that a `.env`
+*names* outside the project (`sqlite:///../elsewhere.db`) is dropped rather than offered, so the
+same boundary holds however the path was written.
 
 ### What discovery does not do
 
@@ -336,6 +338,10 @@ symlink, so it cannot read anything outside the project.
   refuses writes until you `:DbLensWrite`.
 - **It executes nothing it finds.** Discovery reads files. A `docker-compose.yml` is parsed, never
   run; a `.env` is read, never sourced.
+- **What a workspace file says is untrusted.** A candidate is validated before it is offered, and
+  a value that a database client would read as an *option* rather than as data (a host, user,
+  database or path starting with `-`) is refused, so a cloned repository cannot steer the client
+  dblens spawns. Anything dropped is reported alongside what was found.
 - **A discovered password is never written anywhere.** A password parsed out of a `DATABASE_URL`
   or a compose file is held in memory for that editor session only, and a discovered connection is
   **session-only**: it is never added to the connections file, so the file cannot receive a secret

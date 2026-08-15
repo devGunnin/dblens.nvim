@@ -420,6 +420,82 @@ describe('security: the filter bar', function()
   end)
 end)
 
+--- Discovery builds specs out of files in a cloned repo, so a connection field is untrusted text
+--- that ends up in a client's argv. A client reads a leading `-` as an OPTION wherever it sits, so
+--- an unchecked field is a flag the adapter's own flags cannot override: `--host=attacker.example`
+--- redirects the connection (and the password) and `--local-infile=1` re-enables the file read the
+--- adapter disabled one argument earlier. Reproduced against mysql and mariadb, which carried no
+--- such rule while postgres and mssql did.
+describe('security: a discovered value cannot become a client option', function()
+  --- Every spelling of the attack, per engine: the option-with-value form, the bare short flag,
+  --- and the switch that defeats the adapter's own hardening.
+  local INJECTIONS = { '--host=attacker.example.com', '-X', '--local-infile=1' }
+
+  --- A spec that validates on every server engine, so a failure is the injected field alone.
+  local function base(kind)
+    return { kind = kind, name = 'c', host = 'localhost', user = 'u', database = 'app' }
+  end
+
+  it('is refused by validate, for every engine and every field that reaches argv', function()
+    for _, kind in ipairs({ 'postgres', 'mysql', 'mariadb', 'mssql' }) do
+      local adapter = get(kind)
+      eq(adapter.validate(base(kind)), nil, { fail_reason = kind .. ': the clean spec must pass' })
+      for _, field in ipairs({ 'host', 'user', 'database' }) do
+        for _, payload in ipairs(INJECTIONS) do
+          local spec = base(kind)
+          spec[field] = payload
+          eq(type(adapter.validate(spec)), 'string', {
+            fail_reason = ('%s accepted `%s` as `%s`'):format(kind, payload, field),
+          })
+        end
+      end
+    end
+  end)
+
+  it('is refused for the file-backed engines, whose path is a bare positional', function()
+    -- sqlite3 and duckdb have no end-of-options form the plugin can rely on across the versions
+    -- it supports, so the value check is the whole defence and it runs before any client is spawned.
+    for _, kind in ipairs({ 'sqlite', 'duckdb' }) do
+      local adapter = get(kind)
+      eq(adapter.validate({ kind = kind, name = 'c', path = '/tmp/ok.db' }), nil)
+      for _, payload in ipairs({ '-readonly', '--evil', '-X' }) do
+        eq(type(adapter.validate({ kind = kind, name = 'c', path = payload })), 'string', {
+          fail_reason = ('%s accepted the path `%s`'):format(kind, payload),
+        })
+      end
+    end
+  end)
+
+  it('is refused when only the EXPANDED path starts with a dash', function()
+    local previous = vim.env.DBLENS_TEST_EVIL_DIR
+    vim.env.DBLENS_TEST_EVIL_DIR = '--evil'
+    local problem = get('sqlite').validate({
+      kind = 'sqlite',
+      name = 'c',
+      path = '$DBLENS_TEST_EVIL_DIR/x.db',
+    })
+    vim.env.DBLENS_TEST_EVIL_DIR = previous
+    eq(type(problem), 'string', { fail_reason = 'a $VAR expanding to an option was accepted' })
+  end)
+
+  it('never lets an injected value reach argv, even if validation were bypassed', function()
+    for _, kind in ipairs({ 'mysql', 'mariadb' }) do
+      local clients = { mysql = 'mysql', mariadb = 'mariadb' }
+      local spec = { kind = kind, database = '--local-infile=1', read_only = true }
+      local ok = pcall(get(kind).command, spec, nil, 'records', clients)
+      eq(ok, false, { fail_reason = kind .. ' built an argv from an option-like database' })
+    end
+  end)
+
+  --- The database is bound to its option rather than trailing as a positional, so even a value
+  --- that somehow got past validate is data to `my_getopt`, which splits at the first `=`.
+  it('binds the mysql database to its option instead of trailing it', function()
+    local argv = get('mysql').command({ database = 'app' }, nil, 'raw', CLIENTS).argv
+    eq(h.has(argv, '--database=app'), true)
+    eq(h.has(argv, 'app'), false, { fail_reason = 'the database is still a bare positional' })
+  end)
+end)
+
 describe('security: secrets', function()
   local SECRET = 'hunter2-s3cr3t'
 

@@ -9,8 +9,10 @@
 ---  * it never persists anything. `to_spec` builds an ordinary spec WITHOUT the password, so the
 ---    connections file cannot receive a secret this module read out of a `.env`. A discovered
 ---    password lives in the candidate, in memory, for as long as the session that used it;
----  * it never reads outside the workspace and never follows a symlink (see `files.lua`), and the
----    walk is bounded in depth, entries, hits and wall-clock time.
+---  * it never reads outside the workspace and never follows a symlink. The walk only descends and
+---    skips symlinks (`files.lua`); a path a `.env` NAMES is confined to the root by `finalize`,
+---    which drops a candidate resolving above it. The walk is bounded in depth, entries, hits and
+---    wall-clock time.
 local compose_mod = require('dblens.discovery.compose')
 local connections = require('dblens.connections')
 local env_mod = require('dblens.discovery.env')
@@ -42,7 +44,7 @@ local ORIGIN_RANK = { file = 1, compose = 2, env = 3 }
 ---@field root string
 ---@field stats dblens.ScanStats
 ---@field read integer     -- compose and `.env` files read
----@field skipped integer  -- candidates dropped because they did not validate
+---@field skipped integer  -- candidates dropped: invalid, or pointing outside the workspace
 
 --- The workspace root: the git repository the path is in, else the path itself.
 ---@param start string?  -- defaults to the editor's working directory
@@ -200,21 +202,62 @@ local function read_all(hits)
   return out
 end
 
---- Drop duplicates and anything that would not validate as a connection, and give every survivor
---- a unique name and a provenance line.
+---@param anchor string  -- normalized, no trailing slash
+---@param path string
+---@return boolean
+local function under(anchor, path)
+  return path == anchor or path:sub(1, #anchor + 1) == anchor .. '/'
+end
+
+--- Whether a discovered file path stays inside the workspace, before AND after symlink resolution.
+---
+--- The walk cannot leave the root — it descends and refuses symlinks — but a `sqlite:///../x.db`
+--- in a `.env` resolves wherever it likes, which made "never reads above the workspace root" false.
+--- Both spellings of the root are anchors because `M.root` normalizes and `files.scan` realpaths;
+--- on a system where the root sits under a symlinked prefix only one of them matches.
+---@param root string
+---@param path string
+---@return boolean
+local function within_root(root, path)
+  local raw = vim.fs.normalize(root)
+  local real = vim.fs.normalize(vim.uv.fs_realpath(root) or root)
+  local resolved = vim.fs.normalize(vim.uv.fs_realpath(path) or path)
+  return (under(raw, path) or under(real, path)) and (under(raw, resolved) or under(real, resolved))
+end
+
+--- Why a candidate cannot be offered, or nil when it can.
+---@param candidate dblens.RawCandidate
+---@param name string
+---@param root string
+---@return string? problem
+local function candidate_problem(candidate, name, root)
+  -- Validated against the same rules a hand-written connection passes, so a candidate the user
+  -- can pick is one dblens can actually open -- and so no discovered value reaches a client argv
+  -- as an option.
+  local problem = connections.validate(M.to_spec(candidate, name))
+  if problem then
+    return problem
+  end
+  if candidate.target.path and not within_root(root, candidate.target.path) then
+    return ('`%s` is outside the workspace'):format(candidate.target.path)
+  end
+  return nil
+end
+
+--- Drop duplicates and anything that cannot be offered, and give every survivor a unique name and
+--- a provenance line.
 ---@param raw dblens.RawCandidate[]
 ---@param taken table<string, boolean>
+---@param root string
 ---@return dblens.Candidate[] candidates, integer skipped
-local function finalize(raw, taken)
+local function finalize(raw, taken, root)
   local out, seen, skipped = {}, {}, 0
   for _, candidate in ipairs(raw) do
     local key = identity(candidate)
     if not seen[key] then
       seen[key] = true
       local name = unique_name(candidate.name, taken)
-      -- Validated here, against the same rules a hand-written connection passes, so a candidate
-      -- the user can pick is one dblens can actually open.
-      if connections.validate(M.to_spec(candidate, name)) then
+      if candidate_problem(candidate, name, root) then
         skipped = skipped + 1
         taken[name] = nil
       else
@@ -272,7 +315,7 @@ function M.scan(opts, on_done)
       return a.name < b.name
     end)
 
-    local candidates, skipped = finalize(raw, taken)
+    local candidates, skipped = finalize(raw, taken, opts.root)
     on_done(candidates, {
       root = opts.root,
       stats = stats,

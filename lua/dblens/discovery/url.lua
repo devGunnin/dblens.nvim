@@ -55,6 +55,31 @@ local function file_target(kind, rest)
   return { kind = kind, path = path }
 end
 
+--- Where the authority ends: the first `/`, unless an unencoded `/` sits inside the password.
+---
+--- `user:pa/ss@host/db` is invalid per RFC 3986 but routine in a real `.env` — random and base64
+--- secrets carry `/` — and splitting on the first one framed the password as the host, so the
+--- user's actual database never appeared. The authority is extended to the last `@` only when the
+--- part before the first `/` opened a userinfo and did not close it, so an ordinary `@` in a path
+--- is left alone.
+---@param rest string  -- query already removed
+---@return integer? slash  -- nil when the whole of `rest` is the authority
+local function authority_end(rest)
+  local slash = rest:find('/', 1, true)
+  if not slash then
+    return nil
+  end
+  local head = rest:sub(1, slash - 1)
+  if head:find('@', 1, true) or not head:find(':', 1, true) then
+    return slash
+  end
+  local at = rest:find('@[^@]*$')
+  if not at or at < slash then
+    return slash
+  end
+  return rest:find('/', at + 1, true)
+end
+
 --- Split `//user:pass@host:port/db?query` into its three parts, the leading `//` already gone.
 ---@return string authority, string path, string query
 local function split_authority(rest)
@@ -63,7 +88,7 @@ local function split_authority(rest)
   if question then
     query, rest = rest:sub(question + 1), rest:sub(1, question - 1)
   end
-  local slash = rest:find('/', 1, true)
+  local slash = authority_end(rest)
   if not slash then
     return rest, '', query
   end

@@ -58,6 +58,11 @@ function M.expand(raw)
   if expanded == '' then
     return nil, ('path expands to nothing: %s'):format(raw)
   end
+  if expanded:sub(1, 1) == '-' then
+    -- The raw check above is not enough: `$DIR/x.db` with `DIR=--evil` expands into an option.
+    -- sqlite3 and duckdb take the file as a bare positional and have no end-of-options form.
+    return nil, ('path expands to a value starting with `-`: %s'):format(raw)
+  end
   return expanded, nil
 end
 

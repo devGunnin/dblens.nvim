@@ -159,6 +159,28 @@ local function unquote(value)
   return value:match('^"(.*)"$') or value:match("^'(.*)'$") or value
 end
 
+--- Every item of a sequence-valued key, in either YAML spelling.
+---
+--- `ports: ["5432:5432"]` (inline flow) is at least as common as the block form, and reading only
+--- the block form made the commonest compose file in the world discover nothing at all.
+---@param lines dblens.ComposeLine[]
+---@param entry dblens.ComposeEntry
+---@return string[]
+local function sequence_items(lines, entry)
+  local out = list_items(lines, entry.from, entry.to)
+  local inline = entry.value:match('^%[(.*)%]$')
+  if not inline then
+    return out
+  end
+  for part in inline:gmatch('[^,]+') do
+    local item = vim.trim(part)
+    if item ~= '' then
+      out[#out + 1] = item
+    end
+  end
+  return out
+end
+
 --- Substitute `${VAR}`, `${VAR:-default}` and `$VAR` from the compose file's own `.env` values,
 --- then the editor's environment. An unresolved reference makes the whole value nil: a literal
 --- `${DB_PASSWORD}` is not a password, and passing it on would produce a candidate that lies.
@@ -209,7 +231,7 @@ local function service_environment(lines, entry, vars)
       out[key] = resolved
     end
   end
-  for _, item in ipairs(list_items(lines, entry.from, entry.to)) do
+  for _, item in ipairs(sequence_items(lines, entry)) do
     local key, value = unquote(item):match('^([%w_.]+)=(.*)$')
     put(key, value)
   end
@@ -244,7 +266,7 @@ end
 ---@return integer?
 local function host_port(lines, entry, vars, default_port)
   local first = nil
-  for _, item in ipairs(list_items(lines, entry.from, entry.to)) do
+  for _, item in ipairs(sequence_items(lines, entry)) do
     local resolved = interpolate(item, vars)
     if resolved then
       local host, container = published(resolved)
