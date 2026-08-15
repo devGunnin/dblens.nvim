@@ -68,18 +68,25 @@ Session.__index = Session
 
 ---@param spec dblens.ConnectionSpec
 ---@param options table
+---@param opts { secret: string? }?
+--- `opts.secret` is a password the CALLER resolved, for a connection whose secret has no
+--- reference to resolve — a discovered one, whose password came out of a workspace file. It stays
+--- in this session and in nothing else: the spec does not carry it, so it cannot be persisted.
 ---@return dblens.Session? session, string? error
-function M.new(spec, options)
+function M.new(spec, options, opts)
   local adapter, err = adapters.get(spec.kind)
   if not adapter then
     return nil, err
   end
+  local given = opts and opts.secret or nil
+  assert(given == nil or type(given) == 'string', 'session.new: secret must be a string')
   return setmetatable({
     spec = spec,
     adapter = adapter,
     options = options,
     catalog = catalog.new(adapter.caps.schemas),
     txn = txn.new(),
+    given_secret = given,
     secret = nil,
     connected = false,
     jobs = {},
@@ -167,11 +174,8 @@ function Session:connect(on_done)
     end
   end
 
-  connections.resolve_secret(self.spec, self.options, function(secret, err)
-    if err then
-      on_done(false, err)
-      return
-    end
+  --- Prove the connection works before the UI shows anything.
+  local function probe(secret)
     self.secret = secret
     self:run('SELECT 1', {}, function(_, run_err)
       if run_err then
@@ -181,6 +185,18 @@ function Session:connect(on_done)
       self.connected = true
       on_done(true, nil)
     end)
+  end
+
+  if self.given_secret then
+    probe(self.given_secret)
+    return
+  end
+  connections.resolve_secret(self.spec, self.options, function(secret, err)
+    if err then
+      on_done(false, err)
+      return
+    end
+    probe(secret)
   end)
 end
 
@@ -188,6 +204,7 @@ end
 function Session:close()
   self:cancel_all()
   self.secret = nil
+  self.given_secret = nil
   self.connected = false
   self.catalog:clear()
   self.txn:reset()

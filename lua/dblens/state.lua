@@ -62,6 +62,11 @@ function M.snapshot(state)
   if not state or not state.session then
     return nil
   end
+  -- A discovered connection exists only for the session that found it, so remembering its name
+  -- would restore into "the saved connection no longer exists" on the next start.
+  if state.session.spec.source == 'discovered' then
+    return nil
+  end
   local source = state.grid.source
   local relation = source and source.kind == 'relation' and source.relation or nil
   return {

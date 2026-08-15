@@ -20,6 +20,7 @@ anything it cannot prove is a read as a write.
 - [Quickstart](#quickstart)
 - [Supported databases](#supported-databases)
 - [Connections](#connections)
+- [Discovery](#discovery)
 - [Configuration](#configuration)
 - [Commands](#commands)
 - [Keymaps](#keymaps)
@@ -129,7 +130,9 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 ## Quickstart
 
-1. `:DbLensAdd` — pick a kind, name the connection, and fill in its fields. A `sqlite` or `duckdb`
+1. `:DbLens` in a project that has a database — with nothing configured, dblens offers what it
+   finds in it (see [Discovery](#discovery)); pick one and it opens read-only. Or `:DbLensAdd` to
+   name a connection yourself: pick a kind, name it, fill in its fields. A `sqlite` or `duckdb`
    connection needs only a file path.
 2. `:DbLens` — opens on that connection (or asks, with more than one configured). The schema tree
    is on the left; `:DbLensTables` jumps straight to a table by name.
@@ -145,6 +148,9 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 **Browse**
 
+- Workspace discovery: the databases the project in front of you has — a gitignored
+  `db/dev.sqlite3`, a compose service, a `DATABASE_URL` — offered with their provenance, read-only
+  and on demand ([Discovery](#discovery)).
 - Schema tree: connection -> schema -> table/view -> columns, indexes, constraints.
 - Primary key, foreign key, NOT NULL and type shown per column.
 - `SHOW CREATE TABLE` / `sqlite_schema` DDL where the server has it, reconstructed from the
@@ -290,6 +296,54 @@ SQLite and for ambient auth (`.pgpass`, peer, socket).
 The connections file is written `rw-------`. `:checkhealth dblens` reports whether a connection
 has a password reference, never which variable and never its value.
 
+## Discovery
+
+`:DbLensDiscover` looks through the project you are in and offers the databases it appears to
+have. Opening dblens with no connection configured does the same thing instead of telling you to
+add one, so a repository with a database in it is one keystroke from open.
+
+The workspace is the git repository the working directory is in, or the working directory itself.
+Three things are read there:
+
+| Source | What is found |
+| --- | --- |
+| Database files | `*.db` `*.sqlite` `*.sqlite3` `*.sqlite2` `*.duckdb` `*.ddb`, by a bounded walk of the project — **including gitignored ones**, which is what a dev database usually is. The file's magic header decides between SQLite and DuckDB; an ambiguous `.db` with no header is treated as SQLite. |
+| `docker-compose*.yml`, `compose*.yml` | Services whose image is postgres/mysql/mariadb/mssql, with the host port they publish and the user, database and password from their `environment`. `${VAR}` is resolved from the `.env` beside the compose file. A service that publishes no host port is not offered — nothing could connect to it. |
+| `.env`, `.env.*` | Every value that parses as a connection URL (`postgres://`, `postgresql://`, `mysql://`, `mariadb://`, `sqlite:///…`, `duckdb://…`), plus a `PG*` or `MYSQL_*` variable group that names a database. `.env.example` and friends are skipped: they hold placeholders. |
+
+Each candidate shows where it came from, so you can tell a real database from a guess:
+
+```text
+db/dev.sqlite3          (sqlite, file)
+app-db                  (postgres, localhost:5433/shopdb, from docker-compose.yml)
+DATABASE_URL            (postgres, localhost:5432/appdb, from .env)
+Add manually…           the :DbLensAdd form
+Rescan                  look through the project again
+```
+
+The scan is bounded and asynchronous: at most `discovery.max_depth` levels deep and
+`discovery.max_entries` directory entries, skipping `.git`, `node_modules`, `vendor`, `target`,
+`dist`, `build`, `.venv`, `__pycache__` and the other heavy directories, a few directories per
+tick so the editor stays responsive, and cancellable with the usual cancel key. It never follows a
+symlink, so it cannot read anything outside the project.
+
+### What discovery does not do
+
+- **It never connects on its own.** Nothing is scanned until you open dblens or run
+  `:DbLensDiscover`, nothing is connected until you pick a candidate, and `setup{}` starts
+  nothing. With exactly one candidate the picker starts on it — you still press `<CR>`.
+- **A discovered connection opens LOCKED**, like every other connection: the database itself
+  refuses writes until you `:DbLensWrite`.
+- **It executes nothing it finds.** Discovery reads files. A `docker-compose.yml` is parsed, never
+  run; a `.env` is read, never sourced.
+- **A discovered password is never written anywhere.** A password parsed out of a `DATABASE_URL`
+  or a compose file is held in memory for that editor session only, and a discovered connection is
+  **session-only**: it is never added to the connections file, so the file cannot receive a secret
+  discovery read. To keep one, `:DbLensAdd` it, which asks where its password comes from
+  (`password_env` / `password_cmd`) rather than storing one.
+
+Turn the offer-on-open off with `discovery = { auto = false }`; `:DbLensDiscover` still works.
+
 ## Configuration
 
 Every option, with its default. All of it is optional.
@@ -313,6 +367,12 @@ require('dblens').setup({
     confirm_destructive = true,   -- preview + confirm UPDATE/DELETE/DROP/TRUNCATE/ALTER/...
     confirm_write       = false,  -- also gate non-destructive writes (INSERT/CREATE/...)
     read_only_default   = true,   -- applied to connections that do not set `read_only` themselves
+  },
+
+  discovery = {
+    auto        = true,           -- opening dblens with NO connection offers what a scan finds
+    max_depth   = 6,              -- how deep into the project the scan walks
+    max_entries = 20000,          -- directory entries examined before the scan stops and says so
   },
 
   history = {
@@ -402,6 +462,7 @@ pane it belongs to is first opened.
 | `:DbLensHistory` | Browse query history |
 | `:DbLensSnippets` | Browse saved snippets |
 | `:DbLensAdd` | Add a connection interactively |
+| `:DbLensDiscover` | Find databases in this project and offer them (see [Discovery](#discovery)) |
 | `:DbLensRemove {name}` | Remove a saved connection (completes names) |
 | `:DbLensWrite` | Open the active connection for editing |
 | `:DbLensLock` | Lock the active connection read-only |

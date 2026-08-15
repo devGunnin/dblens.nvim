@@ -30,6 +30,11 @@ M.defaults = {
     read_only_default = true,
   },
 
+  --- Workspace database discovery (`:DbLensDiscover`). `auto` only decides whether opening
+  --- dblens with NO connection configured offers what a scan finds; nothing is ever connected
+  --- without the user picking it, and nothing is scanned until dblens is opened.
+  discovery = { auto = true, max_depth = 6, max_entries = 20000 },
+
   history = { enabled = true, max_entries = 500 },
   --- Restoring reconnects, so it is opt-in: nothing reaches a database on startup by default.
   session = { restore = false, auto_save = true },
@@ -241,6 +246,8 @@ local function validate(options)
   positive_int(options.max_bytes, 'max_bytes')
   positive_int(options.timeout_ms, 'timeout_ms')
   positive_int(options.history.max_entries, 'history.max_entries')
+  positive_int(options.discovery.max_depth, 'discovery.max_depth')
+  positive_int(options.discovery.max_entries, 'discovery.max_entries')
   one_of(options.completion.keyword_case, 'completion.keyword_case', { 'upper', 'lower', 'keep' })
   validate_ui(options.ui)
   validate_keymaps(options.keymaps)

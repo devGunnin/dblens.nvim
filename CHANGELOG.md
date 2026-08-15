@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Workspace discovery** (`:DbLensDiscover`): dblens offers the databases the project in front of
+  you has, with where each one came from. It reads database files by a bounded walk — gitignored
+  ones included, which is what a dev database usually is, and the magic header rather than the
+  extension decides SQLite from DuckDB — plus `docker-compose*.yml` services and `.env`
+  connection URLs and variable groups. Opening dblens with no connection configured offers what a
+  scan finds instead of "add one"; `discovery.auto = false` turns that off.
+  - Nothing is scanned until dblens is opened or the command is run, nothing connects without the
+    user picking it, and a discovered connection opens **LOCKED** like every other connection.
+  - A discovered connection is **session-only** and a password read out of a `.env` or a compose
+    file stays in memory for that session: `connections.save` now writes only `source = 'file'`
+    specs, so nothing discovery reads can reach the connections file.
+  - The walk never follows a symlink and never reads above the workspace root, and is bounded in
+    depth, entries, hits and wall-clock time, a few directories per tick.
+
 ## [1.0.0] - 2026-08-15
 
 First release.

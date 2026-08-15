@@ -134,6 +134,10 @@ local function build_state(options)
     layout = nil,
     session = nil,
     specs = {},
+    --- Passwords discovery read out of a workspace file, by connection name. Memory only, for as
+    --- long as this UI is open: no spec carries them, so nothing can write them anywhere.
+    secrets = {},
+    discovering = false,
     tree = { expanded = {}, loading = {}, nodes = {} },
     grid = {
       source = nil,
@@ -180,7 +184,7 @@ end
 
 --- Open the UI. With no name, picks the sole connection, restores, or shows the picker.
 ---@param name string?
----@param opts { restore: boolean? }?
+---@param opts { restore: boolean?, discover: boolean? }?
 function M.open(name, opts)
   local options = config.get()
   if M.is_open() then
@@ -199,7 +203,7 @@ function M.open(name, opts)
   end
 
   M.render()
-  M.choose_connection(name, opts and opts.restore)
+  M.choose_connection(name, opts)
 end
 
 --- Build everything a live UI owns: the specs, the layout, the spinner, the pane bindings and
@@ -264,22 +268,33 @@ end
 --- Restoring reconnects, so it only happens when the user asked for it: either `:DbLensRestore`
 --- or `session.restore = true`.
 ---@param name string?
----@param force_restore boolean?
-function M.choose_connection(name, force_restore)
+---@param opts { restore: boolean?, discover: boolean? }?
+function M.choose_connection(name, opts)
+  opts = opts or {}
   if name then
     M.connect(name)
     return
   end
-  if (force_restore or state.options.session.restore) and M.restore_saved() then
+  if opts.discover then
+    M.discover()
     return
   end
-  if force_restore then
+  if (opts.restore or state.options.session.restore) and M.restore_saved() then
+    return
+  end
+  if opts.restore then
     M.notify('no saved session to restore')
   end
 
   local specs = state.specs
   if #specs == 0 then
-    M.notify('no connections configured - add one with :DbLensAdd')
+    -- Nothing configured is the case discovery exists for: offer what the project has instead of
+    -- a dead end. It still only OFFERS — the user picks, and nothing is scanned until now.
+    if state.options.discovery.auto then
+      M.discover()
+      return
+    end
+    M.notify('no connections configured - add one with :DbLensAdd or :DbLensDiscover')
     return
   end
   if #specs == 1 then
@@ -417,7 +432,10 @@ function M.connect(name, on_ready)
   state.grid =
     vim.tbl_extend('force', state.grid, { source = nil, result = nil, error = nil, message = nil })
 
-  local session, err = session_mod.new(spec, state.options)
+  -- Only a discovered connection has a secret held here: every other spec resolves its own from
+  -- the reference it carries, and nothing but discovery ever puts a value in this table.
+  local secret = spec.source == 'discovered' and state.secrets[spec.name] or nil
+  local session, err = session_mod.new(spec, state.options, { secret = secret })
   if not session then
     M.error(err)
     return
@@ -520,6 +538,121 @@ function M.load_relation_details(relation, on_done)
       end
     end)
   )
+end
+
+-- ---------------------------------------------------------------------------
+-- discovery
+
+--- Put a discovered spec in the live list, replacing the one a previous scan left under the same
+--- name. A collision with a CONFIGURED connection is refused: `:DbLens name` must never open a
+--- different database than the name has always meant.
+---@param spec dblens.ConnectionSpec
+---@return string? error
+local function adopt_discovered(spec)
+  for index, existing in ipairs(state.specs) do
+    if existing.name == spec.name then
+      if existing.source ~= 'discovered' then
+        return ('a connection named `%s` already exists'):format(spec.name)
+      end
+      state.specs[index] = spec
+      return nil
+    end
+  end
+  state.specs[#state.specs + 1] = spec
+  return nil
+end
+
+--- Names a scan must not hand out. A rescan legitimately finds the same databases again, so a
+--- discovered connection does not reserve its own name; every other one does.
+---@return string[]
+local function reserved_names()
+  local taken = {}
+  for _, spec in ipairs(state.specs) do
+    if spec.source ~= 'discovered' then
+      taken[#taken + 1] = spec.name
+    end
+  end
+  return taken
+end
+
+--- Show what a finished scan found, or say why there is nothing to show.
+---@param candidates dblens.Candidate[]
+---@param report dblens.DiscoveryReport
+local function offer(candidates, report)
+  local root = vim.fn.fnamemodify(report.root, ':~')
+  if #candidates == 0 then
+    M.notify(('found no databases under %s - add one with :DbLensAdd'):format(root))
+    return
+  end
+  -- A bounded scan that stopped early has found SOME of them, and saying so is the difference
+  -- between "your project has these" and "these are the ones it got to".
+  if report.stats.truncated then
+    M.notify(('the scan of %s hit its limit, so this may not be all of them'):format(root))
+  end
+  require('dblens.ui.picker').discovered(state, candidates, report)
+end
+
+--- Scan the workspace and offer what it finds.
+---
+--- On-demand only: nothing here runs at startup or from `setup{}`, nothing is connected without
+--- the user picking it, and what is picked opens LOCKED like every other connection.
+function M.discover()
+  if not M.is_open() then
+    M.open(nil, { discover = true })
+    return
+  end
+  if state.discovering then
+    M.notify('already looking for databases in this project')
+    return
+  end
+  local discovery = require('dblens.discovery')
+  state.discovering = true
+  set_busy('discovering', nil)
+  local job = discovery.scan(
+    {
+      root = discovery.root(),
+      taken = reserved_names(),
+      bounds = {
+        max_depth = state.options.discovery.max_depth,
+        max_entries = state.options.discovery.max_entries,
+      },
+    },
+    live(function(candidates, report)
+      state.discovering = false
+      set_busy(nil, nil)
+      if report.stats.error then
+        M.error(report.stats.error)
+        return
+      end
+      if not report.stats.cancelled then
+        offer(candidates, report)
+      end
+    end)
+  )
+  track(job)
+end
+
+--- Connect to something discovery found.
+---
+--- Session-only, by design: the spec joins THIS UI's connection list and is never written to the
+--- connections file, and a password found in a `.env` stays in `state.secrets` until dblens
+--- closes. To keep a discovered connection, save it with `:DbLensAdd`, which asks where its
+--- password comes from rather than storing one.
+---@param candidate dblens.Candidate
+function M.connect_discovered(candidate)
+  local spec = require('dblens.discovery').to_spec(candidate)
+  local problem = connections.validate(spec)
+  if problem then
+    M.error(problem)
+    return
+  end
+  problem = adopt_discovered(spec)
+  if problem then
+    M.error(problem)
+    return
+  end
+  state.secrets[spec.name] = candidate.secret
+  M.connect(spec.name)
 end
 
 -- ---------------------------------------------------------------------------

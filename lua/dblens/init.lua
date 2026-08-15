@@ -227,6 +227,13 @@ function M.restore()
   app.open(nil, { restore = true })
 end
 
+--- Scan the workspace for databases and offer what it finds. On-demand only: nothing is scanned
+--- until this is called, and nothing connects until the user picks a candidate.
+function M.discover()
+  M.ensure_setup()
+  require('dblens.app').discover()
+end
+
 --- Add a connection interactively.
 function M.add_connection()
   M.ensure_setup()

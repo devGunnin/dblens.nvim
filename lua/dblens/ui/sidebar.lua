@@ -86,6 +86,7 @@ local function no_connection(icons, options)
   return empty.panel(icons.database .. '  no connection', {
     { key = keymaps.lhs_for('global', 'connections', options.keymaps.global), text = 'pick one' },
     { key = ':DbLensAdd', text = 'add one' },
+    { key = ':DbLensDiscover', text = 'find one in this project' },
   })
 end
 

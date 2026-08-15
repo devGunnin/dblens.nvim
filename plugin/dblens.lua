@@ -51,6 +51,13 @@ local COMMANDS = {
     { desc = 'Add a dblens connection' },
   },
   {
+    'DbLensDiscover',
+    function()
+      require('dblens').discover()
+    end,
+    { desc = 'Find databases in this project' },
+  },
+  {
     'DbLensRemove',
     function(args)
       require('dblens').remove_connection(args.args)
