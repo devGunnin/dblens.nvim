@@ -995,11 +995,12 @@ end
 ---
 --- Sorting is a server-side ORDER BY on a browsed relation. A query result is whatever the user's
 --- own statement returned, and re-ordering it would mean re-writing their SQL.
+---@param unsortable_message string?  -- shown instead of the default when a query result blocks
 ---@return dblens.SortKey[]?
-local function sort_keys()
+local function sort_keys(unsortable_message)
   local source = state.grid.source
   if not source or source.kind ~= 'relation' then
-    M.notify('sorting needs a table; run the query with an ORDER BY instead')
+    M.notify(unsortable_message or 'sorting needs a table; run the query with an ORDER BY instead')
     return nil
   end
   return vim.deepcopy(state.grid.sort or {})
@@ -1072,7 +1073,8 @@ end
 
 --- Drop every sort key at once.
 function M.clear_sort()
-  local keys = sort_keys()
+  -- Clearing is never "add a sort", so a query result is just unsorted, not blocked from sorting.
+  local keys = sort_keys('the rows are not sorted')
   if not keys then
     return
   end

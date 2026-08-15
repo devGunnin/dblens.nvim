@@ -120,6 +120,26 @@ describe('sort: one column, cycled', function()
       eq(state.grid.sort, nil)
     end)
   end)
+
+  --- Clearing is not "add a sort": a query result has nothing to clear, so `gs` there should say
+  --- the rows are unsorted, not repeat the "needs a table" message meant for `s`/`S`.
+  it(
+    'clearing on a query result says the rows are not sorted, not that sorting needs a table',
+    function()
+      with_pages(function(app, state)
+        state.grid.source = { kind = 'query', label = 'query' }
+        local said = {}
+        local notify = vim.notify
+        vim.notify = function(message)
+          said[#said + 1] = message
+        end
+        app.clear_sort()
+        vim.notify = notify
+        eq(#said, 1)
+        eq(said[1]:find('the rows are not sorted', 1, true) ~= nil, true, { fail_reason = said[1] })
+      end)
+    end
+  )
 end)
 
 describe('sort: several columns, in the order they were chosen', function()

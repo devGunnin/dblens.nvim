@@ -642,6 +642,89 @@ TACTICA_DB_PORT=5433
   end)
 end)
 
+--- `tonumber` alone accepts negatives, fractions, hex, `inf`/exponents past 65535, and infinity —
+--- none of those are a port, and unchecked they reach the client's argv verbatim.
+describe('discovery: .env port validation', function()
+  local function port_of(value)
+    local text = ('X_POSTGRES_DB=shop\nX_POSTGRES_HOST=h\nX_POSTGRES_PORT=%s\n'):format(value)
+    return by_name(env.candidates(text, OPTS), 'shop').target.port
+  end
+
+  it('drops an out-of-range or non-integer port, falling back to the engine default', function()
+    local DEFAULT_POSTGRES_PORT = 5432
+    for _, bad in ipairs({ '-1', 'inf', '1e999', '999999999999', '5432.5' }) do
+      eq(port_of(bad), DEFAULT_POSTGRES_PORT, { fail_reason = 'accepted bad port ' .. bad })
+    end
+  end)
+
+  it('keeps a valid port written in hex or scientific notation', function()
+    eq(port_of('0x1F'), 31)
+    eq(port_of('5e3'), 5000)
+  end)
+
+  it('drops an out-of-range port parsed out of a URL too, not just a PORT variable', function()
+    local text = 'DATABASE_URL=postgres://u:p@h:999999999999/shop\n'
+    eq(by_name(env.candidates(text, OPTS), 'DATABASE_URL').target.port, 5432)
+  end)
+end)
+
+--- `inferred_kind` used to scan every URL for every engine-less group (O(groups x urls)); it now
+--- looks its own prefix up in a table built once. Both properties are tested: the lookup stays
+--- correct on the fixtures above, and a large adversarial file (many groups, none matching any of
+--- many URLs — the previous worst case) still resolves quickly.
+describe('discovery: inferred_kind stays correct and fast on many groups and urls', function()
+  it(
+    'is not O(groups x urls): a large adversarial .env resolves well under the quadratic cost',
+    function()
+      local n = 1500
+      local lines = {}
+      for i = 1, n do
+        -- Every group's prefix is unique and shares none with the URLs below, so the old linear
+        -- scan would run to the end of `vars.urls` on every single one of these.
+        lines[#lines + 1] = ('G%d_DB_HOST=localhost\n'):format(i)
+        lines[#lines + 1] = ('G%d_DB_PORT=9999\n'):format(i) -- not a single-engine port either
+        lines[#lines + 1] = ('G%d_DB_NAME=db%d\n'):format(i, i)
+        lines[#lines + 1] = ('U%d_URL=postgres://u:p@host%d:5432/u%d\n'):format(i, i, i)
+      end
+      local text = table.concat(lines)
+
+      local started = vim.uv.hrtime()
+      local candidates = env.candidates(text, OPTS)
+      local elapsed_ms = (vim.uv.hrtime() - started) / 1e6
+
+      eq(#candidates, n, { fail_reason = 'expected exactly one candidate per unmatched group' })
+      -- Quadratic here (n=1500 groups x 1500 urls) would cost hundreds of ms; bucketed lookup does
+      -- not, so a generous bound still catches a regression back to the linear scan.
+      eq(elapsed_ms < 500, true, {
+        fail_reason = ('inferred_kind took %.1fms for n=%d — looks quadratic again'):format(
+          elapsed_ms,
+          n
+        ),
+      })
+    end
+  )
+
+  it(
+    'yields the same candidate the linear scan would: URL under the matching prefix wins',
+    function()
+      local text = 'P_URL=mysql://u:p@h:3306/pdb\n'
+        .. 'P_DB_HOST=localhost\nP_DB_PORT=9999\nP_DB_NAME=pdb2\n'
+        .. 'Q_DB_HOST=localhost\nQ_DB_PORT=5432\nQ_DB_NAME=qdb\n' -- no URL under Q_, falls to PORT_KINDS
+      local candidates = env.candidates(text, OPTS)
+      eq(
+        by_name(candidates, 'pdb2').kind,
+        'mysql',
+        { fail_reason = 'prefix-matched URL not found' }
+      )
+      eq(
+        by_name(candidates, 'qdb').kind,
+        'postgres',
+        { fail_reason = 'single-engine port fallback broke' }
+      )
+    end
+  )
+end)
+
 describe('discovery: what a candidate becomes', function()
   local function url_candidate()
     local candidates =

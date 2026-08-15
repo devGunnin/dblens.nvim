@@ -146,6 +146,7 @@ end
 ---@field engines table<string, integer>           -- engine groups per prefix
 ---@field ports table<string, integer>             -- host port named under a prefix, by prefix
 ---@field urls { key: string, kind: string }[]     -- values that parsed as a URL, in file order
+---@field url_kind_by_prefix table<string, { kind: string? }>  -- see `bucket_urls_by_prefix`
 
 --- The bucket a variable belongs to, created on first sight. Engine groups are one per (prefix,
 --- engine); everything generic shares one group per prefix.
@@ -180,12 +181,28 @@ local function collect(entries)
       local group = group_for(vars, by_id, part)
       if group.values[part.role] == nil then
         group.values[part.role] = entry.value
-        vars.ports[part.prefix] = vars.ports[part.prefix]
-          or (part.role == 'port' and tonumber(entry.value) or nil)
+        if part.role == 'port' and vars.ports[part.prefix] == nil then
+          vars.ports[part.prefix] = tonumber(entry.value)
+        end
       end
     end
   end
   return vars
+end
+
+--- Whether a discovered value is usable as a port: an integer 1..65535. `tonumber` alone accepts
+--- negatives, fractions, hex, `inf` and anything past the 16-bit range, all of which reach the
+--- client's argv verbatim if let through.
+---@param port number?
+---@return integer?
+local function valid_port(port)
+  if type(port) ~= 'number' or port ~= port then -- NaN: only value unequal to itself
+    return nil
+  end
+  if port < 1 or port > 65535 or math.floor(port) ~= port then
+    return nil
+  end
+  return port
 end
 
 --- Resolve a discovered file path against the directory of the file that named it, the way the
@@ -223,6 +240,9 @@ local function candidate_from_target(target, key, opts)
   target.secret = nil
   if target.path then
     target.path = absolute(target.path, opts.dir)
+  end
+  if target.port and not valid_port(target.port) then
+    target.port = url_mod.DEFAULT_PORTS[target.kind]
   end
   local kind = target.kind
   target.kind = nil
@@ -316,6 +336,34 @@ local function offer(out, seen, candidate, hint_key, vars)
   end
 end
 
+--- Index the file's URLs by every prefix a group's `under` could be, so `inferred_kind` looks one
+--- up instead of scanning all of them. `under` is always either `''` or a run of whole
+--- `_`-joined tokens followed by `_` (see `split_family`), so every value it could take for ANY
+--- group is exactly `''` plus each of a URL key's own token boundaries — that is what is indexed
+--- here, once, rather than once per group.
+---
+--- A prefix that matches wraps its result (`{ kind = ... }`) rather than storing the kind bare, so
+--- a URL with an unrecognized engine (`kind == nil`) is still a match and the first one in file
+--- order still wins — the same as the linear scan this replaces.
+---@param urls { key: string, kind: string? }[]
+---@return table<string, { kind: string? }>
+local function bucket_urls_by_prefix(urls)
+  local buckets = {}
+  for _, entry in ipairs(urls) do
+    local under = ''
+    if buckets[under] == nil then
+      buckets[under] = { kind = entry.kind }
+    end
+    for token in entry.key:gmatch('([^_]+)_') do
+      under = under .. token .. '_'
+      if buckets[under] == nil then
+        buckets[under] = { kind = entry.kind }
+      end
+    end
+  end
+  return buckets
+end
+
 --- The engine a group without one describes: what a URL under the same prefix says, else what
 --- its own published port can only be. Nothing else — an invented engine is an invented target.
 ---@param group dblens.EnvGroup
@@ -323,10 +371,9 @@ end
 ---@return string?
 local function inferred_kind(group, vars)
   local under = group.prefix == '' and '' or group.prefix .. '_'
-  for _, entry in ipairs(vars.urls) do
-    if entry.key:sub(1, #under) == under then
-      return entry.kind
-    end
+  local match = vars.url_kind_by_prefix[under]
+  if match then
+    return match.kind
   end
   return PORT_KINDS[tonumber(group.values.port or '') or 0]
 end
@@ -357,7 +404,7 @@ local function group_candidate(group, vars, opts)
     kind = kind,
     target = {
       host = value('host') or 'localhost',
-      port = tonumber(value('port') or '') or url_mod.DEFAULT_PORTS[kind],
+      port = valid_port(tonumber(value('port') or '')) or url_mod.DEFAULT_PORTS[kind],
       user = value('user'),
       database = database,
     },
@@ -390,6 +437,7 @@ function M.candidates(text, opts)
       end
     end
   end
+  vars.url_kind_by_prefix = bucket_urls_by_prefix(vars.urls)
 
   for _, group in ipairs(vars.groups) do
     -- A generic group under a prefix that also names an engine has already been read as part of
