@@ -297,8 +297,15 @@ function M.format(from, to)
     app.error('dblens is not open, so there is no SQL buffer to format')
     return
   end
+  -- Both ends clamped: `:DbLensFormat` comes pre-clamped from vim, a direct Lua call does not,
+  -- and `format_range` asserts its range is inside the buffer rather than reporting it.
   local last = vim.api.nvim_buf_line_count(state.layout.bufs.editor)
-  require('dblens.ui.editor').format_range(state, from or 1, math.min(to or last, last))
+  local first = math.min(math.max(from or 1, 1), last)
+  require('dblens.ui.editor').format_range(
+    state,
+    first,
+    math.min(math.max(to or last, first), last)
+  )
 end
 
 --- Show the binding overlay for the pane the cursor is in, for a user who turned the keymaps off.

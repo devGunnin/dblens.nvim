@@ -181,7 +181,12 @@ describe('postgres.command', function()
       '-f',
       '-',
     })
-    eq(cmd.env, { PGCONNECT_TIMEOUT = '10' })
+    -- `standard_conforming_strings` is pinned on EVERY connection, writable ones included: it is
+    -- what makes the `E'...'` literals `quote_literal` emits agree with the server.
+    eq(cmd.env, {
+      PGCONNECT_TIMEOUT = '10',
+      PGOPTIONS = '-c standard_conforming_strings=on',
+    })
   end)
 
   it('asks for quoted CSV in records mode', function()
@@ -240,12 +245,17 @@ describe('mysql.command', function()
   --- The database is `--database=<name>`, never a bare positional: `my_getopt` splits a long
   --- option at its first `=`, so the value cannot be re-read as a flag however it is spelled.
   it('builds the documented argv for both modes', function()
+    -- Every connection clears `NO_BACKSLASH_ESCAPES`, which is the mode this dialect's literal
+    -- quoting and its lexer both assume. Spelled out rather than derived from the adapter.
+    local mode_pin = "--init-command=SET SESSION sql_mode = TRIM(BOTH ',' FROM "
+      .. "REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))"
     local records = mysql.command({ database = 'app' }, nil, 'records', CLIENTS)
     eq(records.argv, {
       'mysql',
       '--default-character-set=utf8mb4',
       '--connect-timeout=10',
       '--local-infile=0',
+      mode_pin,
       '--xml',
       '--database=app',
     })
@@ -255,6 +265,7 @@ describe('mysql.command', function()
       '--default-character-set=utf8mb4',
       '--connect-timeout=10',
       '--local-infile=0',
+      mode_pin,
       '--batch',
       '--database=app',
     })

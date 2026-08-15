@@ -233,6 +233,14 @@ describe('filter from a cell: the value is data, never syntax', function()
   --- refusing a Windows path or a regex there was a usability hole with nothing behind it.
   it('refuses a backslash only on an engine where it may escape', function()
     local windows_path = [[C:\\Users\\me]]
+    -- The literal each engine gets, spelled out. sqlite and mssql pass a backslash through;
+    -- postgres and duckdb double it inside an `E'...'`, where its meaning is not a server setting.
+    local LITERAL = {
+      sqlite = [['C:\\Users\\me']],
+      mssql = [['C:\\Users\\me']],
+      postgres = [[E'C:\\\\Users\\\\me']],
+      duckdb = [[E'C:\\\\Users\\\\me']],
+    }
     for _, kind in ipairs({ 'sqlite', 'postgres', 'duckdb', 'mssql' }) do
       local dialect = sqlmod.dialects[kind]
       local predicate, err = common.cell_predicate('c', windows_path, '=', dialect)
@@ -244,7 +252,7 @@ describe('filter from a cell: the value is data, never syntax', function()
       -- Still exactly one statement, which is the property the refusal was protecting.
       local statement = ('SELECT * FROM t WHERE %s LIMIT 5 OFFSET 0'):format(predicate)
       eq(#sqlmod.split(statement, dialect), 1, { fail_reason = statement })
-      eq(predicate:find(windows_path, 1, true) ~= nil, true, { fail_reason = predicate })
+      eq(predicate:find(LITERAL[kind], 1, true) ~= nil, true, { fail_reason = predicate })
     end
     for _, kind in ipairs({ 'mysql', 'mariadb' }) do
       local dialect = sqlmod.dialects[kind] or sqlmod.dialects.mysql

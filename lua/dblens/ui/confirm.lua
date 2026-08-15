@@ -62,6 +62,10 @@ function M.ask(options, opts, on_confirm)
 
   local decided = false
   vim.keymap.set('n', 'y', function()
+    -- One answer per prompt: `on_confirm` runs a change, and two of them would run it twice.
+    if decided then
+      return
+    end
     decided = true
     popup.close()
     on_confirm()

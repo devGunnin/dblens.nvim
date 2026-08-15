@@ -20,10 +20,14 @@ local M = {}
 ---@field key dblens.KeyValue[]?
 ---@field column string?
 ---@field value any
+--- What a failure message should call this change. Set by a queuer that knows a better name than
+--- the queue position — the importer numbers by FILE row, which is what its other errors use.
+---@field label string?
 
 ---@class dblens.ScriptOwner
 ---@field index integer  -- 1-based position in the queue
 ---@field guard boolean  -- the line is the change's guard rather than the change itself
+---@field label string?  -- the queuer's own name for the change
 
 local Txn = {}
 Txn.__index = Txn
@@ -97,9 +101,9 @@ function Txn:script(assert_one, frame)
   emit(frame.open, nil)
   for index, change in ipairs(self.pending) do
     if change.guard then
-      emit(assert_one(change.guard) .. ';', { index = index, guard = true })
+      emit(assert_one(change.guard) .. ';', { index = index, guard = true, label = change.label })
     end
-    emit(change.sql .. ';', { index = index, guard = false })
+    emit(change.sql .. ';', { index = index, guard = false, label = change.label })
   end
   emit(frame.close, nil)
   return table.concat(parts, '\n'), nil, owners

@@ -46,7 +46,7 @@ local MECHANISM = {
   postgres = {
     spec = { kind = 'postgres', database = 'app' },
     where = 'env',
-    switch = 'PGOPTIONS=-c default_transaction_read_only=on',
+    switch = 'PGOPTIONS=-c standard_conforming_strings=on -c default_transaction_read_only=on',
   },
   mysql = {
     spec = { kind = 'mysql', database = 'app' },
@@ -73,6 +73,21 @@ local function flatten(command)
   return parts
 end
 
+--- Whether the documented switch appears in what goes on the wire.
+---
+--- A SUBSTRING match, not an exact argument: postgres carries the switch in a `PGOPTIONS` that
+--- also pins `standard_conforming_strings`, and mysql/mariadb in an `--init-command` that also
+--- pins `sql_mode`, because neither client accepts a second copy of those.
+---@return boolean
+local function carries(command, switch)
+  for _, part in ipairs(flatten(command)) do
+    if part:find(switch, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
 describe('read-only is enforced by the engine, per adapter', function()
   it('puts the documented switch on the wire for a read-only connection', function()
     for kind, want in pairs(MECHANISM) do
@@ -80,7 +95,7 @@ describe('read-only is enforced by the engine, per adapter', function()
         local spec = vim.tbl_extend('force', want.spec, { read_only = true })
         local command = get(kind).command(spec, nil, 'records', CLIENTS)
         eq(
-          h.has(flatten(command), want.switch),
+          carries(command, want.switch),
           true,
           { fail_reason = ('%s must pass `%s` in %s'):format(kind, want.switch, want.where) }
         )
@@ -94,7 +109,7 @@ describe('read-only is enforced by the engine, per adapter', function()
         local spec = vim.tbl_extend('force', want.spec, { read_only = false })
         local command = get(kind).command(spec, nil, 'records', CLIENTS)
         eq(
-          h.has(flatten(command), want.switch),
+          carries(command, want.switch),
           false,
           { fail_reason = ('%s must not force read-only on a writable connection'):format(kind) }
         )

@@ -373,7 +373,10 @@ describe('import: the guards around the run', function()
       eq(#calls, 1, { fail_reason = 'a failed import must not retry row by row' })
       local text = table.concat(said, '\n')
       eq(text:find('nothing was imported', 1, true) ~= nil, true, { fail_reason = text })
-      eq(text:find('change 2 of 3', 1, true) ~= nil, true, { fail_reason = text })
+      -- The FILE row, header counted: batch line 3 is the second INSERT, which came from `2,b`
+      -- on line 3 of the CSV. The queue ordinal (2) is a number the user never saw.
+      eq(text:find('row 3', 1, true) ~= nil, true, { fail_reason = text })
+      eq(text:find('change 2 of 3', 1, true), nil, { fail_reason = text })
       eq(state.session.txn:is_active(), false, {
         fail_reason = 'the failed import left its changes queued',
       })
@@ -696,9 +699,89 @@ CREATE TABLE import_live(id int PRIMARY KEY, note text);
     local failed = run_import(state, 'id,note\n4,four\n5,five\n1,collides\n')
     local text = table.concat(failed, '\n')
     eq(text:find('nothing was imported', 1, true) ~= nil, true, { fail_reason = text })
-    eq(text:find('change 3 of 3', 1, true) ~= nil, true, { fail_reason = text })
+    -- The FILE row (header counted), which is what the queue-time failures also report.
+    eq(text:find('row 4', 1, true) ~= nil, true, { fail_reason = text })
     eq(rows_now(), before, { fail_reason = 'a failed import left rows behind' })
     eq(state.session.txn:is_active(), false, { fail_reason = 'the queue outlived the failure' })
     app.close()
+  end)
+  --- Send a statement WITHOUT the `standard_conforming_strings` pin the adapter normally adds,
+  --- so the database's own setting is what decides how a literal is read. This is the condition
+  --- the blocker needed, and it is checked rather than assumed below.
+  local function psql_unpinned(statement)
+    local spec = vim.tbl_extend('force', target.spec, { read_only = false })
+    local command = adapter.command(spec, target.secret, 'records', target.clients)
+    command.env.PGOPTIONS = nil
+    return vim.system(command.argv, { env = command.env, stdin = statement }):wait(60000)
+  end
+
+  local function first_cell(out)
+    eq(out.code, 0, { fail_reason = tostring(out.stderr) })
+    local row = adapter.decode(out.stdout, {}).rows[1]
+    return row and tostring(row[1]) or nil
+  end
+
+  --- THE BLOCKER, live and both ways round.
+  ---
+  --- `standard_conforming_strings` is a per-database setting and dblens spawns a fresh `psql` per
+  --- run, so a database with it OFF is what every dblens connection gets. Under the old quoting a
+  --- CSV cell ending in `\` closed its own literal there, the rest of the row ran, `victim` was
+  --- DROPPED and the import said `imported 1 row(s)`. Both modes must now store it as text.
+  it('imports a table-dropping payload as data whatever the string mode is', function()
+    if skip() then
+      return
+    end
+    local PAYLOAD = [[\'); DROP TABLE victim; --]]
+    for _, setting in ipairs({ 'on', 'off' }) do
+      local prepared = psql(([[
+ALTER DATABASE %s SET standard_conforming_strings = %s;
+DROP TABLE IF EXISTS victim;
+CREATE TABLE victim(a int);
+DROP TABLE IF EXISTS import_live;
+CREATE TABLE import_live(id int PRIMARY KEY, note text);
+]]):format(target.spec.database, setting))
+      eq(prepared.code, 0, { fail_reason = tostring(prepared.stderr) })
+
+      -- The premise, not an assumption: a connection dblens has not pinned really is in this mode.
+      eq(first_cell(psql_unpinned('SHOW standard_conforming_strings')), setting, {
+        fail_reason = ('the server did not take standard_conforming_strings = %s'):format(setting),
+      })
+
+      local app, state = live_ui()
+      local said = table.concat(run_import(state, ('id,note\n1,"%s"\n'):format(PAYLOAD)), '\n')
+      eq(said:find('imported 1 row', 1, true) ~= nil, true, { fail_reason = said })
+
+      -- The table a payload would have dropped, and the bytes that were meant to drop it.
+      eq(first_cell(psql('SELECT count(*) AS n FROM victim')), '0', {
+        fail_reason = ('victim did not survive with standard_conforming_strings = %s'):format(
+          setting
+        ),
+      })
+      eq(first_cell(psql('SELECT note FROM import_live WHERE id = 1')), PAYLOAD, {
+        fail_reason = ('the payload was not stored verbatim under scs = %s'):format(setting),
+      })
+      app.close()
+    end
+
+    -- And the SYNTAX alone, with the pin taken back off: `E'...'` is what makes the literal mean
+    -- one thing in either mode, so it has to hold without the connection setting helping.
+    local plan = assert(
+      require('dblens.import').plan(
+        { schema = 'public', name = 'import_live', kind = 'table' },
+        { { 'id', 'note' }, { '2', PAYLOAD } },
+        { 'id', 'note' },
+        adapter.dialect
+      )
+    )
+    local sent = psql_unpinned(plan.changes[1].sql .. ';')
+    eq(sent.code, 0, { fail_reason = tostring(sent.stderr) })
+    eq(first_cell(psql('SELECT count(*) AS n FROM victim')), '0', {
+      fail_reason = 'the E-literal dropped victim once the connection pin was removed',
+    })
+    eq(first_cell(psql('SELECT note FROM import_live WHERE id = 2')), PAYLOAD)
+
+    local reset =
+      psql(('ALTER DATABASE %s RESET standard_conforming_strings'):format(target.spec.database))
+    eq(reset.code, 0, { fail_reason = tostring(reset.stderr) })
   end)
 end)

@@ -317,3 +317,138 @@ describe('tabs: in the app', function()
     end)
   end)
 end)
+
+--- Foreign-key navigation is the one async path that used to read the tab LATE.
+---
+--- `gf` and `gF` both have to load metadata before they can build a predicate, and both then
+--- called `open_relation`, which read `state.grid` at that moment. A user who switched tabs during
+--- the round trip had the tab they switched TO replaced, and the tab they pressed the key in left
+--- untouched — the exact opposite of the guarantee `doc/dblens.txt` prints.
+---
+--- Every existing `gf` case seeds the target's columns, so the round trip never happens and the
+--- window never opens. These two leave them unseeded on purpose.
+describe('tabs: foreign-key navigation lands where it was started', function()
+  local ORDERS = { name = 'orders', kind = 'table' }
+  local CUSTOMERS = { name = 'customers', kind = 'table' }
+
+  local function columns_reply(rows)
+    local records = { h.record('name', 'type', 'notnull', 'pk', 'fk') }
+    for _, row in ipairs(rows) do
+      records[#records + 1] = h.record(row[1], 'int', '0', row[2], row[3])
+    end
+    return h.wire(records)
+  end
+
+  --- Everything the navigation needs EXCEPT the part it has to fetch, which is what opens the
+  --- async window each case is about.
+  local function seed(state, browsing, unloaded)
+    local catalog = state.session.catalog
+    catalog:set_relations(nil, { ORDERS, CUSTOMERS })
+    for _, relation in ipairs({ ORDERS, CUSTOMERS }) do
+      catalog:set_part(relation, 'indexes', {})
+      catalog:set_part(relation, 'constraints', {})
+    end
+    if unloaded ~= ORDERS then
+      catalog:set_part(ORDERS, 'columns', {
+        { name = 'id', type = 'int', pk = 1 },
+        { name = 'customer_id', type = 'int', pk = 0, fk = 'customers.id' },
+      })
+    end
+    if unloaded ~= CUSTOMERS then
+      catalog:set_part(CUSTOMERS, 'columns', { { name = 'id', type = 'int', pk = 1 } })
+    end
+    state.grid.source = { kind = 'relation', relation = browsing, label = browsing.name }
+    if browsing == ORDERS then
+      state.grid.result =
+        { columns = { 'id', 'customer_id' }, rows = { { '1', '7' } }, malformed = 0 }
+    else
+      state.grid.result = { columns = { 'id' }, rows = { { '7' } }, malformed = 0 }
+    end
+  end
+
+  --- Open a second tab and return the tab the navigation was started in, plus the one now on
+  --- screen. Asserts they really are different objects, so a passing case cannot be a no-op.
+  local function switch_away(app, state, started_in)
+    eq(app.open_tab(), true, { fail_reason = 'the second tab did not open' })
+    eq(rawequal(state.grid, started_in), false, { fail_reason = 'the tab did not change' })
+    return state.grid
+  end
+
+  local function untouched(watching)
+    eq(watching.source, nil, { fail_reason = 'the navigation wrote into the tab on screen' })
+    eq(watching.filter, nil, { fail_reason = 'the tab on screen was filtered by another tab' })
+    eq(watching.result, nil, { fail_reason = 'the tab on screen had a result written into it' })
+  end
+
+  it('lands a `gf` result in the tab it was pressed in', function()
+    h.with_fake_exec(function()
+      return { pending = true }
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, ORDERS, CUSTOMERS)
+      local pressed_in = state.grid
+
+      app.follow_fk({ row = 1, column = 2, name = 'customer_id', value = '7' })
+      eq(#calls, 1, { fail_reason = "gf must have the target's columns in flight" })
+      local watching = switch_away(app, state, pressed_in)
+
+      calls[1].resume({ stdout = columns_reply({ { 'id', '1', '' } }) })
+
+      eq(pressed_in.source and pressed_in.source.relation.name, 'customers', {
+        fail_reason = 'the rows did not land in the tab `gf` was pressed in',
+      })
+      eq(pressed_in.filter, [["id" = '7']])
+      untouched(watching)
+      app.close()
+    end)
+  end)
+
+  it('lands a `gF` result in the tab it was pressed in', function()
+    h.with_fake_exec(function()
+      return { pending = true }
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, CUSTOMERS, ORDERS)
+      local pressed_in = state.grid
+
+      app.find_referencing({ row = 1, column = 1, name = 'id', value = '7' })
+      eq(#calls, 1, { fail_reason = 'gF must have a column sweep in flight' })
+      local watching = switch_away(app, state, pressed_in)
+
+      calls[1].resume({
+        stdout = columns_reply({ { 'id', '1', '' }, { 'customer_id', '0', 'customers.id' } }),
+      })
+
+      eq(pressed_in.source and pressed_in.source.relation.name, 'orders', {
+        fail_reason = 'the rows did not land in the tab `gF` was pressed in',
+      })
+      eq(pressed_in.filter, [["customer_id" = '7']])
+      untouched(watching)
+      app.close()
+    end)
+  end)
+
+  it('drops the result when the tab it was started in has been closed', function()
+    h.with_fake_exec(function()
+      return { pending = true }
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, ORDERS, CUSTOMERS)
+
+      app.follow_fk({ row = 1, column = 2, name = 'customer_id', value = '7' })
+      eq(#calls, 1)
+      switch_away(app, state, state.grid)
+      app.select_tab(1)
+      app.close_tab()
+      local left = state.grid
+
+      calls[1].resume({ stdout = columns_reply({ { 'id', '1', '' } }) })
+
+      untouched(left)
+      eq(require('dblens.tabs').count(state.tabs), 1)
+      -- Nothing was read for a tab that no longer exists.
+      eq(#calls, 1, { fail_reason = 'a closed tab still fetched its page' })
+      app.close()
+    end)
+  end)
+end)

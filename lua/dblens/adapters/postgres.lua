@@ -114,10 +114,14 @@ function M.command(spec, secret, mode, clients)
   end
   vim.list_extend(argv, { '-d', spec.database, '-f', '-' })
 
-  local env = { PGCONNECT_TIMEOUT = '10' }
+  -- `standard_conforming_strings` is a per-database/role setting, and with it OFF a `\` escapes
+  -- inside a plain literal. Pinned on EVERY connection so the server frames strings the way this
+  -- adapter's lexer does. `quote_literal` emits `E'...'` as well; neither alone was enough.
+  local options = { '-c standard_conforming_strings=on' }
   if spec.read_only == true then
-    env.PGOPTIONS = '-c default_transaction_read_only=on'
+    options[#options + 1] = '-c default_transaction_read_only=on'
   end
+  local env = { PGCONNECT_TIMEOUT = '10', PGOPTIONS = table.concat(options, ' ') }
   if secret then
     env.PGPASSWORD = secret
   end

@@ -116,6 +116,36 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **A CSV cell could execute SQL on PostgreSQL, and the import reported success.** Literals were
+  quoted by doubling `'` and leaving `\` alone, which is correct only while the server has
+  `standard_conforming_strings = on` — a per-database/role setting dblens never read, and every
+  run spawns a fresh `psql`. With it off, a cell ending in `\` escaped its own closing quote and
+  the rest of the row was parsed as SQL: proved live on 16.15, where a cell holding
+  `\'); DROP TABLE victim; --` DROPPED the table and the user was told `imported 1 row(s)`.
+  Literals are now written per engine so no server setting can re-frame them: `E'…'` with both
+  `\` and `'` escaped on PostgreSQL and DuckDB, where that syntax means one thing in either mode;
+  `'…'` with `\` doubled on MySQL/MariaDB, whose adapter now CLEARS `NO_BACKSLASH_ESCAPES` from
+  the session `sql_mode` rather than assuming it is unset; `'…'` doubling `'` only elsewhere. The
+  PostgreSQL adapter also pins `standard_conforming_strings=on` on every connection, not just
+  locked ones. One quoter backs filter-from-cell, `gf`/`gF`, grid cell edits, CSV import and
+  `.sql` export, so all of them carried it and all of them are fixed. A hostile-value × engine ×
+  escaping-mode matrix now judges every emitted literal with an independent decoder, and the
+  round trip is proved live on PostgreSQL with the setting both ON and OFF, on MySQL and MariaDB
+  with `NO_BACKSLASH_ESCAPES` both set and clear, and on SQLite and DuckDB.
+- **`gf` and `gF` wrote their result into whatever tab was on screen.** Both have to load
+  metadata before they can build a predicate — the target table's columns for `gf`, every loaded
+  relation's for `gF` — and both then read the active tab at that moment. Switching tabs during
+  the round trip replaced the tab switched TO and left the tab the key was pressed in untouched,
+  contradicting the per-tab guarantee stated here and in `:h dblens-results`. The initiating tab
+  is captured at the keystroke and passed through, as every other async path already did; a
+  navigation whose tab has since been closed is dropped instead of fetching for it.
+- **A NUL byte in a CSV gave a raw traceback and no message.** It flowed past `csv.parse` to an
+  assertion inside a scheduled callback, so the import failed with nothing the user could read.
+  It is refused at the file boundary now, naming the line like the other parse errors.
+- **An import numbered the failing row two different ways.** A queue-time failure named the file
+  row, a commit-time one named the queue ordinal (one less). Both name the file row.
+- **A confirmation prompt could be answered twice**, and `require('dblens').format(from, to)`
+  called directly with an out-of-range `from` tripped an assertion instead of clamping.
 - **Export silently wrote only the current page.** `X` on a 4,000-row table wrote a 100-row file
   and reported "exported 100 row(s)" — true, which is what made it easy to miss — and a query
   result truncated at `max_rows` was written short with a success message and no mention of

@@ -87,6 +87,12 @@ function M.parse(text, opts)
     if err then
       return nil, err
     end
+    -- Refused HERE, at the file boundary: no client can carry a NUL in a statement, and further
+    -- down the only thing left to stop it was an assertion, which is a traceback rather than a
+    -- message. `line` is still the line the value opened on.
+    if type(value) == 'string' and value:find('%z') then
+      return nil, ('line %d: a value contains a NUL byte, which SQL cannot carry'):format(line)
+    end
     row[#row + 1] = value
     -- A newline INSIDE a quoted value is data, but it still moved the file on a line.
     if type(value) == 'string' then

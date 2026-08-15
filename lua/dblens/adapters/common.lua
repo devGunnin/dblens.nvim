@@ -84,13 +84,14 @@ end
 --- way to modify anything.
 ---
 --- The backslash rule is the dialect's own `backslash_escape`, the same flag `sql.scan` frames
---- literals with, so the lexer and this check cannot disagree. On mysql and mariadb a backslash
---- in a literal means one thing under `NO_BACKSLASH_ESCAPES` and another without it, and dblens
---- cannot see which is set — so the server and the lexer could disagree about where the string
---- ends, and a stacked statement would be invisible. sqlite, postgres, duckdb and mssql have no
---- such escape, so a Windows path or a regex is an ordinary value there and refusing it was a
---- usability hole with nothing behind it. An unknown dialect scans as `permissive`, which does
---- escape, so the refusal is what an unrecognised engine gets.
+--- literals with, so the lexer and this check cannot disagree. What makes that flag TRUE is not
+--- assumed anywhere: mysql and mariadb read a backslash one way under `NO_BACKSLASH_ESCAPES` and
+--- another without it, so the adapter clears that mode on connect; postgres reads one way under
+--- `standard_conforming_strings` and another without it, so `quote_literal` emits `E'...'`
+--- (unambiguous in both) and the adapter pins the setting as well. sqlite, duckdb and mssql have
+--- no such escape in a plain literal. So a Windows path or a regex is an ordinary value on the
+--- four that do not branch, and refusing it was a usability hole with nothing behind it. An
+--- unknown dialect scans as `permissive`, which does escape, so an unrecognised engine is refused.
 ---@param where string?
 ---@param dialect dblens.Dialect?
 ---@return string? error message, nil when the predicate is safe to splice

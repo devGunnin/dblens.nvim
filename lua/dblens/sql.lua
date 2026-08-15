@@ -20,6 +20,10 @@ local M = {}
 ---@field hash_comment boolean     -- # to end of line
 ---@field dollar_quote boolean     -- $tag$ ... $tag$
 ---@field backslash_escape boolean -- backslash MAY escape inside string literals
+--- `escape_string_prefix` is the postgres/duckdb `E'...'` literal, where a backslash ALWAYS
+--- escapes whatever `standard_conforming_strings` is set to. `quote_literal` emits it there so
+--- the literal it writes cannot mean two different things on two servers -- see that function.
+---@field escape_string_prefix boolean
 ---@field nested_comment boolean   -- /* /* */ */ nests; only postgres does
 ---@field exec_comment boolean     -- /*! ... */ is executed, so its body is code
 ---@field named_commands boolean   -- a bare leading `system`/`source` is a client command
@@ -42,6 +46,7 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = false,
     backslash_escape = false,
+    escape_string_prefix = false,
     nested_comment = false,
     exec_comment = false,
     named_commands = false,
@@ -57,6 +62,7 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = false,
     backslash_escape = false,
+    escape_string_prefix = false,
     nested_comment = false,
     exec_comment = false,
     named_commands = false,
@@ -72,6 +78,7 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = true,
     backslash_escape = false,
+    escape_string_prefix = true,
     nested_comment = true,
     exec_comment = false,
     named_commands = false,
@@ -87,6 +94,7 @@ M.dialects = {
     hash_comment = true,
     dollar_quote = false,
     backslash_escape = true,
+    escape_string_prefix = false,
     nested_comment = false,
     exec_comment = true,
     named_commands = true,
@@ -106,6 +114,7 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = true,
     backslash_escape = false,
+    escape_string_prefix = true,
     nested_comment = true,
     exec_comment = false,
     named_commands = false,
@@ -123,6 +132,7 @@ M.dialects = {
     hash_comment = false,
     dollar_quote = false,
     backslash_escape = false,
+    escape_string_prefix = false,
     nested_comment = true,
     exec_comment = false,
     named_commands = false,
@@ -145,6 +155,7 @@ M.dialects.permissive = {
   hash_comment = true,
   dollar_quote = true,
   backslash_escape = true,
+  escape_string_prefix = false,
   nested_comment = false,
   exec_comment = true,
   named_commands = true,
@@ -1169,15 +1180,34 @@ function M.classify_all(sql, dialect)
 end
 
 --- Quote a string as a SQL literal. Rejects NUL, which no CLI client can carry in argv.
+---
+--- What a `\` means inside a literal is a SERVER setting on four of the six engines, and dblens
+--- cannot see it. Doubling `'` alone is therefore not enough: with postgres's
+--- `standard_conforming_strings = off` a value ending in `\` escaped the closing quote and the
+--- rest of the row became SQL — a CSV cell dropped a table on a live 16.15. So there are three
+--- shapes, and each one makes the emitted literal true under EVERY mode its engine has:
+---  * `escape_string_prefix` (postgres, duckdb) — `E'...'`, where a backslash always escapes.
+---    Doubling both `\` and `'` then means the same thing whether the plain-string syntax is
+---    standard-conforming or not, so no server setting can re-frame it.
+---  * `backslash_escape` (mysql, mariadb) — `'...'` with `\` doubled. There is no mode-neutral
+---    literal syntax there, so the ADAPTER pins the mode instead: `mysql.init_command` clears
+---    `NO_BACKSLASH_ESCAPES` from the session `sql_mode`, which makes this branch true.
+---  * everything else (sqlite, mssql, standard) — `'...'` doubling `'` only. A backslash is an
+---    ordinary byte on those, and doubling it would store two.
+---
+--- Control bytes are emitted raw rather than as `\n`-style escapes: they are unambiguous in every
+--- mode already, and a locked run's byte scan still refuses them before they reach a client.
 function M.quote_literal(value, dialect)
   assert(type(value) == 'string', 'sql.quote_literal: expected string')
   assert(not value:find('%z'), 'sql.quote_literal: NUL byte cannot be represented')
   local d = dialect or M.dialects.standard
-  local body = value:gsub("'", "''")
-  if d.backslash_escape then
-    body = value:gsub('\\', '\\\\'):gsub("'", "''")
+  if d.escape_string_prefix then
+    return "E'" .. value:gsub('\\', '\\\\'):gsub("'", "''") .. "'"
   end
-  return "'" .. body .. "'"
+  if d.backslash_escape then
+    return "'" .. value:gsub('\\', '\\\\'):gsub("'", "''") .. "'"
+  end
+  return "'" .. value:gsub("'", "''") .. "'"
 end
 
 --- Quote an identifier. Doubling the closing delimiter is correct for every dialect we target.

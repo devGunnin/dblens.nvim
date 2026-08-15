@@ -1019,9 +1019,11 @@ before it is spliced into a statement. Rejected: a comment (which would comment 
 `LIMIT`/`OFFSET` appended after it), an unclosed quote, any punctuation outside the SQL operator
 set — which drops `;` and a bare `\` together, so psql's `\!` never reaches the client — and a
 write verb where a nested statement could begin. A backslash *inside a literal* is rejected only
-on MySQL and MariaDB, where `NO_BACKSLASH_ESCAPES` decides what it means and dblens cannot see
-which way it is set; the other four have no such escape, so a Windows path or a regex filters
-normally there. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
+on MySQL and MariaDB, where `NO_BACKSLASH_ESCAPES` decides what it means; the other four accept
+it, so a Windows path or a regex filters normally there. What makes that safe is that no dialect
+is left guessing about its own server: dblens emits a PostgreSQL/DuckDB literal as `E'…'`, which
+means the same thing whatever `standard_conforming_strings` is set to, and it pins
+`standard_conforming_strings=on` and clears `NO_BACKSLASH_ESCAPES` on the connections it opens. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
 column named after a SQL verb can also be quoted. The filter bar is still raw SQL: the check
 stops it escaping the statement, it does not stop an expensive or volatile function call.
 
@@ -1204,6 +1206,9 @@ error reporting have much thinner live coverage everywhere — please report wha
 - A `.sql` export for MySQL/MariaDB escapes backslashes for the default SQL mode, which is the
   wrong escaping under `NO_BACKSLASH_ESCAPES`. The file says which mode it was written for in a
   comment at the top.
+- A `.sql` export for PostgreSQL/DuckDB writes `E'…'` literals, so the file replays the same
+  whatever `standard_conforming_strings` is set to. That syntax is not portable to the other
+  engines.
 - SQLite exposes no schema level (attached databases are out of scope) and has no
   `EXPLAIN ANALYZE` or row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so `D` shows a DDL reconstructed from

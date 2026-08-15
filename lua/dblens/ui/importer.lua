@@ -148,21 +148,29 @@ end
 local function queue_all(session, plan)
   for index, change in ipairs(plan.changes) do
     local queued, problem = nil, nil
+    -- `index + 1` is the FILE row: the header is row 1. The label rides into the queue so a
+    -- commit-time failure names the same row a queue-time one does.
+    local row = ('row %d'):format(index + 1)
     session:execute_write({
       sql = change.sql,
       summary = change.summary,
       destructive = false,
       confirmed = true,
-      change = { sql = change.sql, summary = change.summary, relation = plan.relation },
+      change = {
+        sql = change.sql,
+        summary = change.summary,
+        relation = plan.relation,
+        label = row,
+      },
     }, function(outcome, err)
       queued, problem = outcome, err
     end)
     if problem then
-      return false, ('row %d: %s'):format(index + 1, problem)
+      return false, ('%s: %s'):format(row, problem)
     end
     assert(
       queued and queued.queued,
-      ('importer: row %d was not queued into the transaction'):format(index + 1)
+      ('importer: %s was not queued into the transaction'):format(row)
     )
   end
   return true, nil

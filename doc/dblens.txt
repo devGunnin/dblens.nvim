@@ -1218,9 +1218,14 @@ LIMIT/OFFSET appended after it), an unclosed quote, any punctuation outside
 the SQL operator set - which drops `;` and a bare `\` together, so psql's `\!`
 never reaches the client - and a write verb where a nested statement could
 begin. A backslash INSIDE a literal is rejected only on MySQL and MariaDB,
-where `NO_BACKSLASH_ESCAPES` decides what it means and dblens cannot see which
-way it is set; the other engines have no such escape, so a Windows path or a
-regex filters normally there.
+where `NO_BACKSLASH_ESCAPES` decides what it means; the other engines accept
+it, so a Windows path or a regex filters normally there.
+
+What makes that safe is that no dialect is left guessing about its own server.
+A PostgreSQL/DuckDB literal is written `E'...'`, which means the same thing
+whatever `standard_conforming_strings` is set to, and dblens also pins
+`standard_conforming_strings=on` and clears `NO_BACKSLASH_ESCAPES` on the
+connections it opens.
 
 `REPLACE(...)`, a column called `comment` and non-ASCII identifiers are
 accepted; a column named after a SQL verb can also be quoted.
@@ -1460,6 +1465,9 @@ Other limits:
 - A `.sql` export for MySQL/MariaDB escapes backslashes for the default SQL
   mode, which is the wrong escaping under NO_BACKSLASH_ESCAPES. The file names
   the mode it was written for in a comment at the top.
+- A `.sql` export for PostgreSQL/DuckDB writes `E'...'` literals, so the file
+  replays the same whatever standard_conforming_strings is set to. That syntax
+  is not portable to the other engines.
 - SQLite exposes no schema level (attached databases are out of scope) and has
   neither EXPLAIN ANALYZE nor a row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so the DDL view is

@@ -825,8 +825,9 @@ end
 --- the second lock on the same door, because `common.page` would otherwise raise deep in SQL
 --- generation with no clue as to who supplied it.
 ---@param relation dblens.Relation
----@param opts { filter: string?, origin: string?, new_tab: boolean? }?
----   origin: where the navigation came from; new_tab: show it beside the current result
+---@param opts { filter: string?, origin: string?, new_tab: boolean?, into: table? }?
+---   origin: where the navigation came from; new_tab: show it beside the current result;
+---   into: the tab the rows belong to, for a caller that decided on one BEFORE an async step
 function M.open_relation(relation, opts)
   opts = opts or {}
   if not state.session then
@@ -836,11 +837,16 @@ function M.open_relation(relation, opts)
     opts.filter == nil or common.check_predicate(opts.filter, state.session.adapter.dialect) == nil,
     'app.open_relation: an unvetted predicate reached the grid'
   )
+  assert(not (opts.into and opts.new_tab), 'app.open_relation: a target tab is not a new one')
   if opts.new_tab and not M.open_tab() then
     return
   end
-  -- Captured now: the rows belong to this tab even if the user switches away while they load.
-  local grid = state.grid
+  -- The tab the rows belong to. `into` is what makes a navigation that had to load metadata first
+  -- land where the user started it, rather than in whatever tab is on screen when it resolves.
+  local grid = opts.into or state.grid
+  if not tabs.index_of(state.tabs, grid) then
+    return
+  end
   grid.paging = paging.new(state.options.page_size)
   grid.sort = nil
   grid.filter = opts.filter
@@ -855,7 +861,11 @@ function M.open_relation(relation, opts)
     fetch_page_into(grid)
     M.count_rows(relation, grid.filter, grid)
   end)
-  layout_mod.focus(state.layout, 'results')
+  -- Only the tab on screen gets the cursor: pulling focus for a background tab's rows would move
+  -- the user off whatever they switched to.
+  if grid == state.grid then
+    layout_mod.focus(state.layout, 'results')
+  end
 end
 
 --- Whether two relations are the same object. Name alone crosses schemas: on postgres and mysql
@@ -1174,7 +1184,9 @@ end
 ---@param from dblens.Relation
 ---@param cell dblens.Cell
 ---@param target dblens.FkTarget
-local function open_fk_target(from, cell, target)
+---@param into table  -- the tab `gf` was pressed in; the target's columns load asynchronously
+local function open_fk_target(from, cell, target, into)
+  assert(type(into) == 'table', 'app.open_fk_target: needs the tab that started the navigation')
   local session = state.session
   local relation = fk.resolve(session.catalog, from, target.table, target.schema)
   if not relation then
@@ -1205,7 +1217,7 @@ local function open_fk_target(from, cell, target)
       M.error(problem)
       return
     end
-    M.open_relation(relation, { filter = predicate, origin = origin })
+    M.open_relation(relation, { filter = predicate, origin = origin, into = into })
     if target.composite then
       M.notify(('this foreign key spans several columns; filtered on `%s` only'):format(column))
     end
@@ -1228,6 +1240,10 @@ function M.follow_fk(cell)
     M.notify('following a foreign key needs a table; open one from the tree')
     return
   end
+  -- Captured at the keystroke. Everything below can take a client round trip (the target's
+  -- columns, and the picker when a column carries several references), so reading `state.grid`
+  -- later would land the rows in whatever tab the user had switched to by then.
+  local into = state.grid
   local column = column_info(session, source.relation, cell.name)
   local targets = column and fk.targets(column.fk, cell.name) or {}
   if #targets == 0 then
@@ -1239,7 +1255,7 @@ function M.follow_fk(cell)
     return
   end
   if #targets == 1 then
-    open_fk_target(source.relation, cell, targets[1])
+    open_fk_target(source.relation, cell, targets[1], into)
     return
   end
   -- A column can carry more than one reference; ask rather than silently take the first.
@@ -1255,7 +1271,7 @@ function M.follow_fk(cell)
     title = ('%s references'):format(cell.name),
     items = items,
     on_choose = function(target)
-      open_fk_target(source.relation, cell, target)
+      open_fk_target(source.relation, cell, target, into)
     end,
   })
 end
@@ -1297,7 +1313,9 @@ end
 ---@param from dblens.Relation                 -- the table the cursor is on
 ---@param reference dblens.FkReference
 ---@param value any                            -- the referenced value in the current row
-local function open_referencing(from, reference, value)
+---@param into table                           -- the tab `gF` was pressed in
+local function open_referencing(from, reference, value, into)
+  assert(type(into) == 'table', 'app.open_referencing: needs the tab that started the navigation')
   local session = state.session
   local origin = ('%s.%s'):format(from.name, reference.target_column or 'pk')
   local predicate, problem = cell_predicate(session, reference.column, value, '=')
@@ -1305,7 +1323,7 @@ local function open_referencing(from, reference, value)
     M.error(problem)
     return
   end
-  M.open_relation(reference.relation, { filter = predicate, origin = origin })
+  M.open_relation(reference.relation, { filter = predicate, origin = origin, into = into })
   if reference.composite then
     M.notify(
       ('`%s.%s` is part of a composite foreign key; matched on that column only'):format(
@@ -1341,7 +1359,8 @@ end
 
 --- Offer the referencing tables, once every relation's columns are loaded.
 ---@param values table<string, any>  -- the row under the cursor, by column name
-local function offer_references(relation, values)
+---@param into table                 -- the tab `gF` was pressed in
+local function offer_references(relation, values, into)
   local session = state.session
   local found = fk.referencing(session.catalog, relation)
   if #found == 0 then
@@ -1364,7 +1383,7 @@ local function offer_references(relation, values)
     return
   end
   if #usable == 1 then
-    open_referencing(relation, usable[1].reference, usable[1].value)
+    open_referencing(relation, usable[1].reference, usable[1].value, into)
     return
   end
 
@@ -1380,7 +1399,7 @@ local function offer_references(relation, values)
     title = ('referencing %s'):format(relation.name),
     items = items,
     on_choose = function(entry)
-      open_referencing(relation, entry.reference, entry.value)
+      open_referencing(relation, entry.reference, entry.value, into)
     end,
   })
 end
@@ -1414,6 +1433,9 @@ function M.find_referencing(cell)
   end
 
   local relation = source.relation
+  -- Captured at the keystroke: the sweep below is one client call per unloaded table, so by the
+  -- time it answers the user may be looking at a different tab. The rows still belong to this one.
+  local into = state.grid
   set_busy('references', nil)
   -- Reading the whole loaded schema's columns is what makes "nothing references this" true rather
   -- than "nothing that happens to be expanded does".
@@ -1425,7 +1447,7 @@ function M.find_referencing(cell)
         M.error(err)
         return
       end
-      offer_references(relation, values)
+      offer_references(relation, values, into)
     end)
   )
 end

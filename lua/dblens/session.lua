@@ -689,6 +689,9 @@ end
 local KILLED = { timeout = true, cancelled = true, max_bytes = true }
 
 --- Name the queued change a client blamed, using the line it reported.
+---
+--- The queuer's own `label` wins over the queue position: an import numbers by FILE row, and
+--- reporting the queue ordinal there gave the same failure two different numbers.
 ---@return string
 local function describe_failure(owners, info, total, run_err)
   local line = info and info.stderr and exec.error_line(info.stderr) or nil
@@ -696,13 +699,11 @@ local function describe_failure(owners, info, total, run_err)
   if not owner then
     return ('the batch failed and was rolled back: %s'):format(run_err)
   end
+  local named = owner.label or ('change %d of %d'):format(owner.index, total)
   if owner.guard then
-    return ('change %d of %d no longer matches exactly one row, so nothing was applied'):format(
-      owner.index,
-      total
-    )
+    return ('%s no longer matches exactly one row, so nothing was applied'):format(named)
   end
-  return ('change %d of %d failed, so nothing was applied: %s'):format(owner.index, total, run_err)
+  return ('%s failed, so nothing was applied: %s'):format(named, run_err)
 end
 
 --- Commit the queued batch as one atomic script.

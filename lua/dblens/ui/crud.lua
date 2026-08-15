@@ -42,11 +42,14 @@ end
 --- Apply a built change through the session, then reflect the outcome in the grid.
 ---@param change dblens.Change
 ---@param cell dblens.Cell?  -- present for a cell edit, so a queued change can be shown in place
-local function apply(state, change, cell)
-  -- The rows this edit belongs to, captured now: by the time the write reports back the user may
-  -- have switched result tabs or re-run the query, and marking a cell in whatever is on screen
-  -- then would mark a DIFFERENT row.
-  local grid, result = state.grid, state.grid.result
+---@param target { grid: table, result: table }?  -- the tab and result the edit was built from
+local function apply(state, change, cell, target)
+  assert(cell == nil or (target and target.grid), 'crud.apply: a cell edit needs its own tab')
+  -- Captured by the CALLER, before its prompts: `vim.ui.input` and the confirmation are modal in
+  -- the default UI but a third-party one need not be, and reading the tab here would then mark a
+  -- cell in whatever is on screen when the write reports back.
+  local grid = target and target.grid
+  local result = target and target.result
   state.session:execute_write({
     sql = change.sql,
     guard = change.guard,
@@ -87,13 +90,13 @@ local function apply(state, change, cell)
 end
 
 --- Preview a change, then apply it if confirmed.
-local function preview_and_apply(state, change, sections, cell)
+local function preview_and_apply(state, change, sections, cell, target)
   confirm.ask(state.options, {
     title = change.kind:upper() .. ' - confirm',
     danger = change.kind == 'delete',
     sections = sections,
   }, function()
-    apply(state, change, cell)
+    apply(state, change, cell, target)
   end)
 end
 
@@ -121,6 +124,7 @@ function M.edit_cell(state, cell)
   end
   local relation = current_relation(state)
   local result = state.grid.result
+  local target = { grid = state.grid, result = result }
   local key, key_err =
     mutate.row_key(state.session.catalog, relation, result.columns, result.rows[cell.row])
   if not key then
@@ -144,7 +148,7 @@ function M.edit_cell(state, cell)
           lines = { 'applied only if this predicate matches exactly 1 row' },
           hl = 'DbLensDim',
         },
-      }, vim.tbl_extend('force', cell, { pending = value }))
+      }, vim.tbl_extend('force', cell, { pending = value }), target)
     end
   )
 end

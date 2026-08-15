@@ -43,12 +43,21 @@ describe('mariadb.command', function()
   end)
 
   it('opens a read-only session and leaves a writable one alone', function()
-    local switch = '--init-command=SET SESSION TRANSACTION READ ONLY'
+    -- Matched INSIDE the `--init-command`, because it shares one with the `sql_mode` pin: the
+    -- client keeps only the last such option, so they cannot be separate arguments.
+    local function sets_read_only(argv)
+      for _, part in ipairs(argv) do
+        if part:find('SET SESSION TRANSACTION READ ONLY', 1, true) then
+          return true
+        end
+      end
+      return false
+    end
     local locked =
       mariadb.command({ database = 'app', read_only = true }, nil, 'records', h.CLIENTS)
-    eq(h.has(locked.argv, switch), true)
+    eq(sets_read_only(locked.argv), true)
     local open = mariadb.command({ database = 'app', read_only = false }, nil, 'records', h.CLIENTS)
-    eq(h.has(open.argv, switch), false)
+    eq(sets_read_only(open.argv), false)
   end)
 
   it('blocks LOAD DATA LOCAL INFILE whatever the mode', function()
