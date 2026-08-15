@@ -27,6 +27,7 @@ local M = {
     explain = true,
     explain_analyze = true,
     estimate_rows = true,
+    ilike = false,
   },
   read_only_enforcement = {
     mechanism = 'session-and-transaction',

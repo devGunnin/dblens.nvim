@@ -379,7 +379,7 @@ local function handlers(state, app)
       end)
     end,
     filter_cell = with_cell(state, app, function(cell)
-      app.filter_by_cell(cell, '=')
+      require('dblens.ui.filterbuilder').open(state, cell)
     end),
     filter_not_cell = with_cell(state, app, function(cell)
       app.filter_by_cell(cell, '<>')

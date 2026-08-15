@@ -87,6 +87,7 @@ local M = {
     explain = false,
     explain_analyze = false,
     estimate_rows = false,
+    ilike = false,
   },
   read_only_enforcement = {
     mechanism = 'classifier',

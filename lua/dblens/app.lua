@@ -6,6 +6,7 @@
 local common = require('dblens.adapters.common')
 local config = require('dblens.config')
 local connections = require('dblens.connections')
+local filter = require('dblens.filter')
 local fk = require('dblens.fk')
 local grid_mod = require('dblens.render.grid')
 local history = require('dblens.history')
@@ -1252,25 +1253,36 @@ function M.set_filter(where)
   M.count_rows(source.relation, state.grid.filter)
 end
 
+--- Why a LOCKED connection cannot run this generated predicate, in the user's terms.
+---
+--- A locked run must be PROVABLY one statement, and that proof is a byte scan that deliberately
+--- does not read quoting — so a `;` inside a value makes the run unprovable however correctly it
+--- is escaped, and the gate would otherwise refuse it with a message about multiple statements
+--- that says nothing about the cell the user was pointing at.
+---@return string? problem
+local function lock_problem(session, predicate)
+  assert(type(predicate) == 'string' and predicate ~= '', 'app.lock_problem: expected a predicate')
+  if not session:is_read_only() or not predicate:find(';', 1, true) then
+    return nil
+  end
+  return ('this value contains a `;`, and `%s` is LOCKED, so the run cannot be proved to be one '):format(
+    session.spec.name
+  ) .. 'statement. Unlock with `:DbLensWrite` (<leader>dw) to use it.'
+end
+
 --- A predicate comparing a column to a cell value, refused early with a reason the user can act
 --- on rather than left to fail as something else further down.
 ---
---- The value is QUOTED, never spliced, and the predicate is vetted exactly like a typed one. The
---- extra check is the lock: a locked run must be PROVABLY one statement, and that proof is a byte
---- scan that deliberately does not read quoting — so a `;` inside the value makes the run
---- unprovable however correctly it is escaped, and the gate would refuse it with a message about
---- multiple statements that says nothing about the cell the user was pointing at.
+--- The value is QUOTED, never spliced, and the predicate is vetted exactly like a typed one.
 ---@return string? predicate, string? error
 local function cell_predicate(session, column, value, op)
   local predicate, problem = common.cell_predicate(column, value, op, session.adapter.dialect)
   if not predicate then
     return nil, problem
   end
-  if session:is_read_only() and predicate:find(';', 1, true) then
-    return nil,
-      ('this value contains a `;`, and `%s` is LOCKED, so the run cannot be proved to be one '):format(
-        session.spec.name
-      ) .. 'statement. Unlock with `:DbLensWrite` (<leader>dw) to use it.'
+  local locked = lock_problem(session, predicate)
+  if locked then
+    return nil, locked
   end
   return predicate, nil
 end
@@ -1294,6 +1306,41 @@ function M.filter_by_cell(cell, op)
     return
   end
   M.set_filter(predicate)
+end
+
+--- Apply a filter the builder assembled: `<column> <operator> <value...>`, server-side.
+---
+--- The predicate comes from `dblens.filter`, which quotes both the column and every value for the
+--- dialect and vets the result like a typed one; this decides only whether the session can run it
+--- and how it joins the filter already applied. `set_filter` re-reads from page 1, keeping the
+--- sort — the rows that come first have changed.
+---@param column string
+---@param op string        -- an id from `filter.OPERATORS`
+---@param values string[]
+---@param combine 'replace'|'and'
+function M.filter_with(column, op, values, combine)
+  assert(combine == 'replace' or combine == 'and', 'app.filter_with: unknown combine mode')
+  assert(type(column) == 'string' and column ~= '', 'app.filter_with: expected a column')
+  if not state.session then
+    M.error('not connected')
+    return
+  end
+  local source = state.grid.source
+  if not source or source.kind ~= 'relation' then
+    M.notify('filtering needs a table; add a WHERE to the query instead')
+    return
+  end
+  local predicate, problem = filter.build(column, op, values, state.session.adapter.dialect)
+  if not predicate then
+    M.error(problem)
+    return
+  end
+  local locked = lock_problem(state.session, predicate)
+  if locked then
+    M.error(locked)
+    return
+  end
+  M.set_filter(combine == 'and' and filter.combine(state.grid.filter, predicate) or predicate)
 end
 
 function M.clear_filter()
@@ -1385,12 +1432,7 @@ end
 --- The catalog's record of one column of the relation currently browsed.
 ---@return dblens.Column?
 local function column_info(session, relation, name)
-  for _, column in ipairs(session.catalog:info_for(relation).columns or {}) do
-    if column.name == name then
-      return column
-    end
-  end
-  return nil
+  return session.catalog:column(relation, name)
 end
 
 --- The sole primary-key column of a relation, or nil when it has none or several.

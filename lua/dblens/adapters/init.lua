@@ -21,7 +21,10 @@
 ---@field kind string
 ---@field label string
 ---@field dialect dblens.Dialect
----@field caps { schemas: boolean, ddl: 'native'|'reconstructed', explain: boolean, explain_analyze: boolean, estimate_rows: boolean }
+--- `caps.ilike` is the ILIKE KEYWORD, not case-insensitive matching: sqlite and mysql match
+--- case-insensitively with plain LIKE, and neither accepts the word, so the filter builder only
+--- offers it where the engine parses it.
+---@field caps { schemas: boolean, ddl: 'native'|'reconstructed', explain: boolean, explain_analyze: boolean, estimate_rows: boolean, ilike: boolean }
 ---@field read_only_enforcement dblens.ReadOnlyEnforcement
 ---@field fields { name: string, label: string, required: boolean?, default: any }[]
 ---@field validate fun(spec: dblens.ConnectionSpec): string?

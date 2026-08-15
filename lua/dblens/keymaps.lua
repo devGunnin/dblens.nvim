@@ -222,7 +222,7 @@ M.specs = {
     {
       action = 'filter_cell',
       lhs = 'F',
-      desc = 'Filter to this value',
+      desc = 'Filter this column',
       mode = 'n',
       group = 'inspect',
     },
