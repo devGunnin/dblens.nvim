@@ -188,13 +188,12 @@ function M.render_winbar(state)
     segments[#segments + 1] = { text = text, hl = 'DbLensDim' }
   end
   if state.grid.sort then
-    segments[#segments + 1] = {
-      text = ('sort %s %s'):format(
-        state.grid.sort.column,
-        state.grid.sort.desc and 'desc' or 'asc'
-      ),
-      hl = 'DbLensSortKey',
-    }
+    -- In key order, which is the order the server applies them in.
+    local keys = {}
+    for _, key in ipairs(state.grid.sort) do
+      keys[#keys + 1] = ('%s %s'):format(key.column, key.desc and 'desc' or 'asc')
+    end
+    segments[#segments + 1] = { text = 'sort ' .. table.concat(keys, ', '), hl = 'DbLensSortKey' }
   end
   -- Where the view came from, when it was navigated to rather than opened: without it a table
   -- that appeared because a foreign key was followed looks like one the user opened themselves.
@@ -366,6 +365,12 @@ local function handlers(state, app)
     sort = with_cell(state, app, function(cell)
       app.sort_by(cell.name)
     end),
+    add_sort = with_cell(state, app, function(cell)
+      app.add_sort(cell.name)
+    end),
+    clear_sort = function()
+      app.clear_sort()
+    end,
     filter = function()
       vim.ui.input({ prompt = 'WHERE ', default = state.grid.filter or '' }, function(input)
         if input ~= nil then

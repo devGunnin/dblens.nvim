@@ -160,6 +160,10 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   so "nothing references this" means it, and several referencing tables ask which one.
 - **Filter to the cell under the cursor** (`F`), or away from it (`!`), with the value quoted for
   the dialect rather than retyped. `C` clears the filter.
+- **Sort by any column** (`s`, cycling ascending, descending, unsorted), and **by several**: `S`
+  adds the column under the cursor as the next key, `gs` clears them all. The header marks each
+  key with an arrow and, past the first, its position. Every one is a server-side `ORDER BY` with
+  the column name quoted for the dialect, and a change re-reads from page 1.
 - Jump to the first, last, or an arbitrary page (`[P`, `]P`, `gp`).
 - **Search the loaded result** (`g/`, then `gn` / `gN`), matching the underlying values, so a hit
   inside a value the grid clipped is still found and highlighted.
@@ -219,7 +223,7 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 **Extras**
 
-- Server-side sort and WHERE filter on a browsed table, with paging.
+- Server-side sort — single or multi-column, with the keys marked in the header — and a WHERE filter on a browsed table, with paging.
 - `:checkhealth dblens`.
 - A `statusline()` segment: connection, LOCKED/EDIT, transaction state, running query.
 - Highlights derived from your colorscheme, re-derived on `:colorscheme`. Every group is
@@ -341,7 +345,20 @@ Three things are read there:
 | --- | --- |
 | Database files | `*.db` `*.sqlite` `*.sqlite3` `*.sqlite2` `*.duckdb` `*.ddb`, by a bounded walk of the project — **including gitignored ones**, which is what a dev database usually is. The file's magic header decides between SQLite and DuckDB; an ambiguous `.db` with no header is treated as SQLite. |
 | `docker-compose*.yml`, `compose*.yml` | Services whose image is postgres/mysql/mariadb/mssql, with the host port they publish and the user, database and password from their `environment`. `${VAR}` is resolved from the `.env` beside the compose file. A service that publishes no host port is not offered — nothing could connect to it. |
-| `.env`, `.env.*` | Every value that parses as a connection URL (`postgres://`, `postgresql://`, `mysql://`, `mariadb://`, `sqlite:///…`, `duckdb://…`), plus a `PG*` or `MYSQL_*` variable group that names a database. `.env.example` and friends are skipped: they hold placeholders. |
+| `.env`, `.env.*` | Every value that parses as a connection URL (`postgres://`, `postgresql://`, `mysql://`, `mariadb://`, `sqlite:///…`, `duckdb://…`, a driver-suffixed `postgresql+psycopg://` and friends, and `jdbc:postgresql://…`), plus any variable group that names a database — `PG*`, `MYSQL_*`, and project-prefixed ones like `TACTICA_POSTGRES_*`. `.env.example` and friends are skipped: they hold placeholders. |
+
+A variable group is read under whatever prefix a project puts on it. `TACTICA_POSTGRES_DB`,
+`TACTICA_POSTGRES_USER` and `TACTICA_POSTGRES_PASSWORD` are one connection, and a standalone
+`TACTICA_DB_PORT` is the port it answers on here — which is the usual shape, because the group
+describes the container and only that variable says what the port is published as. An absent host
+is `localhost` and an absent port the engine's default; neither is guessed at from anything else,
+and a group that names no database is not a connection. Several prefixes in one file are several
+connections.
+
+A URL pointing at a compose service (`postgresql+psycopg://postgres:postgres@db:5432/tactica`)
+names a host only a sibling container can reach. It is still offered — only you know whether the
+stack is up — but when the same file publishes a port for it, the reachable `localhost` connection
+is offered beside it, and the provenance line tells them apart.
 
 Each candidate shows where it came from, so you can tell a real database from a guess:
 
@@ -349,6 +366,7 @@ Each candidate shows where it came from, so you can tell a real database from a 
 db/dev.sqlite3          (sqlite, file)
 app-db                  (postgres, localhost:5433/shopdb, from docker-compose.yml)
 DATABASE_URL            (postgres, localhost:5432/appdb, from .env)
+tactica                 (postgres, localhost:5433/tactica, from .env)
 Add manually…           the :DbLensAdd form
 Rescan                  look through the project again
 ```
@@ -588,6 +606,8 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `]P` | `last_page` | Last page |
 | `gp` | `goto_page` | Go to page N |
 | `s` | `sort` | Sort by this column |
+| `S` | `add_sort` | Add this column to the sort |
+| `gs` | `clear_sort` | Clear the sort |
 | `f` | `filter` | Filter rows (WHERE) |
 | `F` | `filter_cell` | Filter to this value |
 | `!` | `filter_not_cell` | Filter out this value |
@@ -1195,7 +1215,7 @@ error reporting have much thinner live coverage everywhere — please report wha
   key and says so, so the result may hold more rows than the single referenced one. Reverse
   navigation sees the loaded schema only: it reads the columns of tables that were never
   expanded, but a schema that has not been listed at all is not searched.
-- The `?` overlay no longer fits an 80x24 screen in ANY pane — the grid lists 44 bindings and
+- The `?` overlay no longer fits an 80x24 screen in ANY pane — the grid lists 46 bindings and
   even the sidebar's list is taller than the 18 rows that size leaves. It scrolls there (`j`/`k`),
   and the footer says so; nothing is dropped or cut off the right edge. It fits from about
   100x33.

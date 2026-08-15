@@ -6,12 +6,13 @@
 --- which is a value the caller keeps in memory; it is never part of a spec.
 local M = {}
 
---- URL scheme -> adapter kind. `jdbc:` URLs are deliberately absent: they nest a second URL and
---- their host/port syntax is driver-specific, so guessing at one would invent a target.
+--- URL scheme -> adapter kind, after the scheme has been reduced to the engine it names.
 local SCHEMES = {
   postgres = 'postgres',
   postgresql = 'postgres',
   pg = 'postgres',
+  cockroachdb = 'postgres',
+  cockroach = 'postgres',
   mysql = 'mysql',
   mysql2 = 'mysql',
   mariadb = 'mariadb',
@@ -170,6 +171,27 @@ end
 ---@field sslmode string?
 ---@field secret string?   -- kept in memory by the caller; never written into a spec
 
+--- The engine a scheme names, and everything after it.
+---
+--- SQLAlchemy and Django spell the Python driver into the scheme (`postgresql+psycopg`), and JDBC
+--- nests the real URL behind `jdbc:`. Both still name one engine, so both are reduced to it. What
+--- follows is parsed by the ordinary rules, which is deliberate: a driver-specific spelling
+--- (`jdbc:sqlserver://host;databaseName=x`) then yields no database and is dropped by validation
+--- rather than turned into an invented target.
+---@param url string
+---@return string? scheme, string? rest
+local function split_scheme(url)
+  local head, tail = url:match('^(%a[%w%+%.%-]*):(.*)$')
+  if head and head:lower() == 'jdbc' then
+    head, tail = tail:match('^(%a[%w%+%.%-]*):(.*)$')
+  end
+  if not head then
+    return nil, nil
+  end
+  -- `postgresql+psycopg2` -> `postgresql`; a scheme with no `+` is unchanged.
+  return head:match('^([^+]+)'), tail
+end
+
 --- Parse a database connection URL.
 ---
 --- Returns nil for anything that is not one — an unknown scheme, a bare string, an in-memory
@@ -180,7 +202,7 @@ function M.parse(url)
   if type(url) ~= 'string' or url == '' then
     return nil
   end
-  local scheme, rest = url:match('^(%a[%w%+%.%-]*):(.*)$')
+  local scheme, rest = split_scheme(url)
   if not scheme then
     return nil
   end

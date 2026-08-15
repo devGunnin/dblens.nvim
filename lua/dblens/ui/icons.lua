@@ -25,6 +25,8 @@ local NERD = {
   lock = '\239\128\163', -- nf-fa-lock
   edit = '\239\129\128', -- nf-fa-pencil
   transaction = '\239\131\172', -- nf-fa-exchange
+  sort_asc = '▲',
+  sort_desc = '▼',
 }
 
 --- Default: geometric symbols present in essentially every monospace font.
@@ -46,6 +48,8 @@ local UNICODE = {
   lock = '⊘',
   edit = '✎',
   transaction = '⧗',
+  sort_asc = '▲',
+  sort_desc = '▼',
 }
 
 local PLAIN = {
@@ -66,6 +70,8 @@ local PLAIN = {
   lock = 'RO',
   edit = 'RW',
   transaction = 'TX',
+  sort_asc = '^',
+  sort_desc = 'v',
 }
 
 --- Devicons, when installed, gives a per-filetype glyph for the database file.

@@ -541,7 +541,7 @@ describe('common.page', function()
         limit = 25,
         offset = 50,
         where = 'a = 1',
-        order_by = { column = 'c d', desc = true },
+        order_by = { { column = 'c d', desc = true } },
       }, dialect),
       'SELECT * FROM "s"."t" WHERE a = 1 ORDER BY "c d" DESC LIMIT 25 OFFSET 50'
     )
@@ -560,7 +560,11 @@ describe('common.page', function()
 
   it('sorts ascending unless told otherwise, and quotes the sort column', function()
     eq(
-      common.page({ name = 't' }, { limit = 1, offset = 0, order_by = { column = 'a"b' } }, dialect),
+      common.page(
+        { name = 't' },
+        { limit = 1, offset = 0, order_by = { { column = 'a"b' } } },
+        dialect
+      ),
       'SELECT * FROM "t" ORDER BY "a""b" ASC LIMIT 1 OFFSET 0'
     )
   end)

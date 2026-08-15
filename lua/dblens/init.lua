@@ -8,7 +8,7 @@ local keymaps = require('dblens.keymaps')
 local M = {}
 
 --- Release version. Bumped on tag; see CHANGELOG.md.
-M.VERSION = '1.2.0'
+M.VERSION = '1.3.0'
 
 local configured = false
 

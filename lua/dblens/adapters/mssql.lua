@@ -422,22 +422,8 @@ function M.sql.page(relation, opts)
     type(opts.offset) == 'number' and opts.offset >= 0,
     'mssql.page: offset must not be negative'
   )
-  local order = '(SELECT NULL)'
-  if opts.order_by then
-    local keys = {
-      ('%s %s'):format(
-        sql.quote_ident(opts.order_by.column, dialect),
-        opts.order_by.desc and 'DESC' or 'ASC'
-      ),
-    }
-    -- Appended so a sort on a non-unique column orders every row, not just the distinct ones.
-    for _, column in ipairs(opts.tiebreak or {}) do
-      if column ~= opts.order_by.column then
-        keys[#keys + 1] = sql.quote_ident(column, dialect) .. ' ASC'
-      end
-    end
-    order = table.concat(keys, ', ')
-  end
+  local keys = common.order_keys(opts.order_by, opts.tiebreak, dialect)
+  local order = #keys > 0 and table.concat(keys, ', ') or '(SELECT NULL)'
   local where = ''
   if opts.where and vim.trim(opts.where) ~= '' then
     assert(

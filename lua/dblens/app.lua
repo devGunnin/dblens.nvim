@@ -991,24 +991,96 @@ function M.page_edge(which)
   M.goto_page(pages)
 end
 
---- Sort server-side by a column, cycling ascending -> descending -> unsorted.
----@param column string
-function M.sort_by(column)
+--- The sort keys of the grid on screen, or nil with a message when it cannot be sorted.
+---
+--- Sorting is a server-side ORDER BY on a browsed relation. A query result is whatever the user's
+--- own statement returned, and re-ordering it would mean re-writing their SQL.
+---@return dblens.SortKey[]?
+local function sort_keys()
   local source = state.grid.source
   if not source or source.kind ~= 'relation' then
     M.notify('sorting needs a table; run the query with an ORDER BY instead')
-    return
+    return nil
   end
-  local current = state.grid.sort
-  if not current or current.column ~= column then
-    state.grid.sort = { column = column, desc = false }
-  elseif not current.desc then
-    state.grid.sort = { column = column, desc = true }
-  else
-    state.grid.sort = nil
+  return vim.deepcopy(state.grid.sort or {})
+end
+
+--- Where `column` sits in the sort, or nil when it is not a key.
+---@param keys dblens.SortKey[]
+---@param column string
+---@return integer?
+local function key_index(keys, column)
+  for at, key in ipairs(keys) do
+    if key.column == column then
+      return at
+    end
   end
+  return nil
+end
+
+--- Apply a new set of sort keys and re-read from the FIRST page: a different order means
+--- different rows come first, so the page the user was on no longer names the same ones.
+---@param keys dblens.SortKey[]
+local function apply_sort(keys)
+  assert(vim.islist(keys), 'app.apply_sort: expected a list of sort keys')
+  state.grid.sort = #keys > 0 and keys or nil
   state.grid.paging.page = 1
   M.fetch_page()
+end
+
+--- Sort by one column, cycling ascending -> descending -> unsorted.
+---
+--- Replaces the whole sort rather than adding to it: `s` is "sort by this column", and leaving a
+--- column the user has moved on from still ordering the rows underneath would be a surprise.
+--- `add_sort` is the key that builds a multi-column order.
+---@param column string
+function M.sort_by(column)
+  assert(type(column) == 'string' and column ~= '', 'app.sort_by: expected a column name')
+  local keys = sort_keys()
+  if not keys then
+    return
+  end
+  local only = #keys == 1 and keys[1].column == column and keys[1] or nil
+  if not only then
+    apply_sort({ { column = column, desc = false } })
+  elseif not only.desc then
+    apply_sort({ { column = column, desc = true } })
+  else
+    apply_sort({})
+  end
+end
+
+--- Add a column to the sort as its next key, or cycle one that is already there: ascending ->
+--- descending -> dropped, leaving the keys around it in place.
+---@param column string
+function M.add_sort(column)
+  assert(type(column) == 'string' and column ~= '', 'app.add_sort: expected a column name')
+  local keys = sort_keys()
+  if not keys then
+    return
+  end
+  local at = key_index(keys, column)
+  if not at then
+    keys[#keys + 1] = { column = column, desc = false }
+  elseif not keys[at].desc then
+    keys[at].desc = true
+  else
+    table.remove(keys, at)
+  end
+  apply_sort(keys)
+end
+
+--- Drop every sort key at once.
+function M.clear_sort()
+  local keys = sort_keys()
+  if not keys then
+    return
+  end
+  if #keys == 0 then
+    M.notify('the rows are not sorted')
+    return
+  end
+  apply_sort({})
 end
 
 --- Apply a WHERE predicate to the current relation.
@@ -1769,6 +1841,7 @@ function M.grid_output()
     separator = ui.grid.separator,
     truncation = ui.grid.truncation,
     sort = state.grid.sort,
+    sort_glyphs = { asc = state.icons.sort_asc, desc = state.icons.sort_desc },
     dirty = state.grid.dirty,
     search = state.grid.search and state.grid.search.keys or nil,
   })
