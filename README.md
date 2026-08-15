@@ -181,9 +181,11 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 - Every change is previewed as the exact SQL that will run before it runs.
 - Yank a cell, a row as CSV, as JSON, or as an `INSERT`.
 - Export to CSV, JSON or `.sql` `INSERT` statements — the whole result from the grid (`X`), or a
-  whole table from the tree (`X`). Rows are streamed page by page, the file is renamed into place
-  only once the run completes, and a run stopped by the `export.max_rows` cap says so loudly
-  instead of writing a short file that looks complete.
+  whole table from the tree (`X`). A table export is ONE statement in one client invocation, so
+  the file is a SNAPSHOT: a write that lands while it runs belongs to the next export, never to
+  half of this one. Rows are written as the client emits them, the file is renamed into place only
+  once the run completes, and a run stopped by the `export.max_rows` cap says so loudly instead of
+  writing a short file that looks complete.
 
 **Safety**
 
@@ -395,7 +397,6 @@ require('dblens').setup({
 
   export = {
     max_rows   = 1000000,         -- hard cap on a streamed export; reaching it STOPS it and says so
-    batch_size = 5000,            -- rows fetched per round trip while streaming an export
   },
 
   history = {
@@ -972,9 +973,12 @@ argv run with no shell, and it is checked only for being a runnable argv.
 
 **Filters are vetted by an allow-list.** A `WHERE` typed into the results filter is checked
 before it is spliced into a statement. Rejected: a comment (which would comment out the
-`LIMIT`/`OFFSET` appended after it), a backslash, an unclosed quote, any punctuation outside the
-SQL operator set — which drops `;` and `\` together — and a write verb where a nested statement
-could begin. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
+`LIMIT`/`OFFSET` appended after it), an unclosed quote, any punctuation outside the SQL operator
+set — which drops `;` and a bare `\` together, so psql's `\!` never reaches the client — and a
+write verb where a nested statement could begin. A backslash *inside a literal* is rejected only
+on MySQL and MariaDB, where `NO_BACKSLASH_ESCAPES` decides what it means and dblens cannot see
+which way it is set; the other four have no such escape, so a Windows path or a regex filters
+normally there. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
 column named after a SQL verb can also be quoted. The filter bar is still raw SQL: the check
 stops it escaping the statement, it does not stop an expensive or volatile function call.
 
@@ -1144,8 +1148,16 @@ error reporting have much thinner live coverage everywhere — please report wha
 - Foreign-key navigation is FORWARD only: it goes to the row a cell references, not to the rows
   that reference this one. Where the key spans several columns it follows the one column under
   the cursor and says so, so the result may hold more rows than the single referenced one.
-- The grid's `?` overlay lists 38 bindings, which no longer fit an 80x24 screen — it scrolls
-  there (`j`/`k`) rather than cutting any of them off.
+- The `?` overlay no longer fits an 80x24 screen in ANY pane — the grid lists 38 bindings and
+  even the sidebar's list is taller than the 18 rows that size leaves. It scrolls there (`j`/`k`),
+  and the footer says so; nothing is dropped or cut off the right edge. It fits from about 100x30.
+- A `.sql` export replays TEXT faithfully. A binary/BLOB column does not survive it: the value
+  reaches dblens through the client's text output, where a NUL byte truncates it, so the INSERT
+  carries what the grid shows rather than the bytes in the table. Use the engine's own dump tool
+  for binary columns.
+- A `.sql` export for MySQL/MariaDB escapes backslashes for the default SQL mode, which is the
+  wrong escaping under `NO_BACKSLASH_ESCAPES`. The file says which mode it was written for in a
+  comment at the top.
 - SQLite exposes no schema level (attached databases are out of scope) and has no
   `EXPLAIN ANALYZE` or row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so `D` shows a DDL reconstructed from

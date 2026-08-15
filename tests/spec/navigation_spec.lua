@@ -90,6 +90,25 @@ describe('fk: reading what a column references', function()
     })
   end)
 
+  --- Unquoting the whole `"sch"."t"` string saw one pair of quotes around it and left `sch"."t`,
+  --- a name no catalog holds, so `gf` reported the referenced table was not loaded.
+  it('splits a schema-qualified target at the delimiter, not through it', function()
+    eq(fk.targets('FOREIGN KEY (a) REFERENCES "sch"."t"(x)', 'a')[1], {
+      schema = 'sch',
+      table = 't',
+      column = 'x',
+      composite = false,
+    })
+    -- A dot INSIDE a delimited name still belongs to the name.
+    eq(fk.targets('FOREIGN KEY (a) REFERENCES "my.tbl"(x)', 'a')[1].table, 'my.tbl')
+    eq(fk.targets('FOREIGN KEY (a) REFERENCES sch.t(x)', 'a')[1], {
+      schema = 'sch',
+      table = 't',
+      column = 'x',
+      composite = false,
+    })
+  end)
+
   it('reports nothing rather than guessing when there is no usable metadata', function()
     eq(fk.targets(nil, 'x'), {})
     eq(fk.targets('', 'x'), {})
@@ -129,6 +148,18 @@ describe('fk: resolving a target against the loaded schema', function()
 
   it('reports nothing for a table that is not loaded', function()
     eq(fk.resolve(catalog_with({ public = {} }), { name = 'orders' }, 'users'), nil)
+  end)
+
+  --- A schema the METADATA named is not a preference: `staging.users` is a different table from
+  --- `public.users`, and browsing the wrong one is worse than saying it is not loaded.
+  it('takes the schema the metadata named over the referencing table own', function()
+    local catalog = catalog_with({
+      public = { { schema = 'public', name = 'users', kind = 'table' } },
+      staging = { { schema = 'staging', name = 'users', kind = 'table' } },
+    })
+    local from = { schema = 'staging', name = 'orders', kind = 'table' }
+    eq(fk.resolve(catalog, from, 'users', 'public').schema, 'public')
+    eq(fk.resolve(catalog, from, 'users', 'nowhere'), nil)
   end)
 end)
 
@@ -191,15 +222,42 @@ describe('filter from a cell: the value is data, never syntax', function()
   end)
 
   it('refuses a value it cannot express, instead of sending an unprovable predicate', function()
-    -- A backslash means different things depending on a server setting, so the filter vetting
-    -- refuses it; saying so beats generating a predicate the assertion would then reject.
-    local predicate, err = common.cell_predicate('c', 'a\\b', '=', DIALECT)
-    eq(predicate, nil)
-    eq(type(err) == 'string' and err:find('cannot filter', 1, true) ~= nil, true)
-
     local nul_predicate, nul_err = common.cell_predicate('c', 'a\0b', '=', DIALECT)
     eq(nul_predicate, nil)
     eq(type(nul_err) == 'string' and nul_err:find('NUL', 1, true) ~= nil, true)
+  end)
+
+  --- A backslash is refused where it MIGHT be an escape and nowhere else. On mysql and mariadb
+  --- its meaning depends on `NO_BACKSLASH_ESCAPES`, which dblens cannot see, so the lexer and the
+  --- server could disagree about where the literal ends. The other four have no such escape, and
+  --- refusing a Windows path or a regex there was a usability hole with nothing behind it.
+  it('refuses a backslash only on an engine where it may escape', function()
+    local windows_path = [[C:\\Users\\me]]
+    for _, kind in ipairs({ 'sqlite', 'postgres', 'duckdb', 'mssql' }) do
+      local dialect = sqlmod.dialects[kind]
+      local predicate, err = common.cell_predicate('c', windows_path, '=', dialect)
+      eq(
+        err,
+        nil,
+        { fail_reason = ('%s refused a plain backslash: %s'):format(kind, tostring(err)) }
+      )
+      -- Still exactly one statement, which is the property the refusal was protecting.
+      local statement = ('SELECT * FROM t WHERE %s LIMIT 5 OFFSET 0'):format(predicate)
+      eq(#sqlmod.split(statement, dialect), 1, { fail_reason = statement })
+      eq(predicate:find(windows_path, 1, true) ~= nil, true, { fail_reason = predicate })
+    end
+    for _, kind in ipairs({ 'mysql', 'mariadb' }) do
+      local dialect = sqlmod.dialects[kind] or sqlmod.dialects.mysql
+      local predicate, err = common.cell_predicate('c', windows_path, '=', dialect)
+      eq(predicate, nil, { fail_reason = kind .. ' accepted a backslash it cannot pin down' })
+      eq(err:find('backslash', 1, true) ~= nil, true, { fail_reason = err })
+    end
+    -- A backslash OUTSIDE a literal stays refused everywhere: psql runs `\!` as a shell command.
+    eq(
+      common.check_predicate([[a = 1 \! ls]], sqlmod.dialects.postgres) ~= nil,
+      true,
+      { fail_reason = 'a bare backslash was allowed through' }
+    )
   end)
 
   it('refuses an operator it does not know', function()
@@ -575,6 +633,36 @@ describe('app: jumping to a page', function()
       app.close()
     end)
   end)
+
+  --- With no count there is no last page to clamp against, so the jump goes through and comes
+  --- back empty. Saying so beats a `0 rows` winbar that reads like an empty table.
+  it('says a jump landed past the end when there is no count to clamp it with', function()
+    local said = nil
+    h.with_fake_exec(function()
+      return { stdout = '' }
+    end, function(session_mod)
+      local app, state = browsing(session_mod, nil)
+      -- A FULL page is the only evidence the pager has that more rows may exist, and with no
+      -- count it is what lets any target through.
+      state.grid.result.rows = {}
+      for id = 1, 10 do
+        state.grid.result.rows[id] = { tostring(id) }
+      end
+      local real = app.notify
+      app.notify = function(message)
+        said = message
+      end
+      app.goto_page(500)
+      app.notify = real
+
+      eq(state.grid.paging.page, 500)
+      eq(#state.grid.result.rows, 0)
+      eq(type(said) == 'string' and said:find('past the end', 1, true) ~= nil, true, {
+        fail_reason = ('an empty page 500 said `%s`'):format(tostring(said)),
+      })
+      app.close()
+    end)
+  end)
 end)
 
 -- ---------------------------------------------------------------------------
@@ -684,6 +772,29 @@ end)
 -- ---------------------------------------------------------------------------
 
 describe('picker: running a stored statement instead of pasting it', function()
+  local history = require('dblens.history')
+
+  --- Press the key the picker itself bound, on the entry it is holding. Going through the real
+  --- mapping is the point: asserting `app.run_sql` refuses a DELETE proves nothing about whether
+  --- `<C-r>` reaches it, and reaching `session:run_script` instead would bypass the gate.
+  local function press_run(state, sql)
+    history.record(state.history, state.session.spec.name, sql)
+    require('dblens.ui.picker').history(state)
+    local prompt = vim.api.nvim_get_current_buf()
+    local bound = nil
+    for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(prompt, 'n')) do
+      if mapping.lhs == '<C-R>' or mapping.lhs == '<C-r>' then
+        bound = mapping.callback
+      end
+    end
+    assert(bound, 'the history picker bound no <C-r>')
+    bound()
+    -- `accept` hands the value over on the next tick, so the picker can close first.
+    vim.wait(500, function()
+      return false
+    end)
+  end
+
   it('sends it through the gate, so a write on a LOCKED connection is refused', function()
     h.with_fake_exec(function()
       return {}
@@ -691,10 +802,23 @@ describe('picker: running a stored statement instead of pasting it', function()
       local app, state = open_with_session(session_mod)
       state.session = h.fake_session(session_mod, { read_only = true }, scratch_options())
 
-      -- What `<C-r>` in the history picker does with the entry it is holding.
-      app.run_sql('DELETE FROM t', { label = 'history' })
+      press_run(state, 'DELETE FROM t')
 
       eq(#calls, 0, { fail_reason = 'a stored DELETE ran on a locked connection' })
+      app.close()
+    end)
+  end)
+
+  it('reaches the same runner the editor does, carrying the entry it was on', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+
+      press_run(state, 'SELECT 42 AS answer')
+
+      eq(#calls, 1, { fail_reason = ('<C-r> spawned %d client(s)'):format(#calls) })
+      eq(calls[1].stdin, 'SELECT 42 AS answer')
       app.close()
     end)
   end)

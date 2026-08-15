@@ -102,6 +102,10 @@ end
 
 M.decode = protocol.decode
 
+--- Records are separated by a control byte no value can carry unescaped, so a streamed read cuts
+--- at the last one it has.
+M.stream_boundary = protocol.record_boundary
+
 M.sql = {}
 
 --- sqlite exposes one implicit schema, so the tree skips the schema level entirely.

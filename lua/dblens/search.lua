@@ -33,7 +33,6 @@ function M.find(result, term)
       end
     end
   end
-  assert(#matches == vim.tbl_count(keys), 'search.find: a match must have exactly one key')
   return matches, keys
 end
 

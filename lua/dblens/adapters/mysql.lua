@@ -254,6 +254,19 @@ function M.decode(stdout, opts)
   return { columns = columns, rows = rows, malformed = malformed }
 end
 
+--- How much of a partial `--xml` stream is whole rows: everything up to the last `</row>`.
+---
+--- Safe because the client escapes `<` and `>` in values, so the closing tag cannot appear inside
+--- one. A streamed read is one statement (`Session:stream` refuses anything else), so there is
+--- only ever the one `<resultset>` and no second one's rows can be mistaken for the first's.
+---@param text string
+---@return integer
+function M.stream_boundary(text)
+  assert(type(text) == 'string', 'mysql.stream_boundary: expected a string')
+  local at = text:match('^.*()</row>')
+  return at and (at + 5) or 0
+end
+
 M.sql = {}
 
 function M.sql.schemas()

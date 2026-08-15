@@ -32,8 +32,8 @@ All notable changes to this project are documented here. Format follows
   through them and the winbar shows `1/17`. Matching is over the underlying values, so a hit
   inside a value the grid clipped at `ui.grid.max_col_width` is found — which the buffer's own `/`
   cannot do, because it only ever sees the drawn text.
-- `export.max_rows` (default 1,000,000) and `export.batch_size` (5,000): the bound on a streamed
-  export, and how many rows each round trip asks for.
+- `export.max_rows` (default 1,000,000): the bound on a streamed export. It becomes the `LIMIT` of
+  the one statement the export reads with, so the file is one snapshot of the table.
 - **Workspace discovery** (`:DbLensDiscover`): dblens offers the databases the project in front of
   you has, with where each one came from. It reads database files by a bounded walk — gitignored
   ones included, which is what a dev database usually is, and the magic header rather than the
@@ -56,16 +56,27 @@ All notable changes to this project are documented here. Format follows
 ### Changed
 
 - **Export writes the whole result, not the page on screen.** `X` in the grid re-reads a browsed
-  table page by page with its filter and sort applied and streams it to the file, so the row count
-  in the notification is the row count in the file. Rows are written to a temp file beside the
-  target and renamed into place only once the run completed, so a cancelled (`<C-c>`) or failed
-  export leaves whatever was there before untouched, and an existing file is confirmed before it
-  is replaced.
+  table with its filter and sort applied and streams it to the file, so the row count in the
+  notification is the row count in the file. Rows are written to a temp file beside the target and
+  renamed into place only once the run completed, so a cancelled (`<C-c>`) or failed export leaves
+  whatever was there before untouched, and an existing file is confirmed before it is replaced.
+- **A table export is ONE statement in ONE client invocation**, so the file is a consistent
+  snapshot rather than a stitch of separate reads, and it is bounded by that statement's `LIMIT`
+  instead of by `max_bytes` — a result larger than the client byte cap now exports rather than
+  being killed part-way. `Session:stream` is the new path: the client's output is decoded and
+  written as it arrives, so nothing holds the result in memory. A sort is completed by the primary
+  key, so rows that sort equal come out in the same order every time.
 - **An export format is no longer guessed with a silent CSV fallback.** `.csv`, `.json` and `.sql`
   are recognised; anything else is an error naming the three, instead of a `.tsv` quietly written
   as CSV.
-- The grid's `?` overlay lists 38 bindings, which do not fit an 80x24 screen. It scrolls there
-  (`j`/`k`) rather than dropping or truncating any of them.
+- The `?` overlay does not fit an 80x24 screen in any pane — the grid lists 38 bindings and even
+  the sidebar's list outgrows the 18 rows that size leaves. It scrolls there (`j`/`k`), the footer
+  says so, and nothing is dropped or cut off the right edge.
+- **A filter is refused for a backslash only where a backslash may escape.** MySQL and MariaDB read
+  one inside a literal differently depending on `NO_BACKSLASH_ESCAPES`, which dblens cannot see, so
+  the refusal stands there. SQLite, PostgreSQL, DuckDB and SQL Server have no such escape, so `F`
+  on a Windows path or a regex now filters instead of being refused for a reason that did not
+  apply. A bare backslash outside a literal is still refused everywhere — that is psql's `\!`.
 
 ### Fixed
 
@@ -77,6 +88,33 @@ All notable changes to this project are documented here. Format follows
   client cap, or a query that cannot be re-read safely (several statements, or one that writes).
   A short file is reported as a WARNING and, where the format has a comment syntax, carries the
   reason as a trailing line.
+- **A streamed export was not a consistent read of the table.** It re-read the table page by
+  page, each page its own client process with no ordering tying them together, so a row deleted
+  between two pages shifted every later row up: the file quietly lost a row it had never read and
+  kept one that no longer existed, and still reported "exported N row(s)" with no warning.
+  Measured live on PostgreSQL, a 200-row export with one concurrent `DELETE` wrote 199 rows,
+  including the deleted one and missing one that existed throughout. An export is now one
+  statement, so there is nothing to stitch: what lands during the run belongs to the next export.
+- **A capped CSV or JSON export left no mark in the file itself.** Only `.sql` has a comment
+  syntax, so the notification — which is transient, while the file is not — was the only record
+  that the file was short. A capped export of a format that cannot say so writes a
+  `<name>.INCOMPLETE` beside it, and a later complete export removes a stale one.
+- **A `.sql` export for MySQL/MariaDB did not say which SQL mode it was escaped for.** The same
+  file replays differently with and without `NO_BACKSLASH_ESCAPES`; it now carries a comment
+  naming the assumption.
+- **PostgreSQL paired a composite foreign key by the cross product.** The catalog query joined
+  `key_column_usage` to `constraint_column_usage` on the constraint name alone, so each source
+  column of a two-column key matched BOTH target columns and `gf` could filter the referenced
+  table on the other column's target. The pairing is positional now, through
+  `referential_constraints`; a column carrying two foreign keys also stops duplicating its row.
+- **A schema-qualified DuckDB foreign key resolved to a broken name.** `REFERENCES "sch"."t"(x)`
+  unquoted to the single name `sch"."t`, and `gf` reported the referenced table was not loaded.
+  The target is split at the delimiter, and a schema the metadata named is used to resolve it.
+- **The overwrite prompt asked about readability, not existence.** A file that exists but cannot
+  be read was replaced with no confirmation.
+- **A jump past the end of an uncounted table said only `0 rows`.** With no row count there is no
+  last page to clamp against, so `gp 500` lands on an empty page; it now says the page is past the
+  end and how to get back.
 - **Counting a table from the tree applied the grid's WHERE to it.** `app.count_rows` read
   `state.grid.filter`, so browsing `orders WHERE status = 'shipped'` and then pressing `c` on
   `customers` counted `customers WHERE status = 'shipped'` — an error on an unknown column, or a

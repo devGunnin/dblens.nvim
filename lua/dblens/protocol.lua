@@ -89,6 +89,135 @@ function M.decode(stdout, opts)
   return { columns = columns, rows = rows, malformed = malformed }
 end
 
+--- How many bytes of `text` end on a record boundary, or 0 when no record is complete yet.
+---
+--- A streamed read is handed the client's output at arbitrary byte offsets, so it can only decode
+--- the part that ends where a record does. This is that rule for the control-character protocol.
+---@param text string
+---@return integer
+function M.record_boundary(text)
+  assert(type(text) == 'string', 'protocol.record_boundary: expected a string')
+  -- Greedy `.*` walks to the end and backs off to the LAST separator, in one C call.
+  return text:match('^.*()' .. M.RECORD_SEP) or 0
+end
+
+--- The same, for RFC 4180 CSV, where a value may legally contain the record terminator.
+---
+--- Quote state cannot straddle a cut: a cut only ever lands on a newline OUTSIDE quotes, so the
+--- remainder always starts at the head of a record and this may always start scanning as outside.
+---@param text string
+---@return integer
+function M.csv_boundary(text)
+  assert(type(text) == 'string', 'protocol.csv_boundary: expected a string')
+  local last, from, inside = 0, 1, false
+  while true do
+    local at = text:find(inside and '"' or '["\n]', from)
+    if not at then
+      return last
+    end
+    if text:sub(at, at) == '\n' then
+      last, from = at, at + 1
+    elseif not inside then
+      inside, from = true, at + 1
+    elseif text:sub(at + 1, at + 1) == '"' then
+      -- `""` is an escaped quote inside the value; a lone one closes it.
+      from = at + 2
+    else
+      inside, from = false, at + 1
+    end
+  end
+end
+
+---@class dblens.RowReader
+---@field push fun(chunk: string): any[][]?, string?  -- rows completed by this chunk
+---@field finish fun(): any[][]?, string?             -- rows left in the tail
+---@field columns fun(): string[]
+---@field malformed fun(): integer
+
+--- Decode client output as it arrives, one chunk at a time.
+---
+--- `boundary` is what makes this incremental: it says how much of the buffer is whole records, and
+--- only that much is decoded. An adapter with no such rule (its decoder needs the whole output to
+--- tell rows from the client's trailing summary) passes none, and everything is decoded at
+--- `finish` — correct, but held in memory, which is what `max_buffer` bounds. Exceeding it is an
+--- error rather than a truncation: a short file that reads as a complete one is the bug this
+--- release exists to remove.
+---@param opts { decode: fun(text: string, opts: table): dblens.ResultSet, boundary: (fun(text: string): integer)?, columns: string[]?, max_buffer: integer }
+---@return dblens.RowReader
+function M.reader(opts)
+  assert(type(opts.decode) == 'function', 'protocol.reader: needs a decoder')
+  assert(
+    opts.boundary == nil or type(opts.boundary) == 'function',
+    'protocol.reader: boundary must be a function'
+  )
+  assert(
+    type(opts.max_buffer) == 'number' and opts.max_buffer > 0,
+    'protocol.reader: needs a positive buffer cap'
+  )
+  local boundary = opts.boundary
+  local columns = opts.columns and vim.deepcopy(opts.columns) or {}
+  local seen_header, malformed = false, 0
+  -- Two shapes, because the two modes hold different things: `tail` is the incomplete record a
+  -- framed reader carries to the next chunk, `parts` is the whole output an unframed one keeps.
+  local tail, parts, held = '', {}, 0
+
+  local function take(text)
+    local decoded = opts.decode(text, { header = not seen_header, columns = columns })
+    seen_header = true
+    if #decoded.columns > 0 then
+      columns = decoded.columns
+    end
+    malformed = malformed + decoded.malformed
+    return decoded.rows
+  end
+
+  local function too_big()
+    return ('the result outgrew the %d byte buffer before a whole record arrived'):format(
+      opts.max_buffer
+    )
+  end
+
+  return {
+    push = function(chunk)
+      assert(type(chunk) == 'string', 'protocol.reader: expected a chunk')
+      if not boundary then
+        parts[#parts + 1] = chunk
+        held = held + #chunk
+        if held > opts.max_buffer then
+          return nil, too_big()
+        end
+        return {}, nil
+      end
+      tail = tail .. chunk
+      local cut = boundary(tail)
+      assert(cut >= 0 and cut <= #tail, 'protocol.reader: boundary landed outside the buffer')
+      if cut == 0 then
+        if #tail > opts.max_buffer then
+          return nil, too_big()
+        end
+        return {}, nil
+      end
+      local whole = tail:sub(1, cut)
+      tail = tail:sub(cut + 1)
+      return take(whole), nil
+    end,
+    finish = function()
+      local text = boundary and tail or table.concat(parts)
+      tail, parts, held = '', {}, 0
+      if text == '' then
+        return {}, nil
+      end
+      return take(text), nil
+    end,
+    columns = function()
+      return columns
+    end,
+    malformed = function()
+      return malformed
+    end,
+  }
+end
+
 --- Read one RFC 4180 field starting at `from`.
 ---
 --- Quoting is what carries the meaning here: psql quotes a value only when it contains a comma,
@@ -162,7 +291,7 @@ end
 --- `\r\n`. `read_csv_field` drops that CR as the framing it is, and only there: a CR inside a
 --- QUOTED value is data and survives.
 ---@param stdout string
----@param opts { null_sentinel: string?, columns: string[]? }?
+---@param opts { header: boolean?, null_sentinel: string?, columns: string[]? }?
 ---@return dblens.ResultSet
 function M.decode_csv(stdout, opts)
   assert(type(stdout) == 'string', 'protocol.decode_csv: expected string')
@@ -171,7 +300,9 @@ function M.decode_csv(stdout, opts)
 
   local records = split_csv(stdout)
   local columns = opts.columns and vim.deepcopy(opts.columns) or {}
-  if #records > 0 then
+  -- `header = false` is what a streamed read passes for every chunk after the first: the header
+  -- came in the one before it, and taking a data row for a header would drop it.
+  if opts.header ~= false and #records > 0 then
     columns = records[1].values
     table.remove(records, 1)
   end

@@ -1,12 +1,14 @@
 --- Serialising result sets: yank formats, and file export.
 ---
---- Export is STREAMED and never silently partial. Rows are appended page by page to a temp file
---- beside the target and renamed into place only once the whole run succeeded, so a cancelled or
---- failed export cannot leave a half-written file where a complete one used to be, and the caller
---- is always told how many rows landed and whether a cap stopped them.
+--- Export is STREAMED and never silently partial. Rows are appended to a temp file beside the
+--- target as they arrive and renamed into place only once the whole run succeeded, so a cancelled
+--- or failed export cannot leave a half-written file where a complete one used to be, and the
+--- caller is always told how many rows landed and whether a cap stopped them.
 ---
---- Where the rows come from is the caller's business: `stream` is handed a `fetch` function, so
---- this module knows nothing about sessions, gates or paging.
+--- Where the rows come from is the caller's business: `stream` is handed a `run` function, so this
+--- module knows nothing about sessions or gates. What it does require of that function is the
+--- property the file's honesty rests on — the rows are ONE query's, so the file is one snapshot
+--- of the table rather than a stitch of several reads of a table that may be changing.
 local mutate = require('dblens.mutate')
 local protocol = require('dblens.protocol')
 
@@ -106,10 +108,10 @@ end
 --- Streaming encoders, one per format. Each appends straight to the open file, so an export of
 --- a million rows never has to exist in memory.
 ---
---- `finish(note)` takes the warning the run wants recorded. Only `sql` has a comment syntax to
---- put it in; for `csv` and `json` the notification is the only channel, which is why the caller
---- must never treat a written file as proof the run was complete.
----@type table<string, fun(file: file*, opts: table): { chunk: fun(columns: string[], rows: any[][]), finish: fun(note: string?) }>
+--- `finish(note)` takes the warning the run wants recorded and returns whether it could record it.
+--- Only `sql` has a comment syntax to put it in; a `csv` or `json` file gets a marker written
+--- beside it instead, because the notification is transient and the file outlives it.
+---@type table<string, fun(file: file*, opts: table): { chunk: fun(columns: string[], rows: any[][]), finish: fun(note: string?): boolean }>
 local ENCODERS = {}
 
 ENCODERS.csv = function(file)
@@ -124,7 +126,10 @@ ENCODERS.csv = function(file)
         file:write(csv_line(row, #columns), '\n')
       end
     end,
-    finish = function() end,
+    -- A trailing `#` line is not CSV, and a reader that ignored it would still be short a row.
+    finish = function()
+      return false
+    end,
   }
 end
 
@@ -141,12 +146,21 @@ ENCODERS.json = function(file)
     end,
     finish = function()
       file:write(wrote_any and '\n]\n' or ']\n')
+      return false
     end,
   }
 end
 
 ENCODERS.sql = function(file, opts)
   assert(opts.relation and opts.dialect, 'export: the sql encoder needs a relation and a dialect')
+  -- mysql and mariadb read `\` inside a literal as an escape unless NO_BACKSLASH_ESCAPES is set,
+  -- so the same file replays differently under the two modes. Say which one it was written for.
+  if opts.dialect.backslash_escape then
+    file:write(
+      '-- dblens: backslashes are escaped for the default SQL mode; replaying this under\n',
+      '-- NO_BACKSLASH_ESCAPES would double every one of them.\n'
+    )
+  end
   return {
     chunk = function(columns, rows)
       for _, row in ipairs(rows) do
@@ -157,6 +171,7 @@ ENCODERS.sql = function(file, opts)
       if note then
         file:write('-- ', note, '\n')
       end
+      return true
     end,
   }
 end
@@ -202,12 +217,65 @@ function Writer:chunk(columns, rows)
   self.encoder.chunk(self.columns, rows)
 end
 
+--- Where an incomplete file that cannot hold a comment says so, since it outlives the notification
+--- that said it first.
+---@param target string
+---@return string
+function M.marker_for(target)
+  assert(type(target) == 'string' and target ~= '', 'export.marker_for: needs a target path')
+  return target .. '.INCOMPLETE'
+end
+
+--- Record — or clear — the marker beside a file the format itself could not annotate.
+---@param target string
+---@param note string?  -- nil once the run is known complete
+---@return boolean ok, string? error
+local function write_marker(target, note)
+  local path = M.marker_for(target)
+  if not note then
+    -- A marker left by an earlier capped run would lie about the file that just replaced it.
+    if not vim.uv.fs_stat(path) then
+      return true, nil
+    end
+    local removed, remove_err = os.remove(path)
+    if not removed then
+      return false,
+        ('%s is complete but the stale %s beside it could not be removed: %s'):format(
+          target,
+          path,
+          tostring(remove_err)
+        )
+    end
+    return true, nil
+  end
+  local file, open_err = io.open(path, 'w')
+  if not file then
+    return false,
+      ('%s was written but is INCOMPLETE, and that could not be recorded in %s: %s'):format(
+        target,
+        path,
+        tostring(open_err)
+      )
+  end
+  file:write(note, '\n')
+  local closed, close_err = file:close()
+  if not closed then
+    return false,
+      ('%s was written but is INCOMPLETE, and that could not be recorded in %s: %s'):format(
+        target,
+        path,
+        tostring(close_err)
+      )
+  end
+  return true, nil
+end
+
 --- Close the file and move it into place.
----@param note string?  -- a warning to record in the file, where the format can carry one
+---@param note string?  -- a warning to record, in the file or in a marker beside it
 ---@return boolean ok, string? error
 function Writer:finish(note)
   assert(self.file, 'export writer: already closed')
-  self.encoder.finish(note)
+  local carried = self.encoder.finish(note) == true
   -- Writes are buffered, so `close` is where a full disk or a bad handle actually surfaces.
   local closed, close_err = self.file:close()
   self.file = nil
@@ -220,7 +288,7 @@ function Writer:finish(note)
     os.remove(self.temp)
     return false, ('could not replace %s: %s'):format(self.target, tostring(rename_err))
   end
-  return true, nil
+  return write_marker(self.target, not carried and note or nil)
 end
 
 --- Give up, leaving whatever was already at the target untouched.
@@ -296,25 +364,28 @@ end
 ---@field path string
 ---@field format string
 ---@field max_rows integer  -- hard cap; hitting it stops the run and is reported, never hidden
----@field batch integer     -- rows per fetch
 ---@field relation dblens.Relation?
 ---@field dialect dblens.Dialect?
----@field fetch fun(offset: integer, limit: integer, on_done: fun(result: dblens.ResultSet?, err: string?))
+---@field run fun(sink: fun(columns: string[], rows: any[][]): string?, on_done: fun(err: string?))
 
---- Export by repeatedly fetching a window of rows until the source runs out or the cap stops it.
+--- Export the rows of ONE query, written to the file as they arrive.
+---
+--- `run` must ask its source for at most `max_rows + 1` rows: the extra row never reaches the
+--- file, it is the evidence that the cap — and not the table — decided where the file stopped.
+--- Asking one query for that is what makes the answer trustworthy; asking a second query "is
+--- there more?" would be answering it about a table that may have changed in between.
 ---
 --- The run is finished exactly once: every exit path either renames the file into place or aborts
 --- it, and `on_done` is called with a summary or with the error that stopped it.
 ---@param plan dblens.ExportPlan
 ---@param on_done fun(summary: { rows: integer, capped: boolean, path: string }?, err: string?)
 function M.stream(plan, on_done)
-  assert(type(plan.fetch) == 'function', 'export.stream: needs a fetch function')
+  assert(type(plan.run) == 'function', 'export.stream: needs a run function')
   assert(type(on_done) == 'function', 'export.stream: on_done must be a function')
   assert(
     type(plan.max_rows) == 'number' and plan.max_rows >= 1,
     'export.stream: max_rows must be positive'
   )
-  assert(type(plan.batch) == 'number' and plan.batch >= 1, 'export.stream: batch must be positive')
 
   local writer, open_err = M.open(plan.path, plan.format, plan)
   if not writer then
@@ -322,9 +393,28 @@ function M.stream(plan, on_done)
     return
   end
 
-  local written, offset = 0, 0
+  local written, capped = 0, false
 
-  local function close(capped)
+  --- Take a batch of rows, up to the cap. Returns a message when the run must stop.
+  local function sink(columns, rows)
+    assert(vim.islist(columns) and vim.islist(rows), 'export.stream: expected columns and rows')
+    local room = plan.max_rows - written
+    assert(room >= 0, 'export.stream: wrote past the cap')
+    if #rows > room then
+      capped = true
+      rows = vim.list_slice(rows, 1, room)
+    end
+    writer:chunk(columns, rows)
+    written = written + #rows
+    return nil
+  end
+
+  plan.run(sink, function(err)
+    if err then
+      writer:abort()
+      on_done(nil, err)
+      return
+    end
     local note = capped
         and ('dblens stopped at the %d row export cap - this file is NOT the whole result'):format(
           plan.max_rows
@@ -336,50 +426,7 @@ function M.stream(plan, on_done)
       return
     end
     on_done({ rows = written, capped = capped, path = writer.target }, nil)
-  end
-
-  local function fail(err)
-    writer:abort()
-    on_done(nil, err)
-  end
-
-  --- Reaching the cap on a FULL page leaves it unknown whether anything is left, and the
-  --- difference decides between a clean report and a loud one. One row settles it.
-  local function probe_for_more()
-    plan.fetch(offset, 1, function(result, err)
-      if err then
-        fail(err)
-        return
-      end
-      close(#result.rows > 0)
-    end)
-  end
-
-  local function step()
-    local want = math.min(plan.batch, plan.max_rows - written)
-    assert(want >= 1, 'export.stream: a step must ask for at least one row')
-    plan.fetch(offset, want, function(result, fetch_err)
-      if fetch_err then
-        fail(fetch_err)
-        return
-      end
-      assert(type(result) == 'table' and vim.islist(result.rows), 'export.stream: bad fetch result')
-      writer:chunk(result.columns, result.rows)
-      written = written + #result.rows
-      offset = offset + #result.rows
-      -- A short page is the evidence the source is exhausted.
-      if #result.rows < want then
-        close(false)
-        return
-      end
-      if written < plan.max_rows then
-        step()
-        return
-      end
-      probe_for_more()
-    end)
-  end
-  step()
+  end)
 end
 
 return M

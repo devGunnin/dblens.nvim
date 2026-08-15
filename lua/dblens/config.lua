@@ -36,8 +36,9 @@ M.defaults = {
   discovery = { auto = true, max_depth = 6, max_entries = 20000 },
 
   --- Exporting a whole result or a whole table. `max_rows` is a foot-gun bound, not a render
-  --- limit: reaching it STOPS the export and says so, it never trims the file in silence.
-  export = { max_rows = 1000000, batch_size = 5000 },
+  --- limit: it becomes the LIMIT of the single statement the export reads with, and reaching it
+  --- STOPS the export and says so — it never trims the file in silence.
+  export = { max_rows = 1000000 },
 
   history = { enabled = true, max_entries = 500 },
   --- Restoring reconnects, so it is opt-in: nothing reaches a database on startup by default.
@@ -250,7 +251,6 @@ local function validate(options)
   positive_int(options.max_bytes, 'max_bytes')
   positive_int(options.timeout_ms, 'timeout_ms')
   positive_int(options.export.max_rows, 'export.max_rows')
-  positive_int(options.export.batch_size, 'export.batch_size')
   positive_int(options.history.max_entries, 'history.max_entries')
   positive_int(options.discovery.max_depth, 'discovery.max_depth')
   positive_int(options.discovery.max_entries, 'discovery.max_entries')

@@ -242,3 +242,120 @@ describe('protocol.decode_csv', function()
     eq(decoded.rows[1], { 'one\ntwo', '3' })
   end)
 end)
+
+--- Framing a stream. A chunk arrives at an arbitrary byte, so a reader that decoded each one on
+--- its own would split a row down the middle; only the part that ends where a record does can be
+--- decoded, and the rest waits for the next chunk.
+describe('protocol: where a partial stream may be cut', function()
+  it('cuts the record protocol at the last separator, and nowhere when there is none', function()
+    eq(protocol.record_boundary('a' .. FS .. 'b' .. RS .. 'c'), 4)
+    eq(protocol.record_boundary('a' .. FS .. 'b' .. RS), 4)
+    eq(protocol.record_boundary('no record here'), 0)
+    eq(protocol.record_boundary(''), 0)
+  end)
+
+  it('cuts CSV only at a newline OUTSIDE quotes, since a value may hold one', function()
+    eq(protocol.csv_boundary('a,b\n1,2\n'), 8)
+    eq(protocol.csv_boundary('a,b\n"one\ntwo"'), 4, { fail_reason = 'cut inside a quoted value' })
+    eq(protocol.csv_boundary('a,b\n"one\ntwo",3\n'), 16)
+    -- `""` is an escaped quote inside the value, not the end of it.
+    eq(protocol.csv_boundary('a\n"he said ""hi\n'), 2)
+    eq(protocol.csv_boundary('no newline'), 0)
+  end)
+end)
+
+describe('protocol: decoding a stream as it arrives', function()
+  local function feed(reader, text, size)
+    local rows, err = {}, nil
+    for at = 1, #text, size do
+      local batch, problem = reader.push(text:sub(at, at + size - 1))
+      if problem then
+        err = problem
+        break
+      end
+      vim.list_extend(rows, batch)
+    end
+    if not err then
+      vim.list_extend(rows, (reader.finish()))
+    end
+    return rows, err
+  end
+
+  local WIRE = h.wire({
+    h.record('id', 'name'),
+    h.record('1', 'a'),
+    h.record('2', 'b'),
+    h.record('3', 'c'),
+  })
+
+  it('produces the same rows however the chunks fall', function()
+    local whole = protocol.decode(WIRE, {})
+    for _, size in ipairs({ 1, 2, 3, 5, 7, #WIRE }) do
+      local reader = protocol.reader({
+        decode = protocol.decode,
+        boundary = protocol.record_boundary,
+        max_buffer = 1024,
+      })
+      local rows, err = feed(reader, WIRE, size)
+      eq(err, nil)
+      eq(
+        rows,
+        whole.rows,
+        { fail_reason = ('chunks of %d bytes decoded differently'):format(size) }
+      )
+      eq(reader.columns(), { 'id', 'name' })
+    end
+  end)
+
+  it('takes the header from the wire, not from the column list it was seeded with', function()
+    local reader = protocol.reader({
+      decode = protocol.decode,
+      boundary = protocol.record_boundary,
+      columns = { 'stale', 'names' },
+      max_buffer = 1024,
+    })
+    feed(reader, WIRE, 4)
+    eq(reader.columns(), { 'id', 'name' })
+  end)
+
+  it('keeps a seeded column list when the result is empty', function()
+    local reader = protocol.reader({
+      decode = protocol.decode,
+      boundary = protocol.record_boundary,
+      columns = { 'id', 'name' },
+      max_buffer = 1024,
+    })
+    eq(select(1, reader.finish()), {})
+    eq(reader.columns(), { 'id', 'name' })
+  end)
+
+  it('decodes CSV across a chunk that lands inside a quoted newline', function()
+    local text = 'a,b\n"one\ntwo",3\nx,4\n'
+    local reader = protocol.reader({
+      decode = protocol.decode_csv,
+      boundary = protocol.csv_boundary,
+      max_buffer = 1024,
+    })
+    local rows, err = feed(reader, text, 6)
+    eq(err, nil)
+    eq(rows, { { 'one\ntwo', '3' }, { 'x', '4' } })
+  end)
+
+  --- Without a boundary rule the whole output has to be held, so the cap is what stops it growing
+  --- without bound. It is an ERROR, never a short result reported as a whole one.
+  it('refuses to buffer past its cap rather than returning half a result', function()
+    local reader = protocol.reader({ decode = protocol.decode, max_buffer = 8 })
+    local rows, err = feed(reader, WIRE, 4)
+    eq(rows, {})
+    eq(type(err) == 'string' and err:find('outgrew', 1, true) ~= nil, true, {
+      fail_reason = tostring(err),
+    })
+  end)
+
+  it('decodes everything at the end when there is no boundary rule', function()
+    local reader = protocol.reader({ decode = protocol.decode, max_buffer = 1024 })
+    local rows, err = feed(reader, WIRE, 4)
+    eq(err, nil)
+    eq(rows, protocol.decode(WIRE, {}).rows)
+  end)
+end)

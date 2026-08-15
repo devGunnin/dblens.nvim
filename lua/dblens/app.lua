@@ -784,6 +784,15 @@ function M.fetch_page()
       end
       present(result, source)
       M.render()
+      -- Past the end. Without a row count the pager cannot clamp a jump — a full page is all it
+      -- knows — so `gp 500` lands here, and a bare `0 rows` winbar looks like an empty table.
+      if #result.rows == 0 and state.grid.paging.page > 1 then
+        M.notify(
+          ('page %d is past the end of this result - `[P` goes back to the first page'):format(
+            state.grid.paging.page
+          )
+        )
+      end
     end)
   )
   track(job)
@@ -1077,11 +1086,12 @@ end
 ---@param target dblens.FkTarget
 local function open_fk_target(from, cell, target)
   local session = state.session
-  local relation = fk.resolve(session.catalog, from, target.table)
+  local relation = fk.resolve(session.catalog, from, target.table, target.schema)
   if not relation then
+    local named = target.schema and ('%s.%s'):format(target.schema, target.table) or target.table
     M.error(
       ('the referenced table `%s` is not in the loaded schema - reload it from the tree'):format(
-        target.table
+        named
       )
     )
     return

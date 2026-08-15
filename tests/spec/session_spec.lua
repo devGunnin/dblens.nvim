@@ -451,6 +451,83 @@ describe('exec.format_error: the reason, not the first noise on stderr', functio
   end)
 end)
 
+--- The streamed read the export is built on. It is the only path that promises a CONSISTENT view
+--- of a table, and everything about that promise rests on it being one statement in one client.
+describe('session: a streamed read is one statement, one client', function()
+  local WIRE = h.wire({ h.record('id'), h.record('1'), h.record('2') })
+
+  local function collect(session, statement, canned)
+    local rows, summary, failure = {}, nil, nil
+    session:stream(statement, {
+      on_rows = function(_, batch)
+        vim.list_extend(rows, batch)
+        return nil
+      end,
+    }, function(result, err)
+      summary, failure = result, err
+    end)
+    return rows, summary, failure, canned
+  end
+
+  it('delivers the rows and reports how many, without accumulating the result', function()
+    h.with_fake_exec(function()
+      return { stdout = WIRE }
+    end, function(session_mod, calls)
+      local session = h.fake_session(session_mod)
+      local rows, summary, failure = collect(session, 'SELECT id FROM t')
+      eq(failure, nil)
+      eq(rows, { { '1' }, { '2' } })
+      eq(summary.rows, 2)
+      eq(#calls, 1, { fail_reason = 'a streamed read spawned more than one client' })
+      -- Nothing was kept: `exec` handed each chunk over instead of collecting it.
+      eq(calls[1].spec.on_stdout ~= nil, true)
+    end)
+  end)
+
+  it('refuses anything it cannot prove is one statement, whatever the mode', function()
+    h.with_fake_exec(function()
+      return { stdout = WIRE }
+    end, function(session_mod, calls)
+      -- Writable, so the refusal is the streamed read's own rule and not the locked gate's.
+      local session = h.fake_session(session_mod, { read_only = false })
+      local _, summary, failure = collect(session, 'SELECT 1; SELECT 2')
+      eq(summary, nil)
+      eq(failure:find('one statement', 1, true) ~= nil, true, { fail_reason = failure })
+      eq(#calls, 0, { fail_reason = 'a two-statement stream reached the client' })
+    end)
+  end)
+
+  it('goes through the same gate, so a write is refused on a locked connection', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local session = h.fake_session(session_mod, { read_only = true })
+      local _, summary, failure = collect(session, 'DELETE FROM t')
+      eq(summary, nil)
+      eq(failure:find('read-only', 1, true) ~= nil, true, { fail_reason = tostring(failure) })
+      eq(#calls, 0)
+    end)
+  end)
+
+  it('stops the client when the consumer cannot take what it is handed', function()
+    h.with_fake_exec(function()
+      return { stdout = WIRE }
+    end, function(session_mod)
+      local session = h.fake_session(session_mod)
+      local summary, failure = nil, nil
+      session:stream('SELECT id FROM t', {
+        on_rows = function()
+          return 'the disk is full'
+        end,
+      }, function(result, err)
+        summary, failure = result, err
+      end)
+      eq(summary, nil)
+      eq(failure, 'the disk is full', { fail_reason = tostring(failure) })
+    end)
+  end)
+end)
+
 describe('protocol: NULL stays distinguishable', function()
   it('reads the sentinel as NULL and a value as itself', function()
     local decoded = protocol.decode(h.wire({ h.record('a'), h.record(h.NULL_SENTINEL) }))

@@ -650,7 +650,7 @@ end)
 --- and a case that cannot land even when allowed would prove nothing about the locked run.
 describe('duckdb, live: the engine refuses the write, not the classifier', function()
   local duckdb = get('duckdb')
-  local scratch, client = nil, nil
+  local scratch, client, clients = nil, nil, nil
 
   local function seed()
     local db = ('%s/victim-%d.duckdb'):format(scratch, math.random(1, 2 ^ 30))
@@ -681,7 +681,9 @@ describe('duckdb, live: the engine refuses the write, not the classifier', funct
 
   local function send(db, read_only, statement)
     local spec = { kind = 'duckdb', path = db, read_only = read_only }
-    local command = duckdb.command(spec, nil, 'records', h.CLIENTS)
+    -- The TARGET's clients, not the defaults: `DBLENS_TEST_DUCKDB_CLIENT` names the binary under
+    -- test, and building the argv from the default map ran a different one (or none).
+    local command = duckdb.command(spec, nil, 'records', clients)
     return vim.system(command.argv, { stdin = statement }):wait(60000)
   end
 
@@ -696,6 +698,7 @@ describe('duckdb, live: the engine refuses the write, not the classifier', funct
   before_each(function()
     local target = h.live_file_client('duckdb')
     client = target and target.client or nil
+    clients = target and target.clients or h.CLIENTS
     scratch = vim.fn.tempname()
     vim.fn.mkdir(scratch, 'p')
   end)

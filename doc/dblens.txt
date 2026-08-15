@@ -348,20 +348,27 @@ an INSERT statement.
 
                                                        *dblens-usage-export*
 `X` exports. In the grid it writes the WHOLE result - a browsed table is
-re-read page by page with its filter and sort applied, not just the page on
-screen - and in the tree it writes a whole table, unfiltered. The format comes
-from the extension: `.csv`, `.json` or `.sql` (INSERT statements, so it needs a
-table rather than a query result). An extension naming none of those is an
-error, never a silent CSV.
+re-read with its filter and sort applied, not just the page on screen - and in
+the tree it writes a whole table, unfiltered. The format comes from the
+extension: `.csv`, `.json` or `.sql` (INSERT statements, so it needs a table
+rather than a query result). An extension naming none of those is an error,
+never a silent CSV.
 
-Rows are streamed, so a large export never has to fit in memory, and the file
-is renamed into place only once the run has finished - a cancelled (`<C-c>`)
-or failed export leaves whatever was there before untouched. An existing file
-is confirmed before it is replaced.
+A table is read by ONE statement in ONE client invocation, so the file is a
+SNAPSHOT of it: a write that commits while the export is running belongs to
+the next export, never to part of this one. Rows are written as the client
+emits them, so a large export never has to fit in memory, and the file is
+renamed into place only once the run has finished - a cancelled (`<C-c>`) or
+failed export leaves whatever was there before untouched. An existing file is
+confirmed before it is replaced. A sort is completed by the primary key, so
+two rows that sort equal come out in the same order every time.
 
-An export STOPS at `export.max_rows` (default 1,000,000) and says so in the
-notification, and in a trailing comment where the format has one. A short file
-is never reported as a complete one. Where a query result cannot be re-read
+An export STOPS at `export.max_rows` (default 1,000,000), which is the LIMIT
+of that one statement, and says so in the notification and in a trailing
+comment where the format has one. CSV and JSON have nowhere to put it, so a
+capped one of those gets a `<name>.INCOMPLETE` file beside it - the
+notification is transient and the file is not. A short file is never reported
+as a complete one. Where a query result cannot be re-read
 safely - several statements, or one that writes - the rows already fetched are
 written and the shortfall is stated the same way.
 
@@ -576,7 +583,6 @@ Every option with its default: >lua
         -- Hard cap on a streamed export. Reaching it STOPS the run and says
         -- so; it never trims the file in silence.
         max_rows   = 1000000,
-        batch_size = 5000,    -- rows per round trip while streaming
       },
 
       history = {
@@ -1106,9 +1112,13 @@ FILTERS                                                 *dblens-safety-filter*
 
 A WHERE typed into the results filter is checked by an allow-list before it is
 spliced into a statement. Rejected: a comment (which would comment out the
-LIMIT/OFFSET appended after it), a backslash, an unclosed quote, any
-punctuation outside the SQL operator set - which drops `;` and `\` together -
-and a write verb where a nested statement could begin.
+LIMIT/OFFSET appended after it), an unclosed quote, any punctuation outside
+the SQL operator set - which drops `;` and a bare `\` together, so psql's `\!`
+never reaches the client - and a write verb where a nested statement could
+begin. A backslash INSIDE a literal is rejected only on MySQL and MariaDB,
+where `NO_BACKSLASH_ESCAPES` decides what it means and dblens cannot see which
+way it is set; the other engines have no such escape, so a Windows path or a
+regex filters normally there.
 
 `REPLACE(...)`, a column called `comment` and non-ASCII identifiers are
 accepted; a column named after a SQL verb can also be quoted.
@@ -1334,8 +1344,17 @@ Other limits:
 - Foreign-key navigation is FORWARD only. Where a key spans several columns it
   follows the one column under the cursor and says so, so the referenced view
   may hold more rows than the single row referenced.
-- The grid's `?` overlay lists 38 bindings and no longer fits an 80x24 screen;
-  it scrolls (`j`/`k`) rather than cutting any of them off.
+- The `?` overlay no longer fits an 80x24 screen in ANY pane - the grid lists
+  38 bindings, and even the sidebar's list is taller than the 18 rows that
+  size leaves. It scrolls there (`j`/`k`) and the footer says so; nothing is
+  dropped or cut off the right edge. It fits from about 100x30.
+- A `.sql` export replays TEXT faithfully. A binary/BLOB column does not
+  survive it: the value reaches dblens through the client's text output, where
+  a NUL byte truncates it, so the INSERT carries what the grid shows rather
+  than the bytes in the table. Use the engine's own dump tool for those.
+- A `.sql` export for MySQL/MariaDB escapes backslashes for the default SQL
+  mode, which is the wrong escaping under NO_BACKSLASH_ESCAPES. The file names
+  the mode it was written for in a comment at the top.
 - SQLite exposes no schema level (attached databases are out of scope) and has
   neither EXPLAIN ANALYZE nor a row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so the DDL view is

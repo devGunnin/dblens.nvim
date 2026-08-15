@@ -157,6 +157,10 @@ end
 
 M.decode = protocol.decode_csv
 
+--- psql emits RFC 4180 CSV, where a value may contain the record terminator, so the framing a
+--- streamed read cuts on has to be quote-aware.
+M.stream_boundary = protocol.csv_boundary
+
 M.sql = {}
 
 function M.sql.schemas()
@@ -172,6 +176,11 @@ FROM information_schema.tables WHERE table_schema = %s ORDER BY kind DESC, table
   )
 end
 
+--- The foreign key is paired POSITIONALLY, through `referential_constraints`. Joining
+--- `key_column_usage` to `constraint_column_usage` on the constraint name alone is a cross
+--- product over a composite key: every source column matches every target column, so `gf` could
+--- filter the referenced table on the OTHER column's target. `string_agg` keeps it one row per
+--- column, which is also what a column carrying two foreign keys needs.
 function M.sql.columns(relation)
   local schema, name = lit(relation.schema or 'public'), lit(relation.name)
   return ([[SELECT c.column_name AS name, c.data_type AS type,
@@ -187,13 +196,18 @@ LEFT JOIN (
   WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = %s AND tc.table_name = %s
 ) pk ON pk.column_name = c.column_name
 LEFT JOIN (
-  SELECT kcu.column_name, ccu.table_name || '.' || ccu.column_name AS ref
+  SELECT kcu.column_name, string_agg(tgt.table_name || '.' || tgt.column_name, ', ') AS ref
   FROM information_schema.table_constraints tc
   JOIN information_schema.key_column_usage kcu
-    ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema
-  JOIN information_schema.constraint_column_usage ccu
-    ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+    ON kcu.constraint_name = tc.constraint_name AND kcu.constraint_schema = tc.constraint_schema
+  JOIN information_schema.referential_constraints rc
+    ON rc.constraint_name = tc.constraint_name AND rc.constraint_schema = tc.constraint_schema
+  JOIN information_schema.key_column_usage tgt
+    ON tgt.constraint_name = rc.unique_constraint_name
+   AND tgt.constraint_schema = rc.unique_constraint_schema
+   AND tgt.ordinal_position = kcu.position_in_unique_constraint
   WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s AND tc.table_name = %s
+  GROUP BY kcu.column_name
 ) fk ON fk.column_name = c.column_name
 WHERE c.table_schema = %s AND c.table_name = %s
 ORDER BY c.ordinal_position]]):format(schema, name, schema, name, schema, name)

@@ -4,6 +4,13 @@
 --- ONE PAGE, and reported "exported 100 row(s)" — true, and therefore easy to miss — while the
 --- README promised the whole result. A truncated query result went the same way, with
 --- `state.grid.truncated` never consulted.
+---
+--- The second defect, which the first fix introduced: reading the table back page by page, each
+--- page its own client process, is not a consistent read. A row deleted between two pages shifted
+--- every later row up, so the file quietly lost one it never read and kept one that no longer
+--- existed — and still reported success. The export is now ONE statement in ONE invocation, which
+--- is what `only one client invocation` below is really asserting.
+local MiniTest = require('mini.test')
 local h = require('helpers')
 
 local export = require('dblens.export')
@@ -37,17 +44,32 @@ local function read(path)
   return text
 end
 
---- A source of `total` rows, answering each window the way a paged SELECT would.
-local function paged_source(total, seen)
-  return function(offset, limit, on_done)
-    if seen then
-      seen[#seen + 1] = { offset = offset, limit = limit }
+--- One query's rows, arriving in batches the way a streamed client's output does.
+---
+--- `available` is what the table holds and `limit` is the statement's own LIMIT, so a run that
+--- yields `limit` rows is exactly the case where the cap, and not the table, decided where the
+--- file ended.
+local function query_source(available, limit, batch)
+  local supply = math.min(available, limit)
+  return function(sink, on_done)
+    local sent = 0
+    while sent < supply do
+      local rows = {}
+      for id = sent + 1, math.min(sent + batch, supply) do
+        rows[#rows + 1] = { tostring(id), 'name ' .. id }
+      end
+      sent = sent + #rows
+      local problem = sink({ 'id', 'name' }, rows)
+      if problem then
+        on_done(problem)
+        return
+      end
     end
-    local rows = {}
-    for id = offset + 1, math.min(offset + limit, total) do
-      rows[#rows + 1] = { tostring(id), 'name ' .. id }
+    -- A result with no rows still carries its columns, so the header is written either way.
+    if sent == 0 then
+      sink({ 'id', 'name' }, {})
     end
-    on_done({ columns = { 'id', 'name' }, rows = rows, malformed = 0 }, nil)
+    on_done(nil)
   end
 end
 
@@ -76,8 +98,7 @@ describe('export: the file is only replaced once the whole run succeeded', funct
       path = path,
       format = 'csv',
       max_rows = 100,
-      batch = 2,
-      fetch = paged_source(5),
+      run = query_source(5, 101, 2),
     }, function(summary, err)
       eq(err, nil)
       eq(summary.rows, 5)
@@ -86,26 +107,20 @@ describe('export: the file is only replaced once the whole run succeeded', funct
     eq(vim.fn.glob(dir .. '/*.tmp'), '', { fail_reason = 'a temp file was left behind' })
   end)
 
-  it('leaves the previous file untouched when a fetch fails part-way', function()
+  it('leaves the previous file untouched when the read fails part-way', function()
     local dir = scratch_dir()
     local path = dir .. '/out.csv'
     local file = assert(io.open(path, 'w'))
     file:write('the file that was already there\n')
     file:close()
 
-    local page = 0
     export.stream({
       path = path,
       format = 'csv',
       max_rows = 100,
-      batch = 2,
-      fetch = function(offset, limit, on_done)
-        page = page + 1
-        if page > 1 then
-          on_done(nil, 'the client was cancelled')
-          return
-        end
-        paged_source(50)(offset, limit, on_done)
+      run = function(sink, on_done)
+        sink({ 'id', 'name' }, { { '1', 'name 1' }, { '2', 'name 2' } })
+        on_done('the client was cancelled')
       end,
     }, function(summary, err)
       eq(summary, nil)
@@ -126,10 +141,9 @@ describe('export: a cap stops the run and says so', function()
       path = path,
       format = 'sql',
       max_rows = 3,
-      batch = 2,
       relation = RELATION,
       dialect = DIALECT,
-      fetch = paged_source(100),
+      run = query_source(100, 4, 2),
     }, function(summary)
       captured = summary
     end)
@@ -141,14 +155,13 @@ describe('export: a cap stops the run and says so', function()
     eq(text:find('NOT the whole result', 1, true) ~= nil, true, { fail_reason = text })
   end)
 
-  it('does not claim a cap when the source simply ran out on the boundary', function()
+  it('does not claim a cap when the table simply ran out on the boundary', function()
     local captured
     export.stream({
       path = scratch_dir() .. '/out.csv',
       format = 'csv',
       max_rows = 10,
-      batch = 4,
-      fetch = paged_source(10),
+      run = query_source(10, 11, 4),
     }, function(summary)
       captured = summary
     end)
@@ -156,23 +169,52 @@ describe('export: a cap stops the run and says so', function()
     eq(captured.capped, false)
   end)
 
-  it('asks for no more rows than the cap leaves, then one to settle whether any are', function()
-    local seen = {}
+  it('never writes the row past the cap, which is only there to prove the cap was hit', function()
+    local path = scratch_dir() .. '/out.csv'
     export.stream({
-      path = scratch_dir() .. '/out.csv',
+      path = path,
       format = 'csv',
-      max_rows = 5,
-      batch = 4,
-      fetch = paged_source(100, seen),
+      max_rows = 3,
+      run = query_source(100, 4, 4),
     }, function(summary)
-      eq(summary.rows, 5)
+      eq(summary.rows, 3)
       eq(summary.capped, true)
     end)
-    eq(seen, {
-      { offset = 0, limit = 4 },
-      { offset = 4, limit = 1 },
-      -- The probe: it decides the report, and its row is never written.
-      { offset = 5, limit = 1 },
+    eq(read(path), 'id,name\n1,name 1\n2,name 2\n3,name 3\n')
+  end)
+
+  it('marks a capped csv beside itself, since csv has nowhere to say it', function()
+    local path = scratch_dir() .. '/out.csv'
+    export.stream({
+      path = path,
+      format = 'csv',
+      max_rows = 2,
+      run = query_source(100, 3, 3),
+    }, function(summary, err)
+      eq(err, nil)
+      eq(summary.capped, true)
+    end)
+    local marker = read(export.marker_for(path))
+    eq(marker:find('NOT the whole result', 1, true) ~= nil, true, { fail_reason = marker })
+  end)
+
+  it('clears a stale marker when a later complete export replaces the file', function()
+    local path = scratch_dir() .. '/out.csv'
+    local stale = assert(io.open(export.marker_for(path), 'w'))
+    stale:write('left by an earlier capped run\n')
+    stale:close()
+
+    export.stream({
+      path = path,
+      format = 'csv',
+      max_rows = 100,
+      run = query_source(2, 101, 2),
+    }, function(summary, err)
+      eq(err, nil)
+      eq(summary.capped, false)
+    end)
+    eq(vim.fn.filereadable(export.marker_for(path)), 0, {
+      fail_reason = 'a complete file kept a marker calling it incomplete',
     })
   end)
 end)
@@ -185,8 +227,7 @@ describe('export: the formats', function()
         path = path,
         format = format,
         max_rows = 100,
-        batch = 2,
-        fetch = paged_source(3),
+        run = query_source(3, 101, 2),
       }, opts or {}),
       function(_, err)
         eq(err, nil)
@@ -282,13 +323,14 @@ local function open_with_session(session_mod, extra)
 end
 
 --- Client stdout for `SELECT * FROM ... LIMIT n OFFSET k` against a table of `total` rows.
-local function wire_page(stdin, total)
+---@param names string[]?  -- row values, defaulting to `name <id>`
+local function wire_page(stdin, total, names)
   local limit = tonumber(stdin:match('LIMIT (%d+)'))
   local offset = tonumber(stdin:match('OFFSET (%d+)'))
   assert(limit and offset, 'the page statement carried no LIMIT/OFFSET: ' .. stdin)
   local records = { h.record('id', 'name') }
   for id = offset + 1, math.min(offset + limit, total) do
-    records[#records + 1] = h.record(tostring(id), 'name ' .. id)
+    records[#records + 1] = h.record(tostring(id), names and names[id] or ('name ' .. id))
   end
   return h.wire(records)
 end
@@ -296,7 +338,7 @@ end
 describe('export: the grid writes the whole table, not the page on screen', function()
   local exporter = require('dblens.ui.exporter')
 
-  it('re-reads every page, so the file is the result and not the window into it', function()
+  it('reads the whole table, not the window the grid holds', function()
     h.with_fake_exec(function(call)
       if call.stdin:find('SELECT * FROM', 1, true) then
         return { stdout = wire_page(call.stdin, 5) }
@@ -306,7 +348,7 @@ describe('export: the grid writes the whole table, not the page on screen', func
       -- page_size 2 is what the old code exported: one page of a five-row table.
       local app, state = open_with_session(session_mod, {
         page_size = 2,
-        export = { batch_size = 2, max_rows = 1000 },
+        export = { max_rows = 1000 },
       })
       state.grid.source = { kind = 'relation', relation = RELATION, label = 'orders' }
       state.grid.result = {
@@ -323,6 +365,55 @@ describe('export: the grid writes the whole table, not the page on screen', func
     end)
   end)
 
+  --- The consistency defect, driven deterministically: the table CHANGES the moment a second read
+  --- would happen. A paged export took the file from both versions and reported it complete; one
+  --- statement can only ever see one of them, so there is nothing to stitch and nothing to lose.
+  it('reads it in ONE statement, so a write between reads cannot skew the file', function()
+    local before = { 'a', 'b', 'c', 'd' }
+    local reads = 0
+    h.with_fake_exec(function(call)
+      if not call.stdin:find('SELECT * FROM', 1, true) then
+        return {}
+      end
+      reads = reads + 1
+      -- Every read after the first sees a table one row shorter, with the rest shifted up.
+      if reads == 1 then
+        return { stdout = wire_page(call.stdin, 4, before) }
+      end
+      return { stdout = wire_page(call.stdin, 3, { 'a', 'c', 'd' }) }
+    end, function(session_mod)
+      local app, state = open_with_session(session_mod, { export = { max_rows = 1000 } })
+      local path = scratch_dir() .. '/table.csv'
+      exporter.relation(state, RELATION, { path = path, format = 'csv' })
+
+      eq(reads, 1, { fail_reason = ('the export read the table %d times'):format(reads) })
+      eq(read(path), 'id,name\n1,a\n2,b\n3,c\n4,d\n')
+      app.close()
+    end)
+  end)
+
+  it('asks for one row past the cap, so a capped run is told from an exhausted one', function()
+    local sent = {}
+    h.with_fake_exec(function(call)
+      if call.stdin:find('SELECT * FROM', 1, true) then
+        sent[#sent + 1] = call.stdin
+        return { stdout = wire_page(call.stdin, 100) }
+      end
+      return {}
+    end, function(session_mod)
+      local app, state = open_with_session(session_mod, { export = { max_rows = 3 } })
+      local path = scratch_dir() .. '/table.csv'
+      exporter.relation(state, RELATION, { path = path, format = 'csv' })
+
+      eq(#sent, 1)
+      eq(sent[1]:find('LIMIT 4 OFFSET 0', 1, true) ~= nil, true, { fail_reason = sent[1] })
+      eq(read(path), 'id,name\n1,name 1\n2,name 2\n3,name 3\n')
+      local marker = read(export.marker_for(path))
+      eq(marker:find('NOT the whole result', 1, true) ~= nil, true, { fail_reason = marker })
+      app.close()
+    end)
+  end)
+
   it('carries the grid filter and sort into the export, so the file matches the view', function()
     local sent = {}
     h.with_fake_exec(function(call)
@@ -332,17 +423,46 @@ describe('export: the grid writes the whole table, not the page on screen', func
       end
       return {}
     end, function(session_mod)
-      local app, state = open_with_session(session_mod, { export = { batch_size = 50 } })
+      local app, state = open_with_session(session_mod)
       state.grid.source = { kind = 'relation', relation = RELATION, label = 'orders' }
       state.grid.result = { columns = { 'id', 'name' }, rows = {}, malformed = 0 }
       state.grid.filter = "id > '3'"
-      state.grid.sort = { column = 'id', desc = true }
+      state.grid.sort = { column = 'name', desc = true }
+      -- A loaded catalog, so the primary key is there to break ties with.
+      state.session.catalog:set_part(RELATION, 'columns', {
+        { name = 'id', type = 'int', notnull = true, pk = 1 },
+        { name = 'name', type = 'text', notnull = false, pk = 0 },
+      })
 
       exporter.current(state, { path = scratch_dir() .. '/out.csv', format = 'csv' })
 
       eq(#sent, 1)
       eq(sent[1]:find("WHERE id > '3'", 1, true) ~= nil, true, { fail_reason = sent[1] })
-      eq(sent[1]:find('ORDER BY "id" DESC', 1, true) ~= nil, true, { fail_reason = sent[1] })
+      -- The primary key is appended so two rows with the same name have ONE order, rather than
+      -- whichever the plan happened to produce this time.
+      eq(sent[1]:find('ORDER BY "name" DESC, "id" ASC', 1, true) ~= nil, true, {
+        fail_reason = sent[1],
+      })
+      app.close()
+    end)
+  end)
+
+  it('leaves an unsorted export unsorted rather than sorting a whole table for looks', function()
+    local sent = {}
+    h.with_fake_exec(function(call)
+      if call.stdin:find('SELECT * FROM', 1, true) then
+        sent[#sent + 1] = call.stdin
+        return { stdout = wire_page(call.stdin, 1) }
+      end
+      return {}
+    end, function(session_mod)
+      local app, state = open_with_session(session_mod)
+      state.session.catalog:set_part(RELATION, 'columns', {
+        { name = 'id', type = 'int', notnull = true, pk = 1 },
+      })
+      exporter.relation(state, RELATION, { path = scratch_dir() .. '/out.csv', format = 'csv' })
+      eq(#sent, 1)
+      eq(sent[1]:find('ORDER BY', 1, true), nil, { fail_reason = sent[1] })
       app.close()
     end)
   end)
@@ -354,10 +474,26 @@ describe('export: the grid writes the whole table, not the page on screen', func
       end
       return {}
     end, function(session_mod)
-      local app, state = open_with_session(session_mod, { export = { batch_size = 2 } })
+      local app, state = open_with_session(session_mod)
       local path = scratch_dir() .. '/table.csv'
       exporter.relation(state, RELATION, { path = path, format = 'csv' })
       eq(read(path), 'id,name\n1,name 1\n2,name 2\n3,name 3\n')
+      app.close()
+    end)
+  end)
+
+  it('writes the header of a table with no rows at all', function()
+    h.with_fake_exec(function()
+      return { stdout = '' }
+    end, function(session_mod)
+      local app, state = open_with_session(session_mod)
+      state.session.catalog:set_part(RELATION, 'columns', {
+        { name = 'id', type = 'int', notnull = true, pk = 1 },
+        { name = 'name', type = 'text', notnull = false, pk = 0 },
+      })
+      local path = scratch_dir() .. '/empty.csv'
+      exporter.relation(state, RELATION, { path = path, format = 'csv' })
+      eq(read(path), 'id,name\n')
       app.close()
     end)
   end)
@@ -369,18 +505,35 @@ describe('export: the grid writes the whole table, not the page on screen', func
       end
       return {}
     end, function(session_mod, calls)
-      local options = scratch_options({ export = { batch_size = 50 } })
-      local app, state = open_with_session(session_mod, { export = { batch_size = 50 } })
+      local options = scratch_options()
+      local app, state = open_with_session(session_mod)
       state.session = h.fake_session(session_mod, { read_only = true }, options)
 
       exporter.relation(state, RELATION, { path = scratch_dir() .. '/out.csv', format = 'csv' })
 
       eq(#calls, 1)
-      -- The export goes through `session:run` like every other read, so the client it spawns is
-      -- the LOCKED one: on sqlite `-readonly` is the file open mode, and that IS the guarantee.
+      -- The export goes through the same gate as every other read, so the client it spawns is the
+      -- LOCKED one: on sqlite `-readonly` is the file open mode, and that IS the guarantee.
       eq(h.has(calls[1].argv, '-readonly'), true, {
         fail_reason = 'the export spawned a writable client: ' .. table.concat(calls[1].argv, ' '),
       })
+      app.close()
+    end)
+  end)
+
+  it('takes the rows a chunk at a time, however the client cuts its output', function()
+    local wire = wire_page('LIMIT 1001 OFFSET 0', 4)
+    h.with_fake_exec(function(call)
+      if not call.stdin:find('SELECT * FROM', 1, true) then
+        return {}
+      end
+      -- Cut mid-record, so a reader that decoded each chunk on its own would lose or split a row.
+      return { chunks = { wire:sub(1, 9), wire:sub(10, 21), wire:sub(22) } }
+    end, function(session_mod)
+      local app, state = open_with_session(session_mod)
+      local path = scratch_dir() .. '/chunked.csv'
+      exporter.relation(state, RELATION, { path = path, format = 'csv' })
+      eq(read(path), 'id,name\n1,name 1\n2,name 2\n3,name 3\n4,name 4\n')
       app.close()
     end)
   end)
@@ -412,7 +565,7 @@ describe('export: the prompt guards the file it is about to replace', function()
 
   local function browsing(session_mod)
     local app = require('dblens.app')
-    local options = scratch_options({ export = { batch_size = 50 } })
+    local options = scratch_options()
     require('dblens.config').setup(options)
     app.open()
     local state = app.state()
@@ -529,5 +682,275 @@ describe('export: a query result that cannot be re-read says what is missing', f
       eq(read(csv), 'id\n1\n')
       app.close()
     end)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- live: the file IS the database
+
+local protocol = require('dblens.protocol')
+
+--- Drive an export the way `ui.exporter` does — ONE statement, streamed to the file — against a
+--- real client. Synchronous, so the assertions can go and read the database afterwards.
+---
+---@param opts { max_rows: integer?, columns: string[]?, during: fun()? }
+---@return table? summary, string? err
+local function live_export(session, relation, path, format, opts)
+  opts = opts or {}
+  local cap = opts.max_rows or 100000
+  local statement = session.adapter.sql.page(relation, { limit = cap + 1, offset = 0 })
+  local finished, summary, failure = false, nil, nil
+  local during, armed = opts.during, false
+  export.stream({
+    path = path,
+    format = format,
+    max_rows = cap,
+    relation = relation,
+    dialect = session.adapter.dialect,
+    run = function(sink, on_done)
+      session:stream(statement, {
+        columns = opts.columns,
+        on_rows = function(columns, rows)
+          -- Only ARMS the write: `on_rows` is the client's own output callback, so a fast event
+          -- context, and driving another client from in there is exactly what is barred.
+          armed = true
+          return sink(columns, rows)
+        end,
+      }, function(_, err)
+        on_done(err)
+      end)
+    end,
+  }, function(result, err)
+    summary, failure, finished = result, err, true
+  end)
+  assert(
+    vim.wait(60000, function()
+      -- The concurrent write, on the main loop, while the export is still in flight.
+      if armed and during then
+        during()
+        during = nil
+      end
+      return finished
+    end),
+    'live export: the run never finished'
+  )
+  return summary, failure
+end
+
+--- A session over a real client, locked, exactly as an export runs.
+local function live_session(spec, clients, secret)
+  local options = require('dblens.config').setup({ clients = clients })
+  local session, err = require('dblens.session').new(spec, options)
+  assert(session, tostring(err))
+  session.secret = secret
+  session.connected = true
+  return session
+end
+
+--- The file-backed engines, live. The single most valuable claim of this release — the file is
+--- the database — with a real client, real values that break naive quoting, and a `.sql` file
+--- replayed back. Both drive the record protocol, so both exercise the framing a streamed read
+--- cuts its chunks on; they differ only in the flags their shell spells CSV with.
+--- `csv` is how each shell is asked for plain CSV with an empty NULL, which is what dblens writes
+--- — duckdb prints the text `NULL` for it otherwise, and the comparison would be against the
+--- reference tool's spelling rather than against the data.
+local FILE_ENGINES = {
+  sqlite = { extension = 'db', csv = { '-csv', '-header' } },
+  duckdb = { extension = 'duckdb', csv = { '-csv', '-nullvalue', '' } },
+}
+
+local function describe_live_file(kind)
+  describe(('%s, live: an exported file is the database'):format(kind), function()
+    local target, scratch = nil, nil
+    local TABLE = { name = 't', kind = 'table' }
+    local flags = FILE_ENGINES[kind]
+
+    local ROWS = {
+      "O'Brien",
+      'a,b "quoted"',
+      'line1\nline2',
+      'héllo 世界',
+      'back\\slash',
+      'NULL',
+      ';DROP TABLE t;--',
+      '',
+    }
+
+    local function client(db, sql, extra)
+      local argv = { target.client, '-batch', '-bail' }
+      vim.list_extend(argv, extra or {})
+      argv[#argv + 1] = db
+      return vim.system(argv, { stdin = sql }):wait(60000)
+    end
+
+    local function seed()
+      local db = ('%s/live-%d.%s'):format(scratch, math.random(1, 2 ^ 30), flags.extension)
+      local statements = { 'CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);' }
+      for index, value in ipairs(ROWS) do
+        statements[#statements + 1] = ("INSERT INTO t VALUES (%d, '%s');"):format(
+          index,
+          value:gsub("'", "''")
+        )
+      end
+      statements[#statements + 1] = ('INSERT INTO t VALUES (%d, NULL);'):format(#ROWS + 1)
+      local made = client(db, table.concat(statements, '\n'))
+      assert(
+        made.code == 0,
+        'export_spec: could not seed ' .. kind .. ': ' .. tostring(made.stderr)
+      )
+      return db
+    end
+
+    local function skip()
+      if target then
+        return false
+      end
+      MiniTest.add_note(('%s is not installed; the live export proof did not run'):format(kind))
+      return true
+    end
+
+    before_each(function()
+      target = h.live_file_client(kind)
+      scratch = vim.fn.tempname()
+      vim.fn.mkdir(scratch, 'p')
+    end)
+
+    after_each(function()
+      if scratch then
+        vim.fn.delete(scratch, 'rf')
+      end
+    end)
+
+    it('writes a CSV that parses row for row identical to what the client prints', function()
+      if skip() then
+        return
+      end
+      local db = seed()
+      local session = live_session({ name = 'live', kind = kind, path = db }, target.clients)
+      local path = scratch .. '/out.csv'
+      local summary, err = live_export(session, TABLE, path, 'csv')
+      eq(err, nil)
+      eq(summary.capped, false)
+      eq(summary.rows, #ROWS + 1)
+
+      local reference = client(db, 'SELECT * FROM t ORDER BY id;', flags.csv)
+      eq(reference.code, 0, { fail_reason = tostring(reference.stderr) })
+      eq(protocol.decode_csv(read(path)), protocol.decode_csv(reference.stdout))
+    end)
+
+    it('writes a .sql file that replays into an identical table', function()
+      if skip() then
+        return
+      end
+      local db = seed()
+      local session = live_session({ name = 'live', kind = kind, path = db }, target.clients)
+      local path = scratch .. '/out.sql'
+      local _, err = live_export(session, TABLE, path, 'sql')
+      eq(err, nil)
+
+      local fresh = ('%s/replayed.%s'):format(scratch, flags.extension)
+      assert(client(fresh, 'CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);').code == 0)
+      local replay = client(fresh, read(path))
+      eq(replay.code, 0, { fail_reason = 'the .sql did not replay: ' .. tostring(replay.stderr) })
+
+      -- `typeof` is in the projection so NULL and the empty string cannot both read as empty.
+      local query = 'SELECT id, typeof(v), v FROM t ORDER BY id;'
+      local before = client(db, query, flags.csv)
+      local after = client(fresh, query, flags.csv)
+      eq(
+        after.stdout,
+        before.stdout,
+        { fail_reason = 'the replayed table differs from the source' }
+      )
+      -- The payload row replayed as DATA: the table is still there afterwards.
+      local counted = client(fresh, 'SELECT count(*) AS n FROM t;', flags.csv)
+      eq(protocol.decode_csv(counted.stdout).rows[1][1], tostring(#ROWS + 1))
+    end)
+  end)
+end
+
+describe_live_file('sqlite')
+describe_live_file('duckdb')
+
+--- postgres, live. THE consistency case: postgres lets a writer commit while a reader is
+--- streaming, so this is the engine where the paged export really did produce a skewed file and
+--- call it complete. One statement is one snapshot; a write that lands during the run belongs to
+--- the next one.
+describe('postgres, live: an export is one snapshot, whatever lands during it', function()
+  local target = nil
+  local TABLE = { schema = 'public', name = 'export_race', kind = 'table' }
+  local TOTAL = 5000
+
+  local function psql(statement)
+    local adapter = require('dblens.adapters').get('postgres')
+    local spec = vim.tbl_extend('force', target.spec, { read_only = false })
+    local command = adapter.command(spec, target.secret, 'records', target.clients)
+    return vim.system(command.argv, { env = command.env, stdin = statement }):wait(60000)
+  end
+
+  local function seed()
+    local out = psql(([[
+DROP TABLE IF EXISTS export_race;
+CREATE TABLE export_race(id int PRIMARY KEY, v text);
+INSERT INTO export_race SELECT g, 'row ' || g FROM generate_series(1, %d) g;
+]]):format(TOTAL))
+    assert(out.code == 0, 'export_spec: could not seed postgres: ' .. tostring(out.stderr))
+  end
+
+  local function skip()
+    if target then
+      return false
+    end
+    MiniTest.add_note(
+      'no postgres server (set DBLENS_TEST_POSTGRES_PORT); the live snapshot proof did not run'
+    )
+    return true
+  end
+
+  before_each(function()
+    target = h.live_target('postgres')
+  end)
+
+  it('exports every row of the snapshot it started from, and no row twice', function()
+    if skip() then
+      return
+    end
+    seed()
+    local session = live_session(vim.deepcopy(target.spec), target.clients, target.secret)
+    local dir = scratch_dir()
+    local path = dir .. '/race.csv'
+
+    local deleted = nil
+    local summary, err = live_export(session, TABLE, path, 'csv', {
+      during = function()
+        deleted = psql('DELETE FROM export_race WHERE id = 2;')
+      end,
+    })
+    eq(err, nil)
+    eq(summary.capped, false)
+    assert(deleted, 'the concurrent write never ran, so this proves nothing')
+    eq(
+      deleted.code,
+      0,
+      { fail_reason = 'the concurrent DELETE failed: ' .. tostring(deleted.stderr) }
+    )
+
+    -- The table lost a row while the export was running.
+    local remaining = psql('SELECT count(*) FROM export_race;')
+    eq(vim.trim(remaining.stdout):match('%d+'), tostring(TOTAL - 1))
+
+    -- The FILE is the snapshot the statement started from: every id once, none missing, none
+    -- extra. The paged export skipped a row it never read and kept one that no longer existed.
+    local exported = protocol.decode_csv(read(path))
+    eq(#exported.rows, TOTAL, { fail_reason = ('the file holds %d rows'):format(#exported.rows) })
+    local seen = {}
+    for _, row in ipairs(exported.rows) do
+      local id = tonumber(row[1])
+      assert(id and not seen[id], ('id %s appears twice in the file'):format(tostring(row[1])))
+      seen[id] = true
+    end
+    for id = 1, TOTAL do
+      assert(seen[id], ('the file is missing id %d, which existed for the whole run'):format(id))
+    end
   end)
 end)

@@ -1,9 +1,16 @@
 --- The export flow: ask where, confirm an overwrite, stream the rows, and report honestly.
 ---
 --- Two scopes reach here — the result the grid is showing, and a whole table picked in the tree —
---- and both write the FULL row set, not the page on screen. Everything is a read: the rows are
---- fetched by the same paged `session:run` path a browse uses, so the gate, the timeout and the
---- byte cap all still apply and a LOCKED connection stays locked.
+--- and both write the FULL row set, not the page on screen. Everything is a read, through
+--- `session:stream`, so the gate still applies and a LOCKED connection stays locked.
+---
+--- A table export is ONE statement in ONE client invocation, which is what makes the file a
+--- SNAPSHOT. The paged version this replaces re-read the table once per batch, each in its own
+--- client process with no ordering tying them together: a row deleted between two batches shifted
+--- everything after it up, so the file quietly lost a row it never read and kept one that no
+--- longer existed — and still reported "exported N row(s)" with no warning. Postgres could do it
+--- with no writer at all, since `synchronize_seqscans` lets two unordered scans start at
+--- different points. One statement is one server snapshot, and nothing has to be stitched.
 local confirm = require('dblens.ui.confirm')
 local export = require('dblens.export')
 local sqlmod = require('dblens.sql')
@@ -24,28 +31,51 @@ local function column_names(session, relation)
   return names
 end
 
---- A `fetch` for `export.stream` reading one window of a relation through the normal gate.
+--- Primary-key columns, which is what makes a sorted export's order TOTAL.
+---
+--- Only ever appended to a sort the user asked for: two rows equal on the sort column would
+--- otherwise come out in whatever order the plan produced, so the same table exported twice could
+--- differ. An unsorted export is left unsorted — one statement is already one snapshot, and
+--- ordering a whole table to make it prettier is a cost with nothing to buy.
+---@return string[]
+local function tiebreak_columns(session, relation)
+  local names = {}
+  for _, column in ipairs(session.catalog:primary_key(relation)) do
+    names[#names + 1] = column.name
+  end
+  return names
+end
+
+--- A `run` for `export.stream`: the whole relation, as ONE statement streamed to the file.
+---
+--- The cap is the statement's own LIMIT, asking for one row more than may be written. That extra
+--- row is how a capped run is told from one that ended because the table did — asked and answered
+--- inside the same snapshot, so the answer cannot be about a table that has since changed.
 ---
 --- The UI closing mid-export is reported as an error rather than dropped, so the stream aborts
 --- and removes its temp file instead of leaving one behind with no one left to finish it.
-local function relation_fetcher(state, relation, scope)
+local function relation_runner(state, relation, scope, max_rows)
   local session = state.session
   local columns = column_names(session, relation)
-  return function(offset, limit, on_done)
-    local statement = session.adapter.sql.page(relation, {
-      limit = limit,
-      offset = offset,
-      order_by = scope.order_by,
-      where = scope.where,
-    })
-    local job = session:run(statement, { columns = columns }, function(result, err)
-      if app().state() ~= state then
-        on_done(nil, 'dblens was closed while the export was running')
-        return
-      end
-      on_done(result, err)
+  local statement = session.adapter.sql.page(relation, {
+    limit = max_rows + 1,
+    offset = 0,
+    order_by = scope.order_by,
+    tiebreak = scope.order_by and tiebreak_columns(session, relation) or nil,
+    where = scope.where,
+  })
+  return function(sink, on_done)
+    local job = session:stream(statement, {
+      columns = columns,
+      on_rows = function(names, rows)
+        if app().state() ~= state then
+          return 'dblens was closed while the export was running'
+        end
+        return sink(names, rows)
+      end,
+    }, function(_, err)
+      on_done(err)
     end)
-    -- Re-registered per page, so `<C-c>` reaches the one running right now.
     if app().state() == state then
       app().set_busy('export', job)
     end
@@ -54,15 +84,21 @@ end
 
 --- What the user is told when the file has landed. A cap or a truncation is a WARNING, never a
 --- footnote: the whole point of this release is that a short file says so.
+---
+--- The notification is transient and the file is not, so a short file that cannot hold a comment
+--- of its own is named alongside the marker written beside it.
 local function report(rows, path, warning)
-  if warning then
-    app().notify(
-      ('exported %d row(s) to %s - INCOMPLETE: %s'):format(rows, path, warning),
-      vim.log.levels.WARN
-    )
+  if not warning then
+    app().notify(('exported %d row(s) to %s'):format(rows, path))
     return
   end
-  app().notify(('exported %d row(s) to %s'):format(rows, path))
+  local marked = vim.uv.fs_stat(export.marker_for(path))
+      and (' - see %s'):format(vim.fn.fnamemodify(export.marker_for(path), ':t'))
+    or ''
+  app().notify(
+    ('exported %d row(s) to %s - INCOMPLETE: %s%s'):format(rows, path, warning, marked),
+    vim.log.levels.WARN
+  )
 end
 
 --- Stream a whole relation to a file.
@@ -82,10 +118,9 @@ function M.relation(state, relation, request)
     path = request.path,
     format = request.format,
     max_rows = cap,
-    batch = state.options.export.batch_size,
     relation = relation,
     dialect = session.adapter.dialect,
-    fetch = relation_fetcher(state, relation, request),
+    run = relation_runner(state, relation, request, cap),
   }, function(summary, err)
     if app().state() == state then
       app().set_busy(nil, nil)
@@ -202,8 +237,9 @@ local function ask_path(state, default, on_ready)
     end
     local request = { path = expanded, format = format }
     -- Asked before the writer opens: it puts its temp file beside the target, so a prompt after
-    -- that point would be asking about a directory already written to.
-    if vim.fn.filereadable(expanded) == 0 then
+    -- that point would be asking about a directory already written to. EXISTENCE, not
+    -- readability: a file the user cannot read is still a file the rename would replace.
+    if not vim.uv.fs_stat(expanded) then
       on_ready(request)
       return
     end
