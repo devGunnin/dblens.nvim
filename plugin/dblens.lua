@@ -35,10 +35,10 @@ local COMMANDS = {
     function()
       require('dblens').close()
     end,
-    { desc = 'Close dblens and restore the previous layout' },
+    { desc = 'Close dblens for good: end the session and release everything' },
   },
   { 'DbLensToggle', action('toggle'), { desc = 'Toggle dblens' } },
-  { 'DbLensConnections', action('connections'), { desc = 'Pick a dblens connection' } },
+  { 'DbLensConnections', action('connections'), { desc = 'Manage dblens connections' } },
   { 'DbLensQuery', action('query'), { desc = 'Focus the dblens SQL editor' } },
   { 'DbLensTables', action('tables'), { desc = 'Find a table' } },
   { 'DbLensHistory', action('history'), { desc = 'Browse dblens query history' } },

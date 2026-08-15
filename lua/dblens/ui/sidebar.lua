@@ -254,8 +254,8 @@ local function handlers(state, app)
     help = function()
       require('dblens.ui.help').show(state, 'sidebar')
     end,
-    close = function()
-      app.close()
+    hide = function()
+      app.hide()
     end,
   }
 end

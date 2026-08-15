@@ -96,7 +96,7 @@ M.defaults = {
   },
 
   --- Per-scope action -> lhs overrides. Defaults and valid action names live in `dblens.keymaps`.
-  keymaps = { global = {}, sidebar = {}, results = {}, editor = {} },
+  keymaps = { global = {}, connections = {}, sidebar = {}, results = {}, editor = {} },
 }
 
 --- Options whose default is nil because it is derived from `stdpath` at setup time. They are
@@ -113,6 +113,7 @@ local OPEN_PATHS = {
   ['connections'] = true,
   ['ui.highlights'] = true,
   ['keymaps.global'] = true,
+  ['keymaps.connections'] = true,
   ['keymaps.sidebar'] = true,
   ['keymaps.results'] = true,
   ['keymaps.editor'] = true,

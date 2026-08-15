@@ -55,6 +55,24 @@ function M.load(options)
   return read(options.state_file)
 end
 
+--- Drop the saved session when it points at `name`.
+---
+--- Deleting a connection has to reach this too: a session file still naming it would try to
+--- restore it on the next start, which is the error the deletion was meant to end.
+---@param options table
+---@param name string
+---@return boolean cleared, string? error
+function M.forget(options, name)
+  assert(type(name) == 'string' and name ~= '', 'state.forget: expected a connection name')
+  local saved, err = read(options.state_file)
+  if err or not saved or saved.connection ~= name then
+    return false, err
+  end
+  -- An empty DICT: a bare `{}` encodes as `[]`, which is not the object shape this file holds.
+  local ok, save_err = M.save(options, vim.empty_dict())
+  return ok, save_err
+end
+
 --- Snapshot the live UI. Returns nil when nothing is worth remembering.
 ---@param state dblens.State
 ---@return dblens.SavedSession?

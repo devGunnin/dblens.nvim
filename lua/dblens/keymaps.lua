@@ -20,7 +20,7 @@ M.specs = {
     {
       action = 'connections',
       lhs = '<leader>dc',
-      desc = 'Pick a connection',
+      desc = 'Manage connections',
       mode = 'n',
       group = 'dblens',
     },
@@ -90,6 +90,48 @@ M.specs = {
     },
   },
 
+  --- The connections manager float: every saved connection, and what to do about it.
+  connections = {
+    {
+      action = 'connect',
+      lhs = '<CR>',
+      desc = 'Connect to this one',
+      mode = 'n',
+      group = 'connections',
+    },
+    {
+      action = 'edit',
+      lhs = 'e',
+      desc = 'Edit this connection',
+      mode = 'n',
+      group = 'connections',
+    },
+    {
+      action = 'delete',
+      lhs = 'dd',
+      desc = 'Delete this connection',
+      mode = 'n',
+      group = 'connections',
+    },
+    { action = 'add', lhs = 'a', desc = 'Add a connection', mode = 'n', group = 'connections' },
+    {
+      action = 'discover',
+      lhs = 'D',
+      desc = 'Find databases in this project',
+      mode = 'n',
+      group = 'connections',
+    },
+    {
+      action = 'refresh',
+      lhs = 'R',
+      desc = 'Re-check every connection',
+      mode = 'n',
+      group = 'window',
+    },
+    { action = 'help', lhs = '?', desc = 'This help', mode = 'n', group = 'window' },
+    { action = 'close', lhs = 'q', desc = 'Close the manager', mode = 'n', group = 'window' },
+  },
+
   sidebar = {
     {
       action = 'select',
@@ -145,7 +187,13 @@ M.specs = {
     },
     { action = 'refresh', lhs = 'R', desc = 'Reload the schema', mode = 'n', group = 'table' },
     { action = 'help', lhs = '?', desc = 'This help', mode = 'n', group = 'window' },
-    { action = 'close', lhs = 'q', desc = 'Close dblens', mode = 'n', group = 'window' },
+    {
+      action = 'hide',
+      lhs = 'q',
+      desc = 'Hide dblens, keeping the session',
+      mode = 'n',
+      group = 'window',
+    },
   },
 
   results = {
@@ -259,7 +307,13 @@ M.specs = {
       group = 'yank',
     },
     { action = 'help', lhs = '?', desc = 'This help', mode = 'n', group = 'window' },
-    { action = 'close', lhs = 'q', desc = 'Close dblens', mode = 'n', group = 'window' },
+    {
+      action = 'hide',
+      lhs = 'q',
+      desc = 'Hide dblens, keeping the session',
+      mode = 'n',
+      group = 'window',
+    },
   },
 
   editor = {
@@ -350,9 +404,9 @@ M.specs = {
       group = 'window',
     },
     {
-      action = 'close',
+      action = 'hide',
       lhs = '<localleader>q',
-      desc = 'Close dblens',
+      desc = 'Hide dblens, keeping the session',
       mode = 'n',
       group = 'window',
     },

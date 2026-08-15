@@ -8,7 +8,7 @@ local keymaps = require('dblens.keymaps')
 local M = {}
 
 --- Release version. Bumped on tag; see CHANGELOG.md.
-M.VERSION = '1.3.0'
+M.VERSION = '1.4.0'
 
 local configured = false
 
@@ -95,7 +95,7 @@ local function global_handlers()
       app().toggle()
     end,
     connections = in_ui(function(state)
-      require('dblens.ui.picker').connections(state)
+      require('dblens.ui.manager').open(state)
     end),
     query = in_ui(function(state)
       require('dblens.ui.layout').focus(state.layout, 'editor')
@@ -191,8 +191,17 @@ function M.open(name)
   require('dblens.app').open(name ~= '' and name or nil)
 end
 
+--- Close dblens for good: end the session, drop the buffers, release everything.
+---
+--- `hide` is the everyday one — `q` and the toggle use it, and what they leave behind comes back
+--- exactly as it was.
 function M.close()
   require('dblens.app').close()
+end
+
+--- Take dblens off screen, keeping the connection, the result tabs and the SQL buffer.
+function M.hide()
+  require('dblens.app').hide()
 end
 
 function M.toggle()

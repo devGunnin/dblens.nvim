@@ -175,6 +175,12 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   catalog where it does not (PostgreSQL).
 - Row counts on demand, and a schema reload.
 
+- **Hide, don't lose it** (`q`, or `<leader>dd` toggling off): the windows go and your layout
+  comes back, the instance stays. Toggling on again re-shows the same connection, the same tree,
+  the same result tabs and the same SQL buffer — no reconnect, no reset, no second UI. A query
+  running when you hide keeps running and its rows are waiting in their tab. `:DbLensClose` is
+  the deliberate teardown.
+
 **Query**
 
 - SQL scratch buffer: run the statement at the cursor, the visual selection, or the whole
@@ -211,6 +217,11 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 
 **Safety**
 
+- **The connections manager** (`:DbLensConnections`, `<leader>dc`): every connection with its
+  engine, target, LOCKED/EDIT default, where its password comes from, and whether it can be
+  opened right now — a flagged row says why (`$PGPASSWORD_PROD is not set`, a host with the port
+  glued on). Connect, edit, delete or add from the list. A misconfigured connection is a flag to
+  fix or delete, never an error on every start.
 - **A connection is LOCKED by default** and enforced by the server: every run is sent inside a
   read-only transaction, so no statement in it can turn write access back on. `:DbLensWrite`
   (`<leader>dw`) opens it for editing; `:DbLensLock` locks it again.
@@ -308,12 +319,50 @@ require('dblens').setup({
 })
 ```
 
+### Managing connections
+
+`:DbLensConnections` (`<leader>dc`) opens the manager: every connection dblens knows about, with
+its engine, target, LOCKED/EDIT default, where its password comes from, and whether it could be
+opened **right now**.
+
+```
+  connection    engine     target                    mode    password
+  local         sqlite     ~/src/app/db.sqlite3      LOCKED  none
+  prod          postgres   analyst@db.internal:5432/shop  LOCKED  $PGPASSWORD_PROD
+! staging       postgres   app@db:5432/app           LOCKED  $.env    `.env` is a file name, not
+                                                                     an environment variable...
+```
+
+`<CR>` connects · `e` edits · `dd` deletes (with a confirmation) · `a` adds · `D` runs discovery ·
+`R` re-checks · `?` shows the bindings.
+
+The health flag resolves the *reference*, it never opens the database: an environment variable is
+read, validation is run, a missing SQLite file is noticed. A `password_cmd` is deliberately NOT
+run for it — running one to draw a list could raise a passphrase prompt — so those rows are
+reported as unchecked and proved when the connection opens.
+
+Deleting removes the connection from the connections file, drops a live session on it, and clears
+the saved session, so it cannot be restored back into existence. A connection from `setup{}` is
+listed but not editable there, a discovered one is marked and never written to disk, and an entry
+the loader refuses is listed too — that one is exactly the one you need to delete.
+
 ### Interactively
 
 `:DbLensAdd` asks for the kind, a name, the adapter's fields, where the password comes from
-(none / environment variable / command) and whether the connection is read-only, then saves it
-to the connections file. `:DbLensRemove {name}` deletes it again. Connections declared in
-`setup{}` are read-only to the picker and the form — remove those in `setup{}`.
+(none / the NAME of an environment variable / a command) and whether the connection is
+read-only, then saves it to the connections file. `:DbLensRemove {name}` deletes it again, and
+`e` in the manager edits one. Connections declared in `setup{}` are read-only to the manager and
+the form — remove those in `setup{}`.
+
+The form refuses what cannot work, so the mistake cannot reach the file:
+
+- a host typed as `host:port` is split into the two fields; a host that disagrees with a port
+  given separately is refused rather than stored.
+- `password_env` must be a variable NAME. `.env` is a *file* — discovery reads those — and a
+  password typed there would be a value dblens never stores; both are refused with what to do
+  instead.
+- read-only is the first and default answer, and anything but an explicit read-write choice
+  leaves the connection LOCKED.
 
 ### Passwords
 
@@ -527,9 +576,9 @@ pane it belongs to is first opened.
 | Command | What it does |
 | --- | --- |
 | `:DbLens [name]` | Open dblens, optionally on a named connection (completes names) |
-| `:DbLensClose` | Close dblens and restore the previous layout |
-| `:DbLensToggle` | Toggle dblens |
-| `:DbLensConnections` | Open dblens if needed, then pick a connection |
+| `:DbLensClose` | Close dblens for good: end the session and release everything |
+| `:DbLensToggle` | Show dblens, or hide it again keeping the session |
+| `:DbLensConnections` | Manage saved connections: health, connect, edit, delete, add |
 | `:DbLensQuery` | Focus the SQL editor |
 | `:DbLensTables` | Find a table |
 | `:DbLensHistory` | Browse query history |
@@ -565,7 +614,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | lhs | Action | Description |
 | --- | --- | --- |
 | `<leader>dd` | `toggle` | Toggle dblens |
-| `<leader>dc` | `connections` | Pick a connection |
+| `<leader>dc` | `connections` | Manage connections |
 | `<leader>dq` | `query` | Focus the SQL editor |
 | `<leader>dt` | `tables` | Find a table |
 | `<leader>dh` | `history` | Query history |
@@ -576,6 +625,22 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<leader>dC` | `txn_commit` | Commit transaction |
 | `<leader>dR` | `txn_rollback` | Roll back transaction |
 | `<leader>dP` | `txn_pending` | Show pending changes |
+
+### Connections manager
+
+`:DbLensConnections` (`<leader>dc`) lists every connection with a health flag; see
+[Managing connections](#managing-connections).
+
+| lhs | Action | Description |
+| --- | --- | --- |
+| `<CR>` | `connect` | Connect to this one |
+| `e` | `edit` | Edit this connection |
+| `dd` | `delete` | Delete this connection |
+| `a` | `add` | Add a connection |
+| `D` | `discover` | Find databases in this project |
+| `R` | `refresh` | Re-check every connection |
+| `?` | `help` | This help |
+| `q` | `close` | Close the manager |
 
 ### Sidebar
 
@@ -593,7 +658,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `I` | `import` | Import a CSV into the table |
 | `R` | `refresh` | Reload the schema |
 | `?` | `help` | This help |
-| `q` | `close` | Close dblens |
+| `q` | `hide` | Hide dblens, keeping the session |
 
 ### Results grid
 
@@ -631,7 +696,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `gi` | `yank_insert` | Yank the row as INSERT |
 | `X` | `export` | Export to a file |
 | `?` | `help` | This help |
-| `q` | `close` | Close dblens |
+| `q` | `hide` | Hide dblens, keeping the session |
 
 ### SQL editor
 
@@ -649,7 +714,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<localleader>s` | n | `save_snippet` | Save as a snippet |
 | `<localleader>h` | n | `history` | Query history |
 | `<localleader>?` | n | `help` | This help |
-| `<localleader>q` | n | `close` | Close dblens |
+| `<localleader>q` | n | `hide` | Hide dblens, keeping the session |
 
 ## Safety model
 
@@ -1159,9 +1224,10 @@ Every group links to a standard group, so dblens follows your colorscheme, inclu
 local dblens = require('dblens')
 
 dblens.setup(opts)          -- configure; optional, safe to call twice
-dblens.open(name)           -- open, optionally on a named connection
-dblens.close()
-dblens.toggle()
+dblens.open(name)           -- open, or show a hidden one, optionally on a named connection
+dblens.hide()               -- off screen, keeping the session, tabs and SQL buffer
+dblens.close()              -- the teardown: end the session and release everything
+dblens.toggle()             -- show, or hide again
 dblens.is_open()            -- boolean
 dblens.restore()            -- reopen the last saved session
 dblens.add_connection()     -- the :DbLensAdd form
