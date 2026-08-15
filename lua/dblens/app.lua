@@ -1261,6 +1261,176 @@ function M.follow_fk(cell)
 end
 
 -- ---------------------------------------------------------------------------
+-- reverse foreign-key navigation
+
+--- Load the columns of every relation that has not got them yet, in order.
+---
+--- The reverse lookup reads foreign keys off OTHER tables, so a table whose columns were never
+--- loaded is a relationship dblens cannot see. Only the missing ones cost a query — `loader.part`
+--- answers from the catalog for the rest — which is what makes the answer the whole loaded schema
+--- rather than whatever the tree happened to have expanded.
+---@param relations dblens.Relation[]
+---@param on_done fun(err: string?)
+local function load_columns_for(relations, on_done)
+  assert(vim.islist(relations), 'app.load_columns_for: expected a relation list')
+  local session = state.session
+  local index = 0
+  local function step()
+    index = index + 1
+    local relation = relations[index]
+    if not relation then
+      on_done(nil)
+      return
+    end
+    loader.part(session, relation, 'columns', function(err)
+      if err then
+        on_done(('could not read the columns of `%s`: %s'):format(relation.name, err))
+        return
+      end
+      step()
+    end)
+  end
+  step()
+end
+
+--- Browse the referencing table, narrowed to the rows that point at this one.
+---@param from dblens.Relation                 -- the table the cursor is on
+---@param reference dblens.FkReference
+---@param value any                            -- the referenced value in the current row
+local function open_referencing(from, reference, value)
+  local session = state.session
+  local origin = ('%s.%s'):format(from.name, reference.target_column or 'pk')
+  local predicate, problem = cell_predicate(session, reference.column, value, '=')
+  if not predicate then
+    M.error(problem)
+    return
+  end
+  M.open_relation(reference.relation, { filter = predicate, origin = origin })
+  if reference.composite then
+    M.notify(
+      ('`%s.%s` is part of a composite foreign key; matched on that column only'):format(
+        reference.relation.name,
+        reference.column
+      )
+    )
+  end
+end
+
+--- One reference, resolved against the row under the cursor: which column of THIS table it points
+--- at, and what that column holds in this row.
+---@return { reference: dblens.FkReference, column: string, value: any }?, string? problem
+local function resolve_reference(catalog, relation, reference, values)
+  local column = reference.target_column or lone_primary_key(catalog, relation)
+  local named = ('%s.%s'):format(reference.relation.name, reference.column)
+  if not column then
+    return nil,
+      ('`%s` names no target column, and `%s` has no single-column primary key to assume'):format(
+        named,
+        relation.name
+      )
+  end
+  local value = values[column]
+  if value == nil then
+    return nil, ('`%s` is not in this result, so there is nothing to match on'):format(column)
+  end
+  if value == protocol.NULL then
+    return nil, ('`%s` is NULL in this row, so nothing can reference it'):format(column)
+  end
+  return { reference = reference, column = column, value = value }, nil
+end
+
+--- Offer the referencing tables, once every relation's columns are loaded.
+---@param values table<string, any>  -- the row under the cursor, by column name
+local function offer_references(relation, values)
+  local session = state.session
+  local found = fk.referencing(session.catalog, relation)
+  if #found == 0 then
+    M.notify(('no loaded table references `%s`'):format(relation.name))
+    return
+  end
+
+  local usable, problems = {}, {}
+  for _, reference in ipairs(found) do
+    local resolved, problem = resolve_reference(session.catalog, relation, reference, values)
+    if resolved then
+      usable[#usable + 1] = resolved
+    else
+      problems[#problems + 1] = problem
+    end
+  end
+  if #usable == 0 then
+    -- Every candidate was refused for a reason the user can act on; naming one beats a bare no.
+    M.notify(problems[1] or ('nothing references `%s` in this row'):format(relation.name))
+    return
+  end
+  if #usable == 1 then
+    open_referencing(relation, usable[1].reference, usable[1].value)
+    return
+  end
+
+  local items = {}
+  for _, entry in ipairs(usable) do
+    items[#items + 1] = {
+      text = ('%s.%s'):format(entry.reference.relation.name, entry.reference.column),
+      detail = ('-> %s%s'):format(entry.column, entry.reference.composite and '  composite' or ''),
+      value = entry,
+    }
+  end
+  require('dblens.ui.picker').select(state, {
+    title = ('referencing %s'):format(relation.name),
+    items = items,
+    on_choose = function(entry)
+      open_referencing(relation, entry.reference, entry.value)
+    end,
+  })
+end
+
+--- Find the rows that reference the row under the cursor — the inverse of `gf`.
+---
+--- A read like `gf` is: the relationships come from metadata, and the referencing rows are browsed
+--- through the same paged SELECT. The referenced value reaches the WHERE through the same
+--- per-dialect quoting as filter-from-cell, never spliced into text.
+---@param cell dblens.Cell
+function M.find_referencing(cell)
+  local session = state.session
+  if not session then
+    M.error('not connected')
+    return
+  end
+  local source = state.grid.source
+  if not source or source.kind ~= 'relation' then
+    M.notify('finding referencing rows needs a table; open one from the tree')
+    return
+  end
+  local result = state.grid.result
+  local row = result and result.rows[cell.row]
+  if not row then
+    M.notify('put the cursor on a data row')
+    return
+  end
+  local values = {}
+  for index, name in ipairs(result.columns) do
+    values[name] = row[index]
+  end
+
+  local relation = source.relation
+  set_busy('references', nil)
+  -- Reading the whole loaded schema's columns is what makes "nothing references this" true rather
+  -- than "nothing that happens to be expanded does".
+  load_columns_for(
+    session.catalog:all_relations(),
+    live(function(err)
+      set_busy(nil, nil)
+      if err then
+        M.error(err)
+        return
+      end
+      offer_references(relation, values)
+    end)
+  )
+end
+
+-- ---------------------------------------------------------------------------
 -- in-result search
 
 --- Highlight every cell of the loaded result containing `term`.

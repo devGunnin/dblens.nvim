@@ -184,6 +184,46 @@ function M.targets(fk, source_column)
   return out
 end
 
+---@class dblens.FkReference
+---@field relation dblens.Relation  -- the table holding the foreign key
+---@field column string             -- the column of THAT table carrying it
+---@field target_column string?     -- the column of the referenced table; nil means its primary key
+---@field composite boolean
+
+--- Whether two relations are the same object. Name alone crosses schemas.
+local function same_relation(a, b)
+  return a.name == b.name and (a.schema or '') == (b.schema or '')
+end
+
+--- Which loaded tables reference `relation`, and through which column.
+---
+--- The inverse of `M.targets`, over the same metadata and the same resolution rules, so a
+--- relationship is described in exactly one place. Only relations whose COLUMNS are loaded can be
+--- seen — how much of the schema to load first is the caller's decision, not this module's.
+---@param catalog dblens.Catalog
+---@param relation dblens.Relation
+---@return dblens.FkReference[]
+function M.referencing(catalog, relation)
+  assert(type(relation) == 'table' and relation.name, 'fk.referencing: needs a relation')
+  local out = {}
+  for _, candidate in ipairs(catalog:all_relations()) do
+    for _, column in ipairs(catalog:info_for(candidate).columns or {}) do
+      for _, target in ipairs(M.targets(column.fk, column.name)) do
+        local resolved = M.resolve(catalog, candidate, target.table, target.schema)
+        if resolved and same_relation(resolved, relation) then
+          out[#out + 1] = {
+            relation = candidate,
+            column = column.name,
+            target_column = target.column,
+            composite = target.composite,
+          }
+        end
+      end
+    end
+  end
+  return out
+end
+
 --- The loaded relation a target names.
 ---
 --- Most foreign-key metadata carries no schema, so a name is looked up in the referencing

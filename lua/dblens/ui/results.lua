@@ -400,6 +400,9 @@ local function handlers(state, app)
     follow_fk = with_cell(state, app, function(cell)
       app.follow_fk(cell)
     end),
+    find_referencing = with_cell(state, app, function(cell)
+      app.find_referencing(cell)
+    end),
     search = function()
       vim.ui.input({
         prompt = 'Search ',

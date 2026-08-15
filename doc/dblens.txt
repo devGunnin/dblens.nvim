@@ -308,7 +308,17 @@ cell references nothing and says so, and a column with several references asks
 which one. It is a read throughout - the target comes from metadata already
 loaded and the row is browsed by the same paged SELECT as any other table.
 
-Reverse navigation ("which rows reference THIS one") is not in this release.
+                                                  *dblens-usage-referencing*
+`gF` goes the other way: the rows in OTHER tables whose foreign key points at
+the row under the cursor. It is the same metadata inverted, so it needs the
+columns of the other tables - the ones the tree never expanded are read first,
+which is what makes "no loaded table references this" mean it. Several
+referencing tables ask which one; a composite key matches on its own column
+and says so; a NULL key, or a table with no single-column primary key to
+assume, is reported rather than guessed at.
+
+Also a read: the key value reaches the WHERE through the same per-dialect
+quoting as `F`, never spliced into text.
 
                                                          *dblens-usage-tabs*
 Several results can be open at once. `t` in the tree opens a table in a new
@@ -447,6 +457,7 @@ Normal mode, in the result grid.
     `C`               clear_filter     Clear the filter
     `R`               refresh          Re-run the query
     `gf`              follow_fk        Go to the referenced row
+    `gF`              find_referencing Find rows referencing this one
     `gt`              next_tab         Next result tab
     `gT`              prev_tab         Previous result tab
     `gc`              close_tab        Close this result tab
@@ -1360,13 +1371,15 @@ Other limits:
   separately at `max_bytes`.
 - Sorting and filtering apply to a browsed table only. For a query result, put
   ORDER BY or WHERE in the query.
-- Foreign-key navigation is FORWARD only. Where a key spans several columns it
-  follows the one column under the cursor and says so, so the referenced view
-  may hold more rows than the single row referenced.
+- Foreign-key navigation, forward (`gf`) and reverse (`gF`), follows ONE column
+  of a composite key and says so, so the view may hold more rows than the
+  single row referenced. Reverse navigation searches the LOADED schema: it
+  reads the columns of tables the tree never expanded, but a schema that has
+  not been listed at all is not searched.
 - The `?` overlay no longer fits an 80x24 screen in ANY pane - the grid lists
-  38 bindings, and even the sidebar's list is taller than the 18 rows that
+  44 bindings, and even the sidebar's list is taller than the 18 rows that
   size leaves. It scrolls there (`j`/`k`) and the footer says so; nothing is
-  dropped or cut off the right edge. It fits from about 100x30.
+  dropped or cut off the right edge. It fits from about 100x33.
 - A `.sql` export replays TEXT faithfully. A binary/BLOB column does not
   survive it: the value reaches dblens through the client's text output, where
   a NUL byte truncates it, so the INSERT carries what the grid shows rather

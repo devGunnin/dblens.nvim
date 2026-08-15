@@ -186,6 +186,13 @@ M.specs = {
       group = 'navigate',
     },
     {
+      action = 'find_referencing',
+      lhs = 'gF',
+      desc = 'Find rows referencing this one',
+      mode = 'n',
+      group = 'navigate',
+    },
+    {
       action = 'next_tab',
       lhs = 'gt',
       desc = 'Next result tab',

@@ -220,7 +220,7 @@ function M.with_fake_exec(respond, fn)
   assert(type(respond) == 'function', 'helpers.with_fake_exec: respond must be a function')
   assert(type(fn) == 'function', 'helpers.with_fake_exec: fn must be a function')
   local real = require('dblens.exec')
-  local saved = { ['dblens.exec'] = real }
+  local saved = {}
   for _, name in ipairs(EXEC_DEPENDENTS) do
     saved[name] = package.loaded[name]
     package.loaded[name] = nil
@@ -229,8 +229,12 @@ function M.with_fake_exec(respond, fn)
   package.loaded['dblens.exec'] = make_fake_exec(real, respond, calls)
 
   local ok, err = pcall(fn, require('dblens.session'), calls)
-  for name, module in pairs(saved) do
-    package.loaded[name] = module
+  package.loaded['dblens.exec'] = real
+  -- Restored by NAME, nil included: a dependent that was not loaded before must go back to not
+  -- being loaded. Putting only the non-nil ones back left a `dblens.session` still holding the
+  -- DOUBLE, so a later "live" case ran against the stub and passed without touching a database.
+  for _, name in ipairs(EXEC_DEPENDENTS) do
+    package.loaded[name] = saved[name]
   end
   if not ok then
     error(err, 0)

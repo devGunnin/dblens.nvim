@@ -545,6 +545,328 @@ end)
 
 -- ---------------------------------------------------------------------------
 
+describe('fk: reading the relationships the other way round', function()
+  local catalog_mod = require('dblens.catalog')
+
+  --- A catalog where `orders.customer_id` and `invoices.buyer` both point at `customers.id`.
+  local function catalog_with(fk_text, extra)
+    local catalog = catalog_mod.new(false)
+    local customers = { name = 'customers', kind = 'table' }
+    local orders = { name = 'orders', kind = 'table' }
+    local relations = { customers, orders }
+    for _, entry in ipairs(extra or {}) do
+      relations[#relations + 1] = entry.relation
+    end
+    catalog:set_relations(nil, relations)
+    catalog:set_part(customers, 'columns', { { name = 'id', type = 'int', pk = 1 } })
+    catalog:set_part(orders, 'columns', {
+      { name = 'id', type = 'int', pk = 1 },
+      { name = 'customer_id', type = 'int', pk = 0, fk = fk_text },
+    })
+    for _, entry in ipairs(extra or {}) do
+      catalog:set_part(entry.relation, 'columns', entry.columns)
+    end
+    return catalog, customers
+  end
+
+  it('names the table and column that point at this one', function()
+    local catalog, customers = catalog_with('customers.id')
+    eq(fk.referencing(catalog, customers), {
+      {
+        relation = { name = 'orders', kind = 'table' },
+        column = 'customer_id',
+        target_column = 'id',
+        composite = false,
+      },
+    })
+  end)
+
+  it('reports the target column as unknown when the metadata names none', function()
+    local catalog, customers = catalog_with('customers.')
+    eq(fk.referencing(catalog, customers)[1].target_column, nil)
+  end)
+
+  it('finds every referencing table, not just the first', function()
+    local catalog, customers = catalog_with('customers.id', {
+      {
+        relation = { name = 'invoices', kind = 'table' },
+        columns = { { name = 'buyer', type = 'int', pk = 0, fk = 'customers.id' } },
+      },
+    })
+    local found = fk.referencing(catalog, customers)
+    eq(#found, 2)
+    -- `customers` holds no foreign key of its own, so the two hits are the other two tables.
+    eq({ found[1].relation.name, found[2].relation.name }, { 'orders', 'invoices' })
+    eq({ found[1].column, found[2].column }, { 'customer_id', 'buyer' })
+  end)
+
+  it('reads a duckdb constraint text the same way, composite flag included', function()
+    local catalog, customers =
+      catalog_with('FOREIGN KEY (tenant_id, customer_id) REFERENCES customers(tenant_id, id)')
+    local found = fk.referencing(catalog, customers)
+    eq(#found, 1)
+    eq(found[1].composite, true)
+    eq(found[1].target_column, 'id')
+  end)
+
+  it('ignores a table whose columns have never been loaded', function()
+    local catalog, customers = catalog_with('customers.id')
+    catalog:set_part({ name = 'orders', kind = 'table' }, 'columns', {})
+    eq(fk.referencing(catalog, customers), {})
+  end)
+
+  it('reports nothing for a table nothing points at', function()
+    local catalog = catalog_with('customers.id')
+    eq(fk.referencing(catalog, { name = 'orders', kind = 'table' }), {})
+  end)
+
+  it('sees a table that references itself', function()
+    local catalog_self = catalog_mod.new(false)
+    local nodes = { name = 'nodes', kind = 'table' }
+    catalog_self:set_relations(nil, { nodes })
+    catalog_self:set_part(nodes, 'columns', {
+      { name = 'id', type = 'int', pk = 1 },
+      { name = 'parent_id', type = 'int', pk = 0, fk = 'nodes.id' },
+    })
+    eq(fk.referencing(catalog_self, nodes)[1].column, 'parent_id')
+  end)
+end)
+
+--- The inverse of `gf`, and the same security property: the row's own key value reaches the WHERE
+--- through the dialect's quoting, so a key holding a quote is data.
+describe('app: finding the rows that reference this one', function()
+  local CUSTOMERS = { name = 'customers', kind = 'table' }
+  local ORDERS = { name = 'orders', kind = 'table' }
+  local INVOICES = { name = 'invoices', kind = 'table' }
+
+  local function seed(state, opts)
+    opts = opts or {}
+    local catalog = state.session.catalog
+    local relations = { CUSTOMERS, ORDERS }
+    if opts.invoices then
+      relations[#relations + 1] = INVOICES
+    end
+    catalog:set_relations(nil, relations)
+    for _, relation in ipairs(relations) do
+      catalog:set_part(relation, 'indexes', {})
+      catalog:set_part(relation, 'constraints', {})
+    end
+    catalog:set_part(CUSTOMERS, 'columns', {
+      { name = 'id', type = 'int', notnull = true, pk = opts.no_pk and 0 or 1 },
+      { name = 'name', type = 'text', notnull = false, pk = 0 },
+    })
+    catalog:set_part(ORDERS, 'columns', {
+      { name = 'id', type = 'int', notnull = true, pk = 1 },
+      { name = 'customer_id', type = 'int', pk = 0, fk = opts.fk or 'customers.id' },
+    })
+    if opts.invoices then
+      catalog:set_part(INVOICES, 'columns', {
+        { name = 'id', type = 'int', pk = 1 },
+        { name = 'buyer', type = 'int', pk = 0, fk = 'customers.id' },
+      })
+    end
+    state.grid.source = { kind = 'relation', relation = CUSTOMERS, label = 'customers' }
+    state.grid.result = {
+      columns = { 'id', 'name' },
+      rows = { { opts.key or '7', 'Ada' } },
+      malformed = 0,
+    }
+  end
+
+  local function page_calls(calls)
+    local out = {}
+    for _, call in ipairs(calls) do
+      if call.stdin:find('SELECT * FROM', 1, true) then
+        out[#out + 1] = call.stdin
+      end
+    end
+    return out
+  end
+
+  local CELL = { row = 1, column = 1, name = 'id', value = '7' }
+
+  it('opens the referencing table filtered to the rows that point here', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state)
+
+      app.find_referencing(CELL)
+
+      eq(
+        page_calls(calls),
+        { [[SELECT * FROM "orders" WHERE "customer_id" = '7' LIMIT 100 OFFSET 0]] }
+      )
+      eq(state.grid.source.relation.name, 'orders')
+      eq(state.grid.source.origin, 'customers.id')
+      app.close()
+    end)
+  end)
+
+  it('quotes a hostile key value rather than splicing it', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, { key = "7'; DROP TABLE orders; --" })
+
+      app.find_referencing({ row = 1, column = 1, name = 'id', value = "7'; DROP TABLE orders; --" })
+
+      local sent = page_calls(calls)[1]
+      eq(sent ~= nil, true, { fail_reason = 'no page was fetched' })
+      eq(#sqlmod.split(sent, DIALECT), 1, { fail_reason = sent })
+      eq(sqlmod.classify(sent, DIALECT).write, false, { fail_reason = sent })
+      eq(sent:find([['7''; DROP TABLE orders; --']], 1, true) ~= nil, true, { fail_reason = sent })
+      app.close()
+    end)
+  end)
+
+  it('assumes the primary key when the foreign key names no target column', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, { fk = 'customers.' })
+
+      app.find_referencing(CELL)
+
+      eq(
+        page_calls(calls),
+        { [[SELECT * FROM "orders" WHERE "customer_id" = '7' LIMIT 100 OFFSET 0]] }
+      )
+      app.close()
+    end)
+  end)
+
+  it('says so, and queries nothing, when no table references this one', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, { fk = nil })
+      -- Nothing points at `customers` once the only foreign key points elsewhere.
+      state.session.catalog:set_part(ORDERS, 'columns', {
+        { name = 'id', type = 'int', pk = 1 },
+        { name = 'customer_id', type = 'int', pk = 0, fk = 'suppliers.id' },
+      })
+
+      app.find_referencing(CELL)
+
+      eq(page_calls(calls), {}, { fail_reason = 'a table nothing references was still queried' })
+      eq(state.grid.source.relation.name, 'customers')
+      app.close()
+    end)
+  end)
+
+  it('refuses a NULL key, which nothing can be referencing', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state)
+      state.grid.result.rows = { { h.NULL, 'Ada' } }
+
+      app.find_referencing({ row = 1, column = 1, name = 'id', value = h.NULL })
+
+      eq(page_calls(calls), {}, { fail_reason = 'a NULL key was matched against' })
+      app.close()
+    end)
+  end)
+
+  it('names the missing key rather than guessing when the table has no primary key', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, { no_pk = true, fk = 'customers.' })
+
+      app.find_referencing(CELL)
+
+      eq(page_calls(calls), {}, { fail_reason = 'a table with no primary key was still matched' })
+      app.close()
+    end)
+  end)
+
+  it('asks which one when several tables reference this row', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state, { invoices = true })
+      local asked = {}
+      local picker = require('dblens.ui.picker')
+      local real = picker.select
+      picker.select = function(_, opts)
+        for _, item in ipairs(opts.items) do
+          asked[#asked + 1] = item.text
+        end
+      end
+
+      app.find_referencing(CELL)
+
+      picker.select = real
+      eq(asked, { 'orders.customer_id', 'invoices.buyer' })
+      eq(page_calls(calls), {}, { fail_reason = 'it navigated before the user chose' })
+      app.close()
+    end)
+  end)
+
+  --- The reverse lookup reads OTHER tables' foreign keys, so a table the tree never expanded is a
+  --- relationship dblens cannot see. It loads the missing columns first rather than reporting a
+  --- confident "nothing references this".
+  it('loads the columns it has not read yet before answering', function()
+    h.with_fake_exec(function(call)
+      if
+        call.stdin:find('pragma_table_info', 1, true) or call.stdin:find('table_info', 1, true)
+      then
+        return {
+          stdout = h.wire({
+            h.record('name', 'type', 'notnull', 'pk', 'dflt', 'fk'),
+            h.record('id', 'int', '1', '1', '', ''),
+            h.record('customer_id', 'int', '0', '0', '', 'customers.id'),
+          }),
+        }
+      end
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      local catalog = state.session.catalog
+      catalog:set_relations(nil, { CUSTOMERS, ORDERS })
+      catalog:set_part(CUSTOMERS, 'columns', { { name = 'id', type = 'int', pk = 1 } })
+      -- `orders` is in the tree but has never been expanded: no columns loaded.
+      state.grid.source = { kind = 'relation', relation = CUSTOMERS, label = 'customers' }
+      state.grid.result = { columns = { 'id' }, rows = { { '7' } }, malformed = 0 }
+
+      app.find_referencing(CELL)
+
+      eq(
+        page_calls(calls),
+        { [[SELECT * FROM "orders" WHERE "customer_id" = '7' LIMIT 100 OFFSET 0]] },
+        { fail_reason = 'the unexpanded table was never read, so its reference was missed' }
+      )
+      app.close()
+    end)
+  end)
+
+  it('needs a table: a query result has no key to be referenced', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      seed(state)
+      state.grid.source = { kind = 'query', sql = 'select 1', label = 'query' }
+
+      app.find_referencing(CELL)
+
+      eq(page_calls(calls), {})
+      app.close()
+    end)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+
 describe('app: jumping to a page', function()
   local RELATION = { name = 't', kind = 'table' }
 
@@ -853,5 +1175,123 @@ describe('picker: running a stored statement instead of pasting it', function()
       runnable:close()
       app.close()
     end)
+  end)
+end)
+
+-- ---------------------------------------------------------------------------
+
+--- sqlite, live. The inversion reads foreign-key metadata the ENGINE produced, so this is the
+--- case that proves the shape the adapter really emits inverts — and that the predicate built
+--- from a row's key selects exactly the referencing rows when a real client runs it.
+describe('sqlite, live: the referencing rows are the ones that come back', function()
+  local MiniTest = require('mini.test')
+  local loader = require('dblens.loader')
+  local protocol = require('dblens.protocol')
+
+  local target, scratch = nil, nil
+  local CUSTOMERS = { name = 'customers', kind = 'table' }
+
+  local function sqlite(db, sql, extra)
+    local argv = { target.client, '-batch', '-bail' }
+    vim.list_extend(argv, extra or {})
+    argv[#argv + 1] = db
+    return vim.system(argv, { stdin = sql }):wait(60000)
+  end
+
+  local function seed()
+    local db = ('%s/live-%d.db'):format(scratch, math.random(1, 2 ^ 30))
+    local made = sqlite(
+      db,
+      [[
+CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id), note TEXT);
+INSERT INTO customers VALUES (1, 'Ada'), (2, 'Grace');
+INSERT INTO orders VALUES (10, 1, 'first'), (11, 1, 'second'), (12, 2, 'other');
+]]
+    )
+    assert(made.code == 0, 'navigation_spec: could not seed sqlite: ' .. tostring(made.stderr))
+    return db
+  end
+
+  local function live_session(db)
+    local options = require('dblens.config').setup({ clients = target.clients })
+    local session, err = require('dblens.session').new({
+      name = 'live',
+      kind = 'sqlite',
+      path = db,
+    }, options)
+    assert(session, tostring(err))
+    session.connected = true
+    return session
+  end
+
+  --- Run one async loader step to completion on the real client.
+  local function wait_for(start)
+    local done, failure = false, nil
+    start(function(err)
+      done, failure = true, err
+    end)
+    assert(
+      vim.wait(60000, function()
+        return done
+      end),
+      'navigation_spec: the live client never answered'
+    )
+    eq(failure, nil)
+  end
+
+  local function skip()
+    if target then
+      return false
+    end
+    MiniTest.add_note('sqlite3 is not installed; the live reverse-FK proof did not run')
+    return true
+  end
+
+  before_each(function()
+    target = h.live_file_client('sqlite')
+    scratch = vim.fn.tempname()
+    vim.fn.mkdir(scratch, 'p')
+  end)
+
+  after_each(function()
+    if scratch then
+      vim.fn.delete(scratch, 'rf')
+    end
+  end)
+
+  it('inverts the metadata sqlite itself reports, and selects only those rows', function()
+    if skip() then
+      return
+    end
+    local db = seed()
+    local session = live_session(db)
+    wait_for(function(done)
+      loader.relations(session, '', done)
+    end)
+    for _, relation in ipairs(session.catalog:all_relations()) do
+      wait_for(function(done)
+        loader.part(session, relation, 'columns', done)
+      end)
+    end
+
+    local found = fk.referencing(session.catalog, CUSTOMERS)
+    eq(#found, 1, { fail_reason = 'the engine metadata did not invert' })
+    eq(found[1].relation.name, 'orders')
+    eq(found[1].column, 'customer_id')
+    eq(found[1].target_column, 'id')
+
+    -- The predicate the navigation builds, run by the real client: only Ada's orders come back.
+    local predicate = common.cell_predicate('customer_id', '1', '=', session.adapter.dialect)
+    local statement = session.adapter.sql.page({ name = 'orders', kind = 'table' }, {
+      limit = 100,
+      offset = 0,
+      where = predicate,
+    })
+    local out = sqlite(db, statement .. ';', { '-csv', '-header' })
+    eq(out.code, 0, { fail_reason = tostring(out.stderr) })
+    local rows = protocol.decode_csv(out.stdout).rows
+    eq(#rows, 2, { fail_reason = out.stdout })
+    eq({ rows[1][1], rows[2][1] }, { '10', '11' }, { fail_reason = out.stdout })
   end)
 end)

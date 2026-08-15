@@ -155,6 +155,9 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 - Primary key, foreign key, NOT NULL and type shown per column.
 - **Follow a foreign key** (`gf`) from the cell under the cursor to the row it references, and
   see where you came from in the winbar.
+- **Find the rows that reference this one** (`gF`): the same metadata read the other way round,
+  so you can go from a customer to their orders. Tables the tree has not expanded are read first,
+  so "nothing references this" means it, and several referencing tables ask which one.
 - **Filter to the cell under the cursor** (`F`), or away from it (`!`), with the value quoted for
   the dialect rather than retyped. `C` clears the filter.
 - Jump to the first, last, or an arbitrary page (`[P`, `]P`, `gp`).
@@ -565,6 +568,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `C` | `clear_filter` | Clear the filter |
 | `R` | `refresh` | Re-run the query |
 | `gf` | `follow_fk` | Go to the referenced row |
+| `gF` | `find_referencing` | Find rows referencing this one |
 | `gt` | `next_tab` | Next result tab |
 | `gT` | `prev_tab` | Previous result tab |
 | `gc` | `close_tab` | Close this result tab |
@@ -1156,12 +1160,14 @@ error reporting have much thinner live coverage everywhere — please report wha
   still does the full work. Client output is capped at `max_bytes`.
 - Sorting and filtering apply to a browsed table only. For a query result, put `ORDER BY` /
   `WHERE` in the query.
-- Foreign-key navigation is FORWARD only: it goes to the row a cell references, not to the rows
-  that reference this one. Where the key spans several columns it follows the one column under
-  the cursor and says so, so the result may hold more rows than the single referenced one.
-- The `?` overlay no longer fits an 80x24 screen in ANY pane — the grid lists 38 bindings and
+- Foreign-key navigation, forward (`gf`) and reverse (`gF`), follows ONE column of a composite
+  key and says so, so the result may hold more rows than the single referenced one. Reverse
+  navigation sees the loaded schema only: it reads the columns of tables that were never
+  expanded, but a schema that has not been listed at all is not searched.
+- The `?` overlay no longer fits an 80x24 screen in ANY pane — the grid lists 44 bindings and
   even the sidebar's list is taller than the 18 rows that size leaves. It scrolls there (`j`/`k`),
-  and the footer says so; nothing is dropped or cut off the right edge. It fits from about 100x30.
+  and the footer says so; nothing is dropped or cut off the right edge. It fits from about
+  100x33.
 - A `.sql` export replays TEXT faithfully. A binary/BLOB column does not survive it: the value
   reaches dblens through the client's text output, where a NUL byte truncates it, so the INSERT
   carries what the grid shows rather than the bytes in the table. Use the engine's own dump tool
