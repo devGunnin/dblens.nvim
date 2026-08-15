@@ -160,6 +160,10 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 - Jump to the first, last, or an arbitrary page (`[P`, `]P`, `gp`).
 - **Search the loaded result** (`g/`, then `gn` / `gN`), matching the underlying values, so a hit
   inside a value the grid clipped is still found and highlighted.
+- **Several results open at once**: `t` in the tree opens a table in a new result tab,
+  `<localleader>t` runs a statement into one, and `gt` / `gT` / `gc` / `gl` move between them,
+  close one, or list them. Each tab keeps its own filter, sort, search and page — and its own
+  race guard, so a slow query in one tab can never land its rows in another.
 - `SHOW CREATE TABLE` / `sqlite_schema` DDL where the server has it, reconstructed from the
   catalog where it does not (PostgreSQL).
 - Row counts on demand, and a schema reload.
@@ -425,7 +429,8 @@ require('dblens').setup({
       position = 'left',          -- 'left' | 'right'
     },
     results = {
-      height = 0.55,              -- share of the main column given to results; fraction, 0 < h < 1
+      height   = 0.55,            -- share of the main column given to results; fraction, 0 < h < 1
+      max_tabs = 8,               -- results open at once; each tab holds a whole result set
     },
     grid = {
       max_col_width = 40,         -- widest a column renders before truncation; minimum 4
@@ -535,6 +540,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `zM` | `collapse_all` | Collapse everything |
 | `/` | `find` | Find a table |
 | `o` | `open` | Open the table in the grid |
+| `t` | `open_tab` | Open the table in a new result tab |
 | `c` | `row_count` | Count rows |
 | `D` | `ddl` | Show the DDL |
 | `X` | `export` | Export the table to a file |
@@ -559,6 +565,10 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `C` | `clear_filter` | Clear the filter |
 | `R` | `refresh` | Re-run the query |
 | `gf` | `follow_fk` | Go to the referenced row |
+| `gt` | `next_tab` | Next result tab |
+| `gT` | `prev_tab` | Previous result tab |
+| `gc` | `close_tab` | Close this result tab |
+| `gl` | `tab_list` | List the open results |
 | `g/` | `search` | Search the result |
 | `gn` | `next_match` | Next match |
 | `gN` | `prev_match` | Previous match |
@@ -580,6 +590,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<CR>` | n | `run` | Run the statement |
 | `<CR>` | x | `run_selection` | Run the selection |
 | `<localleader>r` | n | `run_all` | Run the whole buffer |
+| `<localleader>t` | n | `run_new_tab` | Run into a new result tab |
 | `<localleader>e` | n | `explain` | EXPLAIN the statement |
 | `<localleader>E` | n | `explain_analyze` | EXPLAIN ANALYZE |
 | `<C-c>` | n | `cancel` | Cancel the query |

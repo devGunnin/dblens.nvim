@@ -43,6 +43,10 @@ end
 ---@param change dblens.Change
 ---@param cell dblens.Cell?  -- present for a cell edit, so a queued change can be shown in place
 local function apply(state, change, cell)
+  -- The rows this edit belongs to, captured now: by the time the write reports back the user may
+  -- have switched result tabs or re-run the query, and marking a cell in whatever is on screen
+  -- then would mark a DIFFERENT row.
+  local grid, result = state.grid, state.grid.result
   state.session:execute_write({
     sql = change.sql,
     guard = change.guard,
@@ -61,10 +65,10 @@ local function apply(state, change, cell)
       return
     end
     if outcome.queued then
-      if cell then
+      if cell and grid.result == result then
         -- Show the queued value in place, marked, rather than pretending it landed.
-        state.grid.result.rows[cell.row][cell.column] = cell.pending
-        state.grid.dirty[cell.row .. ':' .. cell.column] = true
+        result.rows[cell.row][cell.column] = cell.pending
+        grid.dirty[cell.row .. ':' .. cell.column] = true
       end
       app().notify(
         ('queued - %d change(s) pending, commit with <leader>dC'):format(state.session.txn:count())

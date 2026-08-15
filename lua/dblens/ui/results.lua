@@ -11,6 +11,7 @@ local layout_mod = require('dblens.ui.layout')
 local paging = require('dblens.paging')
 local protocol = require('dblens.protocol')
 local status = require('dblens.ui.status')
+local tabs = require('dblens.tabs')
 
 local api = vim.api
 
@@ -144,6 +145,31 @@ function M.render(state)
   M.render_winbar(state)
 end
 
+--- The open results, as the leading winbar segments.
+---
+--- With one tab this is just the label, exactly as it was before tabs existed. With several it
+--- becomes the strip — `1 orders`, `2 users` — and only the active one is `keep`, so a narrow
+--- window gives up the others rather than the mode indicator.
+---@return dblens.Segment[]
+local function tab_segments(state)
+  local entries = tabs.describe(state.tabs)
+  if #entries == 1 then
+    local source = state.grid.source
+    return {
+      { text = ' ' .. (source and source.label or 'results'), hl = 'DbLensTitle', keep = true },
+    }
+  end
+  local segments = {}
+  for _, entry in ipairs(entries) do
+    segments[#segments + 1] = {
+      text = ('%s%d %s'):format(#segments == 0 and ' ' or '', entry.index, entry.label),
+      hl = entry.active and 'DbLensTitle' or 'DbLensDim',
+      keep = entry.active,
+    }
+  end
+  return segments
+end
+
 --- The winbar alone. The spinner ticks through here, so it must stay cheap.
 ---@param state dblens.State
 function M.render_winbar(state)
@@ -151,10 +177,9 @@ function M.render_winbar(state)
   if not win or not api.nvim_win_is_valid(win) then
     return
   end
-  local session, source = state.session, state.grid.source
-  local segments = {
-    { text = ' ' .. (source and source.label or 'results'), hl = 'DbLensTitle', keep = true },
-  }
+  local session = state.session
+  local source = state.grid.source
+  local segments = tab_segments(state)
   if state.grid.result then
     -- Only a browsed relation is paged; a query result is just however many rows came back.
     local rows = #state.grid.result.rows
@@ -241,6 +266,26 @@ function M.current_cell(state)
     value = result.rows[row][column],
   },
     nil
+end
+
+--- Pick one of the open results by name rather than stepping through them.
+---@param state dblens.State
+function M.choose_tab(state, app)
+  local items = {}
+  for _, entry in ipairs(tabs.describe(state.tabs)) do
+    items[#items + 1] = {
+      text = ('%d %s'):format(entry.index, entry.label),
+      detail = entry.active and (entry.detail .. '  (shown)') or entry.detail,
+      value = entry.index,
+    }
+  end
+  require('dblens.ui.picker').select(state, {
+    title = 'Results',
+    items = items,
+    on_choose = function(index)
+      app.select_tab(index)
+    end,
+  })
 end
 
 --- Put the cursor on a match, so a hit inside a clipped cell can still be read (`<CR>` opens the
@@ -339,6 +384,18 @@ local function handlers(state, app)
     end,
     refresh = function()
       app.refresh_grid()
+    end,
+    next_tab = function()
+      app.step_tab(1)
+    end,
+    prev_tab = function()
+      app.step_tab(-1)
+    end,
+    close_tab = function()
+      app.close_tab()
+    end,
+    tab_list = function()
+      M.choose_tab(state, app)
     end,
     follow_fk = with_cell(state, app, function(cell)
       app.follow_fk(cell)

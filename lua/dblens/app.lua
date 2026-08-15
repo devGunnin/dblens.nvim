@@ -7,7 +7,7 @@ local common = require('dblens.adapters.common')
 local config = require('dblens.config')
 local connections = require('dblens.connections')
 local fk = require('dblens.fk')
-local grid = require('dblens.render.grid')
+local grid_mod = require('dblens.render.grid')
 local history = require('dblens.history')
 local layout_mod = require('dblens.ui.layout')
 local loader = require('dblens.loader')
@@ -18,6 +18,7 @@ local session_mod = require('dblens.session')
 local state_mod = require('dblens.state')
 local sqlmod = require('dblens.sql')
 local status = require('dblens.ui.status')
+local tabs = require('dblens.tabs')
 local tree = require('dblens.tree')
 
 local M = {}
@@ -94,13 +95,32 @@ local function track(job)
   end
 end
 
---- Bump the identity of what the grid is showing, so results for the previous view are dropped.
+--- Bump the identity of what a tab is showing, so results for its previous view are dropped.
 ---
 --- Sorting and paging keep the epoch: they change the page, not the row set, so a total already
 --- in flight is still the right one.
-local function new_epoch()
-  state.grid.epoch = (state.grid.epoch or 0) + 1
-  return state.grid.epoch
+---@param grid table  the tab this view belongs to
+local function new_epoch(grid)
+  assert(type(grid) == 'table', 'app.new_epoch: expected a grid state')
+  grid.epoch = (grid.epoch or 0) + 1
+  return grid.epoch
+end
+
+--- Claim the next fetch token for a tab. A result carrying a token the tab has moved past belongs
+--- to a superseded request, so it is dropped rather than drawn over what replaced it.
+---@param grid table
+---@return integer
+local function new_fetch(grid)
+  assert(type(grid) == 'table', 'app.new_fetch: expected a grid state')
+  grid.fetch = grid.fetch + 1
+  return grid.fetch
+end
+
+--- Point `state.grid` at the active tab. The ONE place it is repointed, so it can never disagree
+--- with `state.tabs.active` — every reader of `state.grid` is reading the tab on screen.
+local function activate(index)
+  assert(tabs.select(state.tabs, index), ('app.activate: no tab %s'):format(tostring(index)))
+  state.grid = tabs.active(state.tabs)
 end
 
 --- Cancel whatever is running, if anything.
@@ -130,6 +150,7 @@ local function build_state(options)
   if err then
     M.error(err)
   end
+  local open_tabs = tabs.new(options)
   return {
     options = options,
     --- Resolved once: the winbar redraws on every spinner tick, and re-deriving the set there
@@ -143,27 +164,10 @@ local function build_state(options)
     secrets = {},
     discovering = false,
     tree = { expanded = {}, loading = {}, nodes = {} },
-    grid = {
-      source = nil,
-      result = nil,
-      paging = paging.new(options.page_size),
-      sort = nil,
-      filter = nil,
-      spans = {},
-      types = nil,
-      dirty = {},
-      --- In-result search: the term, its matches, and which one is current. Indexes into the
-      --- CURRENT rows, so it is dropped whenever a new result is presented.
-      search = nil,
-      message = nil,
-      error = nil,
-      truncated = false,
-      elapsed_ms = nil,
-      --- Identity of the current view, and of the current page fetch, so a result that belongs
-      --- to a superseded request is dropped instead of overwriting what is on screen.
-      epoch = 0,
-      fetch = 0,
-    },
+    --- Every open result, each with its own guards; `dblens.tabs` owns the shape.
+    tabs = open_tabs,
+    --- The tab on screen. A pointer into `tabs.list`, repointed only by `activate`.
+    grid = tabs.active(open_tabs),
     history = store or { history = {}, snippets = {} },
     busy = nil,
     job = nil,
@@ -436,8 +440,11 @@ function M.connect(name, on_ready)
     state.session = nil
   end
   state.tree = { expanded = {}, loading = {}, nodes = {} }
-  state.grid =
-    vim.tbl_extend('force', state.grid, { source = nil, result = nil, error = nil, message = nil })
+  -- Every open result belongs to the connection it was read from, so switching connections starts
+  -- from one empty tab rather than leaving rows on screen that the new database may not hold.
+  M.cancel_tab_jobs()
+  state.tabs = tabs.new(state.options)
+  activate(1)
 
   -- Only a discovered connection has a secret held here: every other spec resolves its own from
   -- the reference it carries, and nothing but discovery ever puts a value in this table.
@@ -448,7 +455,7 @@ function M.connect(name, on_ready)
     return
   end
 
-  new_epoch()
+  new_epoch(state.grid)
   set_busy('connecting', nil)
   session:connect(live(function(ok, connect_err)
     if not ok then
@@ -703,8 +710,13 @@ local function types_for(result, relation)
   return out
 end
 
---- Store a result and lay it out. `source` describes where the rows came from.
-local function present(result, source, extra)
+--- Store a result in ONE tab and lay it out. `source` describes where the rows came from.
+---
+--- The tab is passed in rather than read from `state`: the rows belong to the tab that asked for
+--- them, which may no longer be the one on screen.
+---@param grid table
+local function present(grid, result, source, extra)
+  assert(type(grid) == 'table', 'app.present: expected the tab the rows belong to')
   local truncated = false
   if #result.rows > state.options.max_rows then
     -- Truncate what we render, never the user's SQL.
@@ -716,20 +728,20 @@ local function present(result, source, extra)
   -- Sorting, filtering and paging are properties of a browsed relation. A query result carries
   -- none of them, so they must not survive from whatever was shown before.
   if source.kind ~= 'relation' then
-    state.grid.sort = nil
-    state.grid.filter = nil
-    state.grid.paging = paging.new(state.options.page_size)
+    grid.sort = nil
+    grid.filter = nil
+    grid.paging = paging.new(state.options.page_size)
   end
-  state.grid.source = source
-  state.grid.result = result
-  state.grid.types = types_for(result, source.relation)
-  state.grid.dirty = {}
+  grid.source = source
+  grid.result = result
+  grid.types = types_for(result, source.relation)
+  grid.dirty = {}
   -- Matches are row/column positions in the rows being replaced, so they cannot survive them.
-  state.grid.search = nil
-  state.grid.error = nil
-  state.grid.truncated = truncated or result.truncated
-  state.grid.elapsed_ms = result.elapsed_ms
-  state.grid.message = extra and extra.message or nil
+  grid.search = nil
+  grid.error = nil
+  grid.truncated = truncated or result.truncated
+  grid.elapsed_ms = result.elapsed_ms
+  grid.message = extra and extra.message or nil
   if result.malformed > 0 then
     -- Not "padded": a SHORT row is padded, a LONG one keeps its extra fields and the grid shows
     -- only the columns it has names for. Naming the wrong repair sent readers hunting for a
@@ -742,60 +754,68 @@ local function present(result, source, extra)
   end
 end
 
---- Fetch the current page of the current relation source.
+--- Fetch the current page of one tab's relation source.
 ---
---- A fetch already in flight is cancelled first: two racing page queries used to be resolved by
---- whichever client happened to exit last, which could show page 1 while the pager said page 3.
-function M.fetch_page()
-  local source = state.grid.source
+--- That tab's own fetch already in flight is cancelled first: two racing page queries used to be
+--- resolved by whichever client happened to exit last, which could show page 1 while the pager
+--- said page 3. Only THIS tab's fetch is cancelled — another tab's query is not this one's to end.
+---@param grid table  the tab to fetch into
+local function fetch_page_into(grid)
+  assert(type(grid) == 'table', 'app.fetch_page_into: expected a grid state')
+  local source = grid.source
   if not source or source.kind ~= 'relation' then
     return
   end
   local session = state.session
   local statement = session.adapter.sql.page(source.relation, {
-    limit = state.grid.paging.size,
-    offset = paging.offset(state.grid.paging),
-    order_by = state.grid.sort,
-    where = state.grid.filter,
+    limit = grid.paging.size,
+    offset = paging.offset(grid.paging),
+    order_by = grid.sort,
+    where = grid.filter,
   })
   local columns = {}
   for _, column in ipairs(session.catalog:info_for(source.relation).columns or {}) do
     columns[#columns + 1] = column.name
   end
 
-  if state.job and not state.job.is_done() then
-    state.job.cancel()
+  if grid.job and not grid.job.is_done() then
+    grid.job.cancel()
   end
-  state.grid.fetch = state.grid.fetch + 1
-  local fetch = state.grid.fetch
+  local fetch = new_fetch(grid)
   set_busy('query', nil)
   local job = session:run(
     statement,
     { columns = columns },
     live(function(result, err)
-      if state.grid.fetch ~= fetch then
+      if grid.fetch ~= fetch then
         return
       end
       set_busy(nil, nil)
       if err then
-        state.grid.error = err
+        grid.error = err
         M.render()
         return
       end
-      present(result, source)
+      present(grid, result, source)
       M.render()
       -- Past the end. Without a row count the pager cannot clamp a jump — a full page is all it
       -- knows — so `gp 500` lands here, and a bare `0 rows` winbar looks like an empty table.
-      if #result.rows == 0 and state.grid.paging.page > 1 then
+      if #result.rows == 0 and grid.paging.page > 1 then
         M.notify(
           ('page %d is past the end of this result - `[P` goes back to the first page'):format(
-            state.grid.paging.page
+            grid.paging.page
           )
         )
       end
     end)
   )
+  grid.job = job
   track(job)
+end
+
+--- Fetch the current page of the tab on screen.
+function M.fetch_page()
+  fetch_page_into(state.grid)
 end
 
 --- Open a relation in the grid: load its columns, count it, then show page 1.
@@ -805,7 +825,8 @@ end
 --- the second lock on the same door, because `common.page` would otherwise raise deep in SQL
 --- generation with no clue as to who supplied it.
 ---@param relation dblens.Relation
----@param opts { filter: string?, origin: string? }?  -- origin: where the navigation came from
+---@param opts { filter: string?, origin: string?, new_tab: boolean? }?
+---   origin: where the navigation came from; new_tab: show it beside the current result
 function M.open_relation(relation, opts)
   opts = opts or {}
   if not state.session then
@@ -815,19 +836,24 @@ function M.open_relation(relation, opts)
     opts.filter == nil or common.check_predicate(opts.filter, state.session.adapter.dialect) == nil,
     'app.open_relation: an unvetted predicate reached the grid'
   )
-  state.grid.paging = paging.new(state.options.page_size)
-  state.grid.sort = nil
-  state.grid.filter = opts.filter
-  new_epoch()
+  if opts.new_tab and not M.open_tab() then
+    return
+  end
+  -- Captured now: the rows belong to this tab even if the user switches away while they load.
+  local grid = state.grid
+  grid.paging = paging.new(state.options.page_size)
+  grid.sort = nil
+  grid.filter = opts.filter
+  new_epoch(grid)
   M.load_relation_details(relation, function()
-    state.grid.source = {
+    grid.source = {
       kind = 'relation',
       relation = relation,
       label = relation.name,
       origin = opts.origin,
     }
-    M.fetch_page()
-    M.count_rows(relation, state.grid.filter)
+    fetch_page_into(grid)
+    M.count_rows(relation, grid.filter, grid)
   end)
   layout_mod.focus(state.layout, 'results')
 end
@@ -847,12 +873,14 @@ end
 --- filtered total belongs to one view, not to the table.
 ---@param relation dblens.Relation
 ---@param where string?  -- the predicate this count is for; nil counts the whole relation
-function M.count_rows(relation, where)
+---@param into table?    -- the tab the total belongs to; the one on screen by default
+function M.count_rows(relation, where, into)
   local session = state.session
   if not session then
     return
   end
-  local epoch = state.grid.epoch
+  local grid = into or state.grid
+  local epoch = grid.epoch
   session:run(
     session.adapter.sql.count(relation, where),
     {},
@@ -864,15 +892,15 @@ function M.count_rows(relation, where)
       if where == nil then
         session.catalog:set_row_count(relation, count)
       end
-      local source = state.grid.source
-      -- A count issued before the user filtered or opened something else is not this view's.
+      local source = grid.source
+      -- A count issued before that tab filtered or opened something else is not its view's.
       if
-        state.grid.epoch == epoch
+        grid.epoch == epoch
         and source
         and source.kind == 'relation'
         and same_relation(source.relation, relation)
       then
-        state.grid.paging.total = count
+        grid.paging.total = count
       end
       M.render()
     end)
@@ -989,7 +1017,7 @@ function M.set_filter(where)
   end
   state.grid.filter = trimmed ~= '' and trimmed or nil
   state.grid.paging = paging.new(state.options.page_size)
-  new_epoch()
+  new_epoch(state.grid)
   M.fetch_page()
   M.count_rows(source.relation, state.grid.filter)
 end
@@ -1057,6 +1085,68 @@ function M.refresh_grid()
     return
   end
   M.run_sql(source.sql, { label = source.label })
+end
+
+-- ---------------------------------------------------------------------------
+-- result tabs
+
+--- Stop every tab's in-flight client call. Used when the whole tab set is being replaced.
+function M.cancel_tab_jobs()
+  for _, grid in ipairs(state.tabs.list) do
+    if grid.job and not grid.job.is_done() then
+      grid.job.cancel()
+    end
+  end
+end
+
+--- Open an empty result tab and show it.
+---@return boolean opened  -- false when the cap refused it, which is reported here
+function M.open_tab()
+  local index, err = tabs.open(state.tabs, state.options, state.options.ui.results.max_tabs)
+  if not index then
+    M.notify(err)
+    return false
+  end
+  activate(index)
+  M.render()
+  return true
+end
+
+--- Close the result tab on screen, cancelling whatever it was running.
+function M.close_tab()
+  local retired = state.grid
+  if retired.job and not retired.job.is_done() then
+    retired.job.cancel()
+  end
+  local removed = tabs.close(state.tabs, state.options)
+  activate(state.tabs.active)
+  M.render()
+  M.notify(
+    removed and ('closed - %d result tab(s) left'):format(tabs.count(state.tabs))
+      or 'closed the last result'
+  )
+end
+
+--- Show the next or previous tab, wrapping.
+---@param delta integer
+function M.step_tab(delta)
+  if tabs.count(state.tabs) == 1 then
+    M.notify('only one result is open')
+    return
+  end
+  activate(tabs.step(state.tabs, delta))
+  M.render()
+end
+
+--- Show the tab at `index`, 1-based.
+---@param index integer
+function M.select_tab(index)
+  if not tabs.select(state.tabs, index) then
+    M.notify(('there is no result tab %s'):format(tostring(index)))
+    return
+  end
+  activate(index)
+  M.render()
 end
 
 -- ---------------------------------------------------------------------------
@@ -1231,7 +1321,7 @@ end
 
 --- Run SQL from the editor. Multiple statements run in order and stop at the first error.
 ---@param text string
----@param opts { label: string?, explain: boolean?, analyze: boolean? }?
+---@param opts { label: string?, explain: boolean?, analyze: boolean?, new_tab: boolean? }?
 function M.run_sql(text, opts)
   opts = opts or {}
   local session = state.session
@@ -1275,6 +1365,9 @@ function M.run_sql(text, opts)
       writes[#writes + 1] = info
     end
   end
+  if opts.new_tab and not M.open_tab() then
+    return
+  end
   if #writes > 0 then
     require('dblens.ui.crud').confirm_script(state, statements, writes, function()
       M.execute_statements(statements, trimmed, opts, { confirmed = true })
@@ -1286,20 +1379,29 @@ end
 
 --- Execute statements that have been through the confirmation gate, and present the last result
 --- that has columns. The session gate still re-checks each statement.
+---
+--- The rows land in the tab the run was started from, whatever tab is on screen when they arrive,
+--- and only while that tab has not moved on to something else.
 ---@param approval dblens.WriteApproval?
 function M.execute_statements(statements, original, opts, approval)
   local session = state.session
+  local grid = state.grid
+  local fetch = new_fetch(grid)
+  local source = { kind = 'query', sql = original, label = opts.label or 'query' }
   set_busy('query', nil)
   local job = session:run_script(
     statements,
     { approval = approval },
     live(function(outcomes)
+      if grid.fetch ~= fetch then
+        return
+      end
       set_busy(nil, nil)
       local last = outcomes[#outcomes]
       if last and last.err then
-        state.grid.error = last.err
-        state.grid.source = { kind = 'query', sql = original, label = opts.label or 'query' }
-        state.grid.result = nil
+        grid.error = last.err
+        grid.source = source
+        grid.result = nil
         M.render()
         return
       end
@@ -1314,23 +1416,24 @@ function M.execute_statements(statements, original, opts, approval)
           shown = outcome.result
         end
       end
-      new_epoch()
+      new_epoch(grid)
       if not shown then
-        state.grid.source = { kind = 'query', sql = original, label = opts.label or 'query' }
-        state.grid.result = { columns = {}, rows = {}, malformed = 0 }
-        state.grid.error = nil
-        state.grid.elapsed_ms = total_ms
-        state.grid.message = ('%d statement(s) ran, no rows returned'):format(#outcomes)
+        grid.source = source
+        grid.result = { columns = {}, rows = {}, malformed = 0 }
+        grid.error = nil
+        grid.elapsed_ms = total_ms
+        grid.message = ('%d statement(s) ran, no rows returned'):format(#outcomes)
         M.render()
         M.refresh_after_write(statements)
         return
       end
       shown.elapsed_ms = total_ms
-      present(shown, { kind = 'query', sql = original, label = opts.label or 'query' })
+      present(grid, shown, source)
       M.render()
       M.refresh_after_write(statements)
     end)
   )
+  grid.job = job
   track(job)
 end
 
@@ -1465,7 +1568,7 @@ function M.grid_output()
     return nil
   end
   local ui = state.options.ui
-  return grid.render({
+  return grid_mod.render({
     columns = result.columns,
     rows = result.rows,
     types = state.grid.types,

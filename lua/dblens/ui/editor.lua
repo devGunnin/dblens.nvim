@@ -126,6 +126,14 @@ local function handlers(state, app)
     run_all = function()
       app.run_sql(buffer_text(buf), {})
     end,
+    run_new_tab = function()
+      local statement = M.statement_at_cursor(state)
+      if not statement then
+        app.notify('nothing to run')
+        return
+      end
+      app.run_sql(statement, { new_tab = true })
+    end,
     explain = function()
       run_current({ explain = true, label = 'explain' })
     end,

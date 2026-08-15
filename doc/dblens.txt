@@ -310,6 +310,18 @@ loaded and the row is browsed by the same paged SELECT as any other table.
 
 Reverse navigation ("which rows reference THIS one") is not in this release.
 
+                                                         *dblens-usage-tabs*
+Several results can be open at once. `t` in the tree opens a table in a new
+result tab and `<localleader>t` in the editor runs a statement into one; `gt`
+and `gT` step between them, `gc` closes the one on screen and `gl` lists them.
+The winbar names every open result once there is more than one.
+
+A tab owns its whole view - result, filter, sort, search and page - and its
+own race guard. A query started in one tab lands in THAT tab whatever you are
+looking at when it finishes, and closing a tab stops what it was running.
+`ui.results.max_tabs` caps how many can be open, because each one holds a
+whole result set. Closing the last tab empties it rather than closing dblens.
+
                                                        *dblens-usage-search*
 `g/` searches the loaded result and highlights every matching cell, `gn` and
 `gN` step through the matches. Matching is over the underlying values, so a
@@ -410,6 +422,7 @@ Normal mode, in the schema tree.
     `zM`              collapse_all     Collapse everything
     `/`               find             Find a table
     `o`               open             Open the table in the grid
+    `t`               open_tab         Open the table in a new result tab
     `c`               row_count        Count rows
     `D`               ddl              Show the DDL
     `X`               export           Export the table to a file
@@ -434,6 +447,10 @@ Normal mode, in the result grid.
     `C`               clear_filter     Clear the filter
     `R`               refresh          Re-run the query
     `gf`              follow_fk        Go to the referenced row
+    `gt`              next_tab         Next result tab
+    `gT`              prev_tab         Previous result tab
+    `gc`              close_tab        Close this result tab
+    `gl`              tab_list         List the open results
     `g/`              search           Search the result
     `gn`              next_match       Next match
     `gN`              prev_match       Previous match
@@ -455,6 +472,7 @@ In the SQL scratch buffer. Normal mode unless marked.
     `<CR>`            run              Run the statement
     `<CR>` (visual)   run_selection    Run the selection
     `<localleader>r`  run_all          Run the whole buffer
+    `<localleader>t`  run_new_tab      Run into a new result tab
     `<localleader>e`  explain          EXPLAIN the statement
     `<localleader>E`  explain_analyze  EXPLAIN ANALYZE
     `<C-c>`           cancel           Cancel the query
@@ -613,7 +631,8 @@ Every option with its default: >lua
         },
         results = {
           -- Share of the main column given to results; 0 < height < 1.
-          height = 0.55,
+          height   = 0.55,
+          max_tabs = 8,       -- results open at once; each holds a whole result
         },
         grid = {
           max_col_width = 40,     -- widest a column renders; minimum 4

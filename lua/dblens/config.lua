@@ -54,8 +54,9 @@ M.defaults = {
     icons = true,
     winbar = true,
     sidebar = { width = 34, position = 'left' },
-    --- Share of the main column given to results; the editor takes the rest.
-    results = { height = 0.55 },
+    --- Share of the main column given to results; the editor takes the rest. `max_tabs` caps how
+    --- many results can be open at once — each tab holds a whole result set.
+    results = { height = 0.55, max_tabs = 8 },
     grid = {
       max_col_width = 40,
       null_display = 'NULL',
@@ -227,6 +228,7 @@ local function validate_ui(ui)
   fraction(ui.results.height, 'ui.results.height')
   fraction(ui.float.max_width, 'ui.float.max_width')
   fraction(ui.float.max_height, 'ui.float.max_height')
+  positive_int(ui.results.max_tabs, 'ui.results.max_tabs')
   positive_int(ui.sidebar.width, 'ui.sidebar.width')
   positive_int(ui.grid.chunk_size, 'ui.grid.chunk_size')
   positive_int(ui.spinner.interval, 'ui.spinner.interval')
