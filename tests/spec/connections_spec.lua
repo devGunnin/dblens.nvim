@@ -157,14 +157,18 @@ describe('connections: the store keeps what it cannot use', function()
     eq(type(entries[2].problem), 'string')
   end)
 
-  it('deletes an entry `load` refuses, leaving its neighbours byte-for-byte', function()
+  --- Not byte-for-byte: the file is re-encoded on every write, so key order and hand formatting
+  --- go. Every field of every untouched entry, and its position, is what survives.
+  it('deletes an entry `load` refuses, leaving its neighbours field-for-field', function()
     local options = scratch()
-    store(options, { GOOD, { name = 'wrong', kind = 'postgres' } })
+    local hand_written = { name = 'wrong', kind = 'postgres', comment = 'keep me' }
+    store(options, { GOOD, hand_written, { name = 'third', kind = 'sqlite', path = '/tmp/t.db' } })
     local ok, err = connections.put(options, 'wrong', nil)
     eq(ok, true, { fail_reason = tostring(err) })
-    local text = read_file(options.connections_file)
-    eq(text:find('wrong', 1, true), nil)
-    neq(text:find('local', 1, true), nil, { fail_reason = 'the good connection was dropped too' })
+    eq(vim.json.decode(read_file(options.connections_file)), {
+      GOOD,
+      { name = 'third', kind = 'sqlite', path = '/tmp/t.db' },
+    }, { fail_reason = 'a neighbour was changed, dropped or reordered' })
   end)
 
   it('refuses to author a plaintext password rather than rewriting the file around one', function()
@@ -182,6 +186,178 @@ describe('connections: the store keeps what it cannot use', function()
     local options = scratch()
     store(options, { GOOD })
     local ok, err = connections.put(options, 'other', vim.tbl_extend('force', GOOD, {}))
+    eq(ok, false)
+    neq(err:find('already exists', 1, true), nil, { fail_reason = tostring(err) })
+  end)
+end)
+
+--- The file the manager exists to REPAIR is by definition not a well-formed one. Every case here
+--- works on a connections.json a hand-edit or an interrupted write could plausibly leave behind.
+describe('an imperfect connections.json', function()
+  --- A stray scalar, a JSON null and an entry with no name at all, either side of a good one.
+  local MALFORMED = '["oops",{"name":"good","kind":"sqlite","path":"%s"},null,{"kind":"sqlite"}]'
+
+  local function store_malformed(options)
+    write_file(GOOD.path, '')
+    write_file(options.connections_file, MALFORMED:format(GOOD.path))
+  end
+
+  it('lists every element, the ones that are not objects included', function()
+    local options = scratch()
+    store_malformed(options)
+    local rows = manager.rows({ options = options, specs = {} })
+    eq(#rows, 4, { fail_reason = 'an element of the file is missing from the list' })
+    eq({ rows[1].index, rows[2].index, rows[3].index, rows[4].index }, { 1, 2, 3, 4 })
+    eq(rows[2].name, 'good')
+    eq(rows[2].health.state, 'ok')
+    for _, at in ipairs({ 1, 3, 4 }) do
+      eq(rows[at].name, nil, { fail_reason = 'a broken entry was given a usable name' })
+      eq(rows[at].health.state, 'broken', { fail_reason = 'the broken entry is not flagged' })
+    end
+  end)
+
+  it('renders and opens rather than throwing a traceback', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function()
+      local app = require('dblens.app')
+      local options = scratch()
+      store_malformed(options)
+      app.open()
+      local state = app.state()
+      local rows = manager.rows(state)
+      local lines = manager.render(rows, nil, nil)
+      local text = table.concat(lines, '\n')
+      neq(text:find('not an object', 1, true), nil, { fail_reason = text })
+      neq(text:find('(no name)', 1, true), nil, { fail_reason = text })
+      local popup = manager.open(state)
+      neq(popup, nil, { fail_reason = ':DbLensConnections did not open on a malformed file' })
+      popup.close()
+      app.close()
+    end)
+  end)
+
+  it('deletes a broken element by its position, leaving the good one', function()
+    local options = scratch()
+    store_malformed(options)
+    local said = notices(function()
+      -- The trailing nameless object first, so the earlier positions stay where they are.
+      require('dblens.ui.form').remove(options, 4)
+      require('dblens.ui.form').remove(options, 3)
+      require('dblens.ui.form').remove(options, 1)
+    end)
+    eq(errors_among(said), {}, { fail_reason = vim.inspect(said) })
+    local text = read_file(options.connections_file)
+    eq(text:find('oops', 1, true), nil, { fail_reason = text })
+    eq(text:find('null', 1, true), nil, { fail_reason = text })
+    eq(vim.json.decode(text), { { name = 'good', kind = 'sqlite', path = GOOD.path } })
+  end)
+
+  it('deletes an entry whose name is a number, with no assert on the way', function()
+    local options = scratch()
+    store(options, { { name = 5, kind = 'sqlite', path = '/tmp/x.db' }, GOOD })
+    local rows = manager.rows({ options = options, specs = {} })
+    eq(rows[1].name, nil, { fail_reason = 'a numeric name was taken for a usable one' })
+    neq(rows[1].label:find('5', 1, true), nil, {
+      fail_reason = 'the broken name is not shown, so it cannot be found in the file',
+    })
+    local said = notices(function()
+      require('dblens.ui.form').remove(options, 1)
+    end)
+    eq(errors_among(said), {}, { fail_reason = vim.inspect(said) })
+    eq(read_file(options.connections_file):find('"name":5', 1, true), nil)
+  end)
+
+  it('keeps two entries under one name apart, and deletes exactly one of them', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+      { name = 'other', kind = 'sqlite', path = '/tmp/c.db' },
+    })
+    local rows = manager.rows({ options = options, specs = {} })
+    eq(#rows, 3)
+    neq(rows[2].health.reason:find('duplicate', 1, true), nil, { fail_reason = 'not flagged' })
+    neq(rows[1].cells[3], rows[2].cells[3], { fail_reason = 'the two rows are indistinguishable' })
+
+    local ok, err = connections.put_at(options, 2, nil)
+    eq(ok, true, { fail_reason = tostring(err) })
+    eq(vim.json.decode(read_file(options.connections_file)), {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'other', kind = 'sqlite', path = '/tmp/c.db' },
+    }, { fail_reason = 'deleting one duplicate took the other with it' })
+  end)
+
+  it('replaces only the duplicate it was pointed at', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    })
+    local ok, err =
+      connections.put_at(options, 2, { name = 'dup', kind = 'sqlite', path = '/tmp/z.db' })
+    eq(ok, true, { fail_reason = tostring(err) })
+    local list = vim.json.decode(read_file(options.connections_file))
+    eq(#list, 2, { fail_reason = 'editing a duplicate changed how many entries there are' })
+    eq({ list[1].path, list[2].path }, { '/tmp/a.db', '/tmp/z.db' })
+  end)
+
+  it('shows `?` rather than a Lua table address for a field that is an object', function()
+    local options = scratch()
+    write_file(
+      options.connections_file,
+      '[{"name":"junk","kind":"postgres","host":{"a":1},"port":"nope","database":"d"}]'
+    )
+    local rows = manager.rows({ options = options, specs = {} })
+    eq(rows[1].cells[3], '?', { fail_reason = 'the target cell reads ' .. rows[1].cells[3] })
+    eq(rows[1].health.state, 'broken')
+  end)
+
+  it('calls a hand-written plaintext password what it is, not "none"', function()
+    local options = scratch()
+    store(options, { { name = 'bad', kind = 'sqlite', path = '/tmp/x.db', password = 'hunter2' } })
+    local rows = manager.rows({ options = options, specs = {} })
+    eq(rows[1].cells[5], 'plaintext!', { fail_reason = rows[1].cells[5] })
+    -- The value itself is still never rendered.
+    eq(h.leaks(rows[1].cells, 'hunter2'), false, { fail_reason = 'the password reached a row' })
+  end)
+
+  it('deletes ONE entry when two share the name it was given', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    })
+    local ok, err = connections.put(options, 'dup', nil)
+    eq(ok, true, { fail_reason = tostring(err) })
+    eq(vim.json.decode(read_file(options.connections_file)), {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    }, { fail_reason = 'deleting `dup` took both entries named `dup`' })
+  end)
+
+  it('replaces ONE entry when two share the name it was given', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    })
+    local ok, err =
+      connections.put(options, 'dup', { name = 'dup', kind = 'sqlite', path = '/tmp/z.db' })
+    eq(ok, true, { fail_reason = tostring(err) })
+    eq(vim.json.decode(read_file(options.connections_file)), {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/z.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    }, { fail_reason = 'the replacement was written once per matching entry' })
+  end)
+
+  it('refuses to rename an entry onto a name another one already holds', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'other', kind = 'sqlite', path = '/tmp/b.db' },
+    })
+    local ok, err =
+      connections.put_at(options, 2, { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' })
     eq(ok, false)
     neq(err:find('already exists', 1, true), nil, { fail_reason = tostring(err) })
   end)
@@ -272,8 +448,9 @@ describe('manager: deleting a connection', function()
       write_file(options.state_file, vim.json.encode({ connection = 'tactica' }))
       app.open()
 
+      -- Addressed by its position in the file: `tactica` is the second stored entry.
       local said = notices(function()
-        require('dblens.ui.form').remove(options, 'tactica')
+        require('dblens.ui.form').remove(options, 2)
       end)
       eq(errors_among(said), {}, { fail_reason = 'deleting reported an error' })
 
@@ -294,10 +471,67 @@ describe('manager: deleting a connection', function()
     local options =
       scratch({ connections = { { name = 'fromconfig', kind = 'sqlite', path = '/tmp/c.db' } } })
     local said = notices(function()
-      require('dblens.ui.form').remove(options, 'fromconfig')
+      require('dblens.ui.form').remove_named(options, 'fromconfig')
     end)
     neq(errors_among(said)[1], nil)
     neq(errors_among(said)[1]:find('setup{}', 1, true), nil, { fail_reason = said[1].message })
+
+    -- And it occupies no position in the file, so `dd` has nothing to address either.
+    local rows = manager.rows({ options = options, specs = {} })
+    eq(rows[1].source, 'config')
+    eq(rows[1].index, nil, { fail_reason = 'a setup{} connection was given a file position' })
+    local problem = manager.editable_problem(rows[1])
+    neq(problem, nil, { fail_reason = 'the manager would let `dd` reach a setup{} connection' })
+    neq(problem:find('setup{}', 1, true), nil, { fail_reason = problem })
+  end)
+
+  it('refuses `:DbLensRemove` a name two stored entries share, rather than guessing', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    })
+    local before = read_file(options.connections_file)
+    local said = notices(function()
+      require('dblens.ui.form').remove_named(options, 'dup')
+    end)
+    local problem = errors_among(said)[1]
+    neq(problem, nil, { fail_reason = 'an ambiguous name was deleted anyway' })
+    neq(problem:find('DbLensConnections', 1, true), nil, {
+      fail_reason = 'the message must point at where the right entry can be picked: ' .. problem,
+    })
+    eq(read_file(options.connections_file), before, { fail_reason = 'the file was changed' })
+  end)
+
+  it('removes by name when exactly one stored entry answers to it', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function()
+      local options = scratch()
+      store(options, { GOOD, BROKEN })
+      require('dblens.app').open()
+      local said = notices(function()
+        require('dblens.ui.form').remove_named(options, 'tactica')
+      end)
+      eq(errors_among(said), {}, { fail_reason = vim.inspect(said) })
+      eq(read_file(options.connections_file):find('tactica', 1, true), nil)
+      require('dblens.app').close()
+    end)
+  end)
+
+  it('refuses a position the connections file does not have', function()
+    local options = scratch()
+    store(options, { GOOD })
+    local said = notices(function()
+      require('dblens.ui.form').remove(options, 2)
+    end)
+    neq(errors_among(said)[1], nil, { fail_reason = 'deleting nothing reported success' })
+    neq(errors_among(said)[1]:find('position 2', 1, true), nil, {
+      fail_reason = errors_among(said)[1],
+    })
+    neq(read_file(options.connections_file):find('local', 1, true), nil, {
+      fail_reason = 'the file was rewritten anyway',
+    })
   end)
 end)
 
@@ -474,5 +708,197 @@ describe('boot: a connection that cannot resolve its secret', function()
       neq(app.state().session, nil, { fail_reason = 'a healthy sole connection must still open' })
       app.close()
     end)
+  end)
+end)
+
+--- The connections file is the only record of every saved connection, and there is no backup: a
+--- write that dies halfway must lose nothing and must never report that it saved.
+describe('connections: writing the file', function()
+  --- Run `fn` with one `vim.uv` call replaced, so a syscall failure can be exercised without
+  --- depending on the machine the suite runs on.
+  local function with_uv_failure(name, replacement, fn)
+    local real = vim.uv[name]
+    vim.uv[name] = replacement
+    local ok, err = pcall(fn)
+    vim.uv[name] = real
+    assert(ok, tostring(err))
+  end
+
+  --- Every `.tmp` file left beside the connections file.
+  local function leftovers(options)
+    local dir = vim.fn.fnamemodify(options.connections_file, ':h')
+    return vim.fn.globpath(dir, '*.tmp', true, true)
+  end
+
+  it('leaves the original file exactly as it was when the rename fails', function()
+    local options = scratch()
+    store(options, { GOOD })
+    local before = read_file(options.connections_file)
+    local ok, err
+    with_uv_failure('fs_rename', function()
+      return nil, 'EIO: injected'
+    end, function()
+      ok, err =
+        connections.put(options, 'second', { name = 'second', kind = 'sqlite', path = '/tmp/s.db' })
+    end)
+    eq(ok, false, { fail_reason = 'a failed write reported that it saved' })
+    neq(err:find('could not replace', 1, true), nil, { fail_reason = tostring(err) })
+    eq(read_file(options.connections_file), before, { fail_reason = 'the original file changed' })
+    eq(leftovers(options), {}, { fail_reason = 'a temp file was left behind' })
+  end)
+
+  it('leaves the original file exactly as it was when the write is short', function()
+    local options = scratch()
+    store(options, { GOOD })
+    local before = read_file(options.connections_file)
+    local ok, err
+    with_uv_failure('fs_write', function()
+      return nil, 'ENOSPC: injected'
+    end, function()
+      ok, err =
+        connections.put(options, 'second', { name = 'second', kind = 'sqlite', path = '/tmp/s.db' })
+    end)
+    eq(ok, false, { fail_reason = 'a failed write reported that it saved' })
+    neq(err:find('ENOSPC', 1, true), nil, { fail_reason = tostring(err) })
+    eq(read_file(options.connections_file), before, { fail_reason = 'the original file changed' })
+    eq(leftovers(options), {}, { fail_reason = 'a temp file was left behind' })
+  end)
+
+  it('reports a real unwritable directory rather than saying it saved', function()
+    local options = scratch()
+    store(options, { GOOD })
+    local before = read_file(options.connections_file)
+    local dir = vim.fn.fnamemodify(options.connections_file, ':h')
+    vim.fn.setfperm(dir, 'r-x------')
+    local probe = vim.uv.fs_open(dir .. '/dblens-probe', 'w', tonumber('600', 8))
+    if probe then
+      -- Running as a user the mode does not bind (root): there is no real failure to observe.
+      vim.uv.fs_close(probe)
+      vim.uv.fs_unlink(dir .. '/dblens-probe')
+      vim.fn.setfperm(dir, 'rwx------')
+      MiniTest.add_note(
+        'the connections directory stayed writable; the real-failure proof did not run'
+      )
+      return
+    end
+    local ok, err =
+      connections.put(options, 'second', { name = 'second', kind = 'sqlite', path = '/tmp/s.db' })
+    vim.fn.setfperm(dir, 'rwx------')
+    eq(ok, false, { fail_reason = 'a failed write reported that it saved' })
+    eq(type(err), 'string')
+    eq(read_file(options.connections_file), before, { fail_reason = 'the original file changed' })
+    eq(leftovers(options), {}, { fail_reason = 'a temp file was left behind' })
+  end)
+
+  it('keeps the file owner-only, from the moment it is created', function()
+    local options = scratch()
+    local ok, err = connections.put(options, GOOD.name, GOOD)
+    eq(ok, true, { fail_reason = tostring(err) })
+    eq(vim.fn.getfperm(options.connections_file), 'rw-------')
+    eq(leftovers(options), {}, { fail_reason = 'a temp file was left behind' })
+  end)
+
+  it('never writes the VALUE a `password_env` names, only the name', function()
+    local options = scratch()
+    vim.env.DBLENS_WRITE_PROBE = 'sup3rs3cr3t'
+    local spec = {
+      name = 'pg',
+      kind = 'postgres',
+      host = 'h',
+      user = 'u',
+      database = 'd',
+      password_env = 'DBLENS_WRITE_PROBE',
+    }
+    local ok, err = connections.put(options, spec.name, spec)
+    eq(ok, true, { fail_reason = tostring(err) })
+    local bytes = read_file(options.connections_file)
+    vim.env.DBLENS_WRITE_PROBE = nil
+    eq(bytes:find('sup3rs3cr3t', 1, true), nil, { fail_reason = 'the secret reached the file' })
+    neq(bytes:find('DBLENS_WRITE_PROBE', 1, true), nil, { fail_reason = bytes })
+  end)
+end)
+
+describe('form: editing a saved connection', function()
+  --- Answer `form.edit`'s questions in order: a value for `vim.ui.input`, a 1-based index for
+  --- `vim.ui.select`.
+  ---@return { message: string, level: integer? }[] said, table? saved
+  local function edit_with(options, index, answers)
+    local at, saved = 0, nil
+    local real_select, real_input = vim.ui.select, vim.ui.input
+    vim.ui.select = function(items, _opts, on_choice)
+      at = at + 1
+      local pick = answers[at]
+      assert(type(pick) == 'number', ('answer %d is not a selection'):format(at))
+      on_choice(items[pick], pick)
+    end
+    vim.ui.input = function(_opts, on_confirm)
+      at = at + 1
+      on_confirm(answers[at])
+    end
+    local said = notices(function()
+      require('dblens.ui.form').edit(options, index, function(spec)
+        saved = spec
+      end)
+    end)
+    vim.ui.select, vim.ui.input = real_select, real_input
+    return said, saved
+  end
+
+  it('keeps a key the user hand-wrote that no question asks about', function()
+    local options = scratch()
+    store(options, {
+      GOOD,
+      {
+        name = 'sq',
+        kind = 'sqlite',
+        path = '/tmp/edit-me.db',
+        comment = 'do not lose me',
+        tunnel = { host = 'bastion' },
+      },
+    })
+    -- path, then "no password", then read-only.
+    local said, saved = edit_with(options, 2, { '/tmp/edited.db', 1, 1 })
+    eq(errors_among(said), {}, { fail_reason = vim.inspect(said) })
+    neq(saved, nil, { fail_reason = 'the edit did not save' })
+    local list = vim.json.decode(read_file(options.connections_file))
+    eq(#list, 2)
+    eq(list[2].path, '/tmp/edited.db', { fail_reason = 'the edited field did not land' })
+    eq(list[2].comment, 'do not lose me', { fail_reason = 'a hand-written key was dropped' })
+    eq(list[2].tunnel, { host = 'bastion' }, { fail_reason = 'a hand-written key was dropped' })
+    eq(list[1].name, 'local', { fail_reason = 'the neighbour was disturbed' })
+  end)
+
+  it('edits the duplicate it was pointed at, not the first one under that name', function()
+    local options = scratch()
+    store(options, {
+      { name = 'dup', kind = 'sqlite', path = '/tmp/a.db' },
+      { name = 'dup', kind = 'sqlite', path = '/tmp/b.db' },
+    })
+    local said = edit_with(options, 2, { '/tmp/z.db', 1, 1 })
+    eq(errors_among(said), {}, { fail_reason = vim.inspect(said) })
+    local list = vim.json.decode(read_file(options.connections_file))
+    eq(#list, 2, { fail_reason = 'editing a duplicate changed how many entries there are' })
+    eq({ list[1].path, list[2].path }, { '/tmp/a.db', '/tmp/z.db' })
+  end)
+
+  it('asks for a name when the stored one cannot be used, and stores the repair', function()
+    local options = scratch()
+    store(options, { { name = '', kind = 'sqlite', path = '/tmp/x.db' } })
+    -- name, path, "no password", read-only.
+    local said, saved = edit_with(options, 1, { 'repaired', '/tmp/x.db', 1, 1 })
+    eq(errors_among(said), {}, { fail_reason = vim.inspect(said) })
+    eq(saved and saved.name, 'repaired')
+    eq(vim.json.decode(read_file(options.connections_file))[1].name, 'repaired')
+  end)
+
+  it('says which entry it cannot edit when the element is not an object at all', function()
+    local options = scratch()
+    write_file(options.connections_file, '["oops"]')
+    local said = edit_with(options, 1, {})
+    neq(errors_among(said)[1], nil, { fail_reason = 'editing a stray scalar said nothing' })
+    neq(errors_among(said)[1]:find('position 1', 1, true), nil, {
+      fail_reason = errors_among(said)[1],
+    })
+    eq(read_file(options.connections_file), '["oops"]', { fail_reason = 'the file was rewritten' })
   end)
 end)

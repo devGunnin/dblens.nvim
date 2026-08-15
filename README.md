@@ -346,6 +346,17 @@ the saved session, so it cannot be restored back into existence. A connection fr
 listed but not editable there, a discovered one is marked and never written to disk, and an entry
 the loader refuses is listed too — that one is exactly the one you need to delete.
 
+The list holds whatever the file holds, however broken. An element that is not an object, a JSON
+`null`, an entry with no `name` or a `name` that cannot be used as one: each is a flagged row
+naming its position in the file and what is wrong with it, and `dd` deletes it from there. `e` on
+an entry with an unusable name asks for one and stores the repair.
+
+`e` and `dd` act on the row the cursor is on, addressed by its **position** in the file, not by
+its name. Two entries under one name are two entries: deleting one leaves the other, editing one
+changes only that one. `e` keeps every field of the entry it edits, keys the form has no question
+for included. `:DbLensRemove` takes a name, so it refuses one that two stored entries share —
+pick the one you mean in the manager.
+
 ### Interactively
 
 `:DbLensAdd` asks for the kind, a name, the adapter's fields, where the password comes from
@@ -378,8 +389,11 @@ Either way the value is resolved into memory at connect time, handed to the clie
 the session closes. It is never written back, logged, or persisted. Omitting both is correct for
 SQLite and for ambient auth (`.pgpass`, peer, socket).
 
-The connections file is written `rw-------`. `:checkhealth dblens` reports whether a connection
-has a password reference, never which variable and never its value.
+The connections file is written `rw-------`, set at creation rather than after, and replaced
+atomically (temp file beside it, flushed, renamed into place) — an interrupted or failed write
+leaves the file it had and says so, instead of a truncated file reported as saved.
+`:checkhealth dblens` reports whether a connection has a password reference, never which variable
+and never its value.
 
 ## Discovery
 

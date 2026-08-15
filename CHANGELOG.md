@@ -40,8 +40,24 @@ All notable changes to this project are documented here. Format follows
 - **An entry the loader refuses can be seen and deleted.** It used to be dropped from the list
   entirely: not listed, not connectable, not removable by name, and shouting on every start. It
   is now listed with its reason, editable and deletable — and deleting or adding a connection
-  leaves every other stored entry byte-for-byte as it was, instead of quietly dropping the ones
-  that failed validation.
+  leaves every other stored entry with the same fields and the same position, instead of quietly
+  dropping the ones that failed validation. (The file is re-encoded on every write, so key order
+  and hand formatting are not preserved; the content of every untouched entry is.)
+- **The manager renders a connections file no matter what is in it.** A stray scalar, a JSON
+  `null`, an entry with no `name`, or one whose `name` is a number: each is listed as a flagged
+  row saying which position in the file it is and what is wrong with it, and each can be deleted
+  from there. `:DbLensConnections` used to throw a traceback on exactly these — the files it
+  exists to repair. `e` on an entry with an unusable name asks for one and stores the repair.
+- **Two entries under one name are two entries.** The manager acts on the row the cursor is on,
+  addressed by its position in the file, so deleting one duplicate removes one (it used to remove
+  both) and editing one replaces one (it used to write the edited entry once per match).
+- **Editing keeps a field you hand-wrote.** `e` used to rebuild the entry from the questions it
+  asks, silently dropping every other key in it. The answers are now merged over the stored entry.
+- **The connections file is written atomically.** A temp file in the same directory, flushed to
+  disk, renamed into place, with the write and the flush both checked. A crash or a full disk
+  mid-write used to leave a truncated file — every saved connection gone, with "saved connection
+  `x`" reported over it. A failed write now leaves the original file exactly as it was and says
+  so. The `rw-------` mode is applied at creation, so there is no window where it is world-readable.
 - **The add form refuses the mistake that caused this.** A host typed as `host:port` is split
   into host and port (and a host that disagrees with a separately given port is refused);
   `password_env` must be a variable NAME, so `.env` is refused with what to do instead (a `.env`

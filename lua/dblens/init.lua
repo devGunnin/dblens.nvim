@@ -252,7 +252,7 @@ end
 ---@param name string
 function M.remove_connection(name)
   M.ensure_setup()
-  require('dblens.ui.form').remove(config.get(), name)
+  require('dblens.ui.form').remove_named(config.get(), name)
 end
 
 --- Open the active connection for editing. The sanctioned write path; writes still confirm.

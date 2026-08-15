@@ -16,8 +16,10 @@ local M = {}
 local NAMESPACE = api.nvim_create_namespace('dblens.manager')
 
 ---@class dblens.ManagerRow
----@field name string?
+---@field name string?  -- nil unless the entry has a usable name; nothing may be keyed on it
+---@field label string  -- what to call this row on screen, broken entries included
 ---@field source 'config'|'file'|'discovered'
+---@field index integer?  -- position in the connections file; nil unless `source` is 'file'
 ---@field health dblens.ConnectionHealth
 ---@field cells string[]
 
@@ -32,10 +34,18 @@ end
 
 --- Where a connection's password comes from, never which value or which variable's value.
 local function secret_label(spec)
-  if spec.password_env then
+  -- dblens never writes one, so saying "none" over a hand-written plaintext password would hide
+  -- the one thing about this entry worth saying.
+  if connections.plaintext_password_key(spec) then
+    return 'plaintext!'
+  end
+  if type(spec.password_env) == 'string' then
     return '$' .. spec.password_env
   end
-  if spec.password_cmd then
+  if spec.password_env ~= nil then
+    return '$?'
+  end
+  if spec.password_cmd ~= nil then
     return 'command'
   end
   if spec.source == 'discovered' then
@@ -44,27 +54,94 @@ local function secret_label(spec)
   return 'none'
 end
 
+--- Whether every adapter field this spec fills is a scalar. A JSON object where a host belongs
+--- describes without raising and renders a Lua table address, which tells the user nothing.
+local function scalar_fields(spec, adapter)
+  for _, field in ipairs(adapter.fields or {}) do
+    local value = spec[field.name]
+    local kind = type(value)
+    if value ~= nil and kind ~= 'string' and kind ~= 'number' and kind ~= 'boolean' then
+      return false
+    end
+  end
+  return true
+end
+
 local function target_label(spec)
   local adapter = adapters.get(spec.kind)
-  if not adapter then
+  if not adapter or not scalar_fields(spec, adapter) then
     return '?'
   end
   local ok, described = pcall(adapter.describe, spec)
-  return ok and described or '?'
+  if not ok or type(described) ~= 'string' then
+    return '?'
+  end
+  return described
 end
 
----@param spec dblens.ConnectionSpec
+--- The stored `name`, but only when it is one that can be used as a name.
+local function usable_name(value)
+  if type(value) == 'string' and value ~= '' then
+    return value
+  end
+  return nil
+end
+
+--- What to call an entry on screen. A name that cannot be used is still SHOWN, because the user
+--- has to be able to find the entry in the file.
+local function name_label(value)
+  local usable = usable_name(value)
+  if usable then
+    return usable
+  end
+  if value == nil then
+    return '(no name)'
+  end
+  if type(value) == 'string' or type(value) == 'number' or type(value) == 'boolean' then
+    return ('(invalid name: %s)'):format(tostring(value))
+  end
+  return '(invalid name)'
+end
+
+--- One row, built from an entry that may be anything the file happened to hold.
+---@param spec dblens.ConnectionSpec  -- every field access here is guarded
 ---@param source 'config'|'file'|'discovered'
 ---@param health dblens.ConnectionHealth
+---@param index integer?  -- position in the connections file
 ---@return dblens.ManagerRow
-local function row_for(spec, source, health)
-  local kind = spec.kind and tostring(spec.kind) or '?'
+local function row_for(spec, source, health, index)
+  assert(type(spec) == 'table', 'manager.row_for: expected a spec table')
+  local kind = type(spec.kind) == 'string' and spec.kind or '?'
   local mode = spec.read_only == false and 'EDIT' or 'LOCKED'
-  local cells = { spec.name or '(no name)', kind, target_label(spec), mode, secret_label(spec) }
+  local label = name_label(spec.name)
+  local cells = { label, kind, target_label(spec), mode, secret_label(spec) }
   if source ~= 'file' then
     cells[1] = cells[1] .. ' (' .. source .. ')'
   end
-  return { name = spec.name, source = source, health = health, cells = cells }
+  return {
+    name = usable_name(spec.name),
+    label = label,
+    source = source,
+    index = index,
+    health = health,
+    cells = cells,
+  }
+end
+
+--- Why the manager cannot change this row, or nil when it can.
+---
+--- Only a stored row is changeable, and only through the position it occupies in the file.
+---@param row dblens.ManagerRow
+---@return string? problem
+function M.editable_problem(row)
+  assert(type(row) == 'table' and row.label, 'manager.editable_problem: expected a row')
+  if row.source == 'file' and row.index then
+    return nil
+  end
+  if row.source == 'config' then
+    return ('`%s` comes from setup{} - change it there'):format(row.label)
+  end
+  return ('`%s` was discovered for this session - `a` saves one like it'):format(row.label)
 end
 
 --- Every connection to show: the configured and stored ones, then the discovered ones this
@@ -76,9 +153,12 @@ function M.rows(state)
   local entries, file_error = connections.entries(state.options)
   local rows, seen = {}, {}
   for _, entry in ipairs(entries) do
-    seen[entry.spec.name] = true
+    local named = usable_name(entry.spec.name)
+    if named then
+      seen[named] = true
+    end
     rows[#rows + 1] =
-      row_for(entry.spec, entry.source, connections.health(entry.spec, entry.problem))
+      row_for(entry.spec, entry.source, connections.health(entry.spec, entry.problem), entry.index)
   end
   for _, spec in ipairs(state.specs or {}) do
     if spec.source == 'discovered' and not seen[spec.name] then
@@ -173,9 +253,9 @@ local function step_out(popup, state, action)
 end
 
 local function confirm_delete(state, row, on_done)
-  local reason = row.health.state ~= 'ok' and { row.health.reason } or {}
+  local reason = (row.health.state ~= 'ok' and row.health.reason) and { row.health.reason } or {}
   require('dblens.ui.confirm').ask(state.options, {
-    title = ('Delete connection `%s`?'):format(row.name),
+    title = ('Delete connection `%s`?'):format(row.label),
     danger = true,
     sections = {
       { heading = 'connection', lines = { row.cells[1] .. '  ' .. row.cells[3] } },
@@ -189,52 +269,64 @@ local function confirm_delete(state, row, on_done)
       },
     },
   }, function()
-    require('dblens.ui.form').remove(state.options, row.name, on_done)
+    require('dblens.ui.form').remove(state.options, row.index, on_done)
   end)
+end
+
+--- Open the connection a row names.
+---
+--- Connecting is BY NAME, so a row without a usable one has nothing to connect to and says so.
+local function connect_row(popup, row)
+  if not row.name then
+    require('dblens.app').notify(
+      ('`%s` has no usable name - fix it with `e`, or delete it with `dd`'):format(row.label)
+    )
+    return
+  end
+  popup.close()
+  vim.schedule(function()
+    require('dblens.app').connect(row.name)
+  end)
+end
+
+--- Whether `e` and `dd` may act on this row, saying why not when they may not. A BROKEN entry
+--- passes: fixing or deleting it is the point.
+local function changeable(row)
+  local problem = M.editable_problem(row)
+  if problem then
+    require('dblens.app').notify(problem)
+    return false
+  end
+  return true
 end
 
 local function handlers(popup, state, rows, row_at)
   local function current()
     local row = row_under_cursor(popup, rows, row_at)
-    if not row or not row.name then
+    if not row then
       require('dblens.app').notify('put the cursor on a connection first')
-      return nil
     end
     return row
-  end
-  local function editable(row)
-    if row.source == 'file' then
-      return true
-    end
-    require('dblens.app').notify(
-      row.source == 'config' and ('`%s` comes from setup{} - change it there'):format(row.name)
-        or ('`%s` was discovered for this session - `a` saves one like it'):format(row.name)
-    )
-    return false
   end
 
   return {
     connect = function()
       local row = current()
-      if not row then
-        return
+      if row then
+        connect_row(popup, row)
       end
-      popup.close()
-      vim.schedule(function()
-        require('dblens.app').connect(row.name)
-      end)
     end,
     edit = function()
       local row = current()
-      if row and editable(row) then
+      if row and changeable(row) then
         step_out(popup, state, function(done)
-          require('dblens.ui.form').edit(state.options, row.name, done)
+          require('dblens.ui.form').edit(state.options, row.index, done)
         end)
       end
     end,
     delete = function()
       local row = current()
-      if row and editable(row) then
+      if row and changeable(row) then
         step_out(popup, state, function(done)
           confirm_delete(state, row, done)
         end)
