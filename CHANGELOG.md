@@ -3,6 +3,36 @@
 All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.5.0] - 2026-08-15
+
+### Added
+
+- **An interactive filter builder** on the grid. `F` on a column no longer only filters to the
+  exact value under the cursor: it opens an operator menu — `=`, `!=`, `>`, `>=`, `<`, `<=`,
+  `BETWEEN`, `IN`, `LIKE` / `NOT LIKE`, `ILIKE` / `NOT ILIKE` where the engine has the keyword,
+  `IS NULL`, `IS NOT NULL` — and then prompts for the value(s), prefilled with the cell you were
+  on. `BETWEEN` asks twice, `IN` takes a comma list, a pattern arrives wrapped in `%…%` to edit
+  or delete, and `IS NULL` asks nothing. The menu order follows the column type the tree has
+  loaded: a number or a date surfaces the range operators, text surfaces the pattern ones, a NULL
+  cell puts `IS NULL` first — every operator stays reachable either way. With a filter applied it asks
+  whether to `AND` onto it or replace it, parenthesising both sides so an `OR` keeps its meaning.
+  The result is one server-side `WHERE` composed with the sort, re-read from page 1.
+
+  The column name and every value go through the same per-dialect quoting the rest of the plugin
+  uses, and the composed predicate is vetted by the same allow-list as a hand-typed one: a column
+  named `select` is a name, a value holding `'`, `;` or `--` is a literal, and a value that
+  cannot be expressed is refused with a reason rather than sent. On a LOCKED connection it stays
+  a read, and a value carrying `;` is still refused there.
+
+- `caps.ilike` per adapter, so the menu offers `ILIKE` only where the engine parses the keyword
+  (PostgreSQL, DuckDB).
+
+### Changed
+
+- `F` (`filter_cell`) is now the builder rather than a one-key exact-value filter; its help text
+  reads "Filter this column". `F` then `<CR>` twice is the old behaviour. `!` still filters the
+  value under the cursor out in one key, and `C` still clears.
+
 ## [1.4.0] - 2026-08-15
 
 ### Added

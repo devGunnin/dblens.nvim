@@ -45,6 +45,7 @@ local M = {
     explain = true,
     explain_analyze = true,
     estimate_rows = false,
+    ilike = true,
   },
   read_only_enforcement = {
     mechanism = 'file-open',

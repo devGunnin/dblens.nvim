@@ -23,6 +23,7 @@ anything it cannot prove is a read as a write.
 - [Discovery](#discovery)
 - [Configuration](#configuration)
 - [Commands](#commands)
+- [Filtering](#filtering)
 - [Keymaps](#keymaps)
 - [Safety model](#safety-model)
 - [Transactions](#transactions)
@@ -158,8 +159,10 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
 - **Find the rows that reference this one** (`gF`): the same metadata read the other way round,
   so you can go from a customer to their orders. Tables the tree has not expanded are read first,
   so "nothing references this" means it, and several referencing tables ask which one.
-- **Filter to the cell under the cursor** (`F`), or away from it (`!`), with the value quoted for
-  the dialect rather than retyped. `C` clears the filter.
+- **Build a filter on the column under the cursor** (`F`): an operator menu — `=`, `!=`, `>`,
+  `>=`, `<`, `<=`, `BETWEEN`, `IN`, `LIKE`, `ILIKE` where the engine has it, `IS NULL` — with the
+  value prompt prefilled from the cell. `!` still filters the value out in one key, `C` clears.
+  See [Filtering](#filtering).
 - **Sort by any column** (`s`, cycling ascending, descending, unsorted), and **by several**: `S`
   adds the column under the cursor as the next key, `gs` clears them all. The header marks each
   key with an arrow and, past the first, its position. Every one is a server-side `ORDER BY` with
@@ -613,6 +616,46 @@ pane it belongs to is first opened.
 
 Every command runs the same handler as its binding, so the two cannot drift apart.
 
+## Filtering
+
+Three ways to narrow a browsed table, all of them a server-side `WHERE` that composes with the
+sort and re-reads from page 1:
+
+- `f` — type a `WHERE` predicate yourself. Raw SQL, vetted by the allow-list described in
+  [Safety model](#safety-model).
+- `F` — the filter builder on the column under the cursor.
+- `!` — filter the value under the cursor out, in one key.
+- `C` — clear the filter.
+
+`F` opens an operator menu for that column:
+
+| Operator | Takes | Notes |
+| --- | --- | --- |
+| `=` `!=` | one value | `!=` is sent as the standard `<>` |
+| `>` `>=` `<` `<=` | one value | |
+| `BETWEEN` | two values | inclusive, asked for in two prompts |
+| `IN` | a comma-separated list | entries are trimmed; a trailing comma is ignored |
+| `LIKE` `NOT LIKE` | one pattern | `%` and `_`; the prompt arrives wrapped in `%…%` to edit or delete |
+| `ILIKE` `NOT ILIKE` | one pattern | offered on PostgreSQL and DuckDB, the engines with the keyword |
+| `IS NULL` `IS NOT NULL` | nothing | no prompt |
+
+The order is chosen for the column's type as the schema tree has loaded it: a number or a date
+surfaces `>`, `<` and `BETWEEN` first, text surfaces the pattern operators, and a NULL cell puts
+`IS NULL` at the top. With no type loaded the order is neutral. Every operator is always
+reachable either way — the type only decides what comes first.
+
+The value prompt is prefilled with the cell you were on, editable before you accept it. With a
+filter already applied, dblens asks whether to `AND` onto it or replace it; both sides are
+parenthesised, so an `OR` in either keeps its meaning. Cancelling any prompt leaves the grid
+exactly as it was.
+
+The column name and every value go through the same per-dialect quoting as `!` and `gf` — a
+column named `select` is a name, and a value holding `'`, `;` or `--` is a literal. The composed
+predicate is then vetted like a hand-typed one, so a value it cannot express (a backslash on
+MySQL/MariaDB, a NUL byte) is refused with a reason instead of sent. On a LOCKED connection this
+is a read; a value carrying `;` is still refused there, because a locked run must be provably one
+statement.
+
 ## Keymaps
 
 Every binding is declared in one table and can be remapped or disabled per scope through
@@ -688,7 +731,7 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `S` | `add_sort` | Add this column to the sort |
 | `gs` | `clear_sort` | Clear the sort |
 | `f` | `filter` | Filter rows (WHERE) |
-| `F` | `filter_cell` | Filter to this value |
+| `F` | `filter_cell` | Filter this column |
 | `!` | `filter_not_cell` | Filter out this value |
 | `C` | `clear_filter` | Clear the filter |
 | `R` | `refresh` | Re-run the query |

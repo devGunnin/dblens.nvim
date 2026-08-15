@@ -177,6 +177,19 @@ function Catalog:set_row_count(relation, count)
   self:info_for(relation).row_count = count
 end
 
+--- One column of a relation by name, or nil when it or the relation is not loaded.
+---@param name string
+---@return dblens.Column?
+function Catalog:column(relation, name)
+  assert(type(name) == 'string' and name ~= '', 'catalog:column: expected a column name')
+  for _, column in ipairs(self:info_for(relation).columns or {}) do
+    if column.name == name then
+      return column
+    end
+  end
+  return nil
+end
+
 --- Primary key columns, in key order. Empty when the relation has none or is not loaded.
 ---@return dblens.Column[]
 function Catalog:primary_key(relation)
