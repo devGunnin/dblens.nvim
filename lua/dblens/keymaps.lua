@@ -298,6 +298,20 @@ M.specs = {
       group = 'run',
     },
     {
+      action = 'format',
+      lhs = '<localleader>f',
+      desc = 'Format the buffer',
+      mode = 'n',
+      group = 'edit',
+    },
+    {
+      action = 'format_selection',
+      lhs = '<localleader>f',
+      desc = 'Format the selection',
+      mode = 'x',
+      group = 'edit',
+    },
+    {
       action = 'save_snippet',
       lhs = '<localleader>s',
       desc = 'Save as a snippet',

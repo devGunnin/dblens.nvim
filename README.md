@@ -181,6 +181,11 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   in the editor; `<C-r>` runs it straight away, through the same gate as one you typed.
 - Schema-aware completion: keywords, tables, views, and columns qualified by table name or
   FROM/JOIN alias. Works through `omnifunc`, nvim-cmp or blink.cmp.
+- **Format the SQL** (`<localleader>f`, or `:DbLensFormat`) with a formatter you already have —
+  `sqlfluff`, `pg_format` or `sqlformat`, detected in that order, or whatever `format.command`
+  names. It is spawned as an argv array with the SQL on stdin: a text tool over text, never a
+  shell string and never anything that could execute the statement. With none installed it says
+  which to install and leaves the buffer alone.
 
 **Edit**
 
@@ -402,6 +407,13 @@ require('dblens').setup({
     max_entries = 20000,          -- directory entries examined before the scan stops and says so
   },
 
+  format = {
+    -- {} detects sqlfluff, pg_format or sqlformat, in that order. An argv ARRAY picks one, e.g.
+    -- { 'sqlfluff', 'format', '--dialect', 'postgres', '-' }. Never a shell string: it is spawned
+    -- directly, is handed the SQL on stdin, and only reformats text.
+    command = {},
+  },
+
   export = {
     max_rows   = 1000000,         -- hard cap on a streamed export; reaching it STOPS it and says so
   },
@@ -502,6 +514,7 @@ pane it belongs to is first opened.
 | `:DbLensCommit` | Commit the transaction |
 | `:DbLensRollback` | Roll back the transaction |
 | `:DbLensPending` | Show the pending changes |
+| `:DbLensFormat` | Format the SQL buffer, or the `:'<,'>` range, through the detected formatter |
 | `:DbLensRestore` | Reopen the last saved session |
 | `:DbLensHelp` | Show every binding for the current pane |
 
@@ -598,6 +611,8 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<localleader>e` | n | `explain` | EXPLAIN the statement |
 | `<localleader>E` | n | `explain_analyze` | EXPLAIN ANALYZE |
 | `<C-c>` | n | `cancel` | Cancel the query |
+| `<localleader>f` | n | `format` | Format the buffer |
+| `<localleader>f` | x | `format_selection` | Format the selection |
 | `<localleader>s` | n | `save_snippet` | Save as a snippet |
 | `<localleader>h` | n | `history` | Query history |
 | `<localleader>?` | n | `help` | This help |

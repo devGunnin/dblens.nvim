@@ -90,6 +90,16 @@ local COMMANDS = {
     { desc = 'Reopen the last dblens session' },
   },
   {
+    'DbLensFormat',
+    function(args)
+      -- A range is only honoured when one was typed: `:DbLensFormat` alone must not format the
+      -- single line the cursor happens to be on.
+      local from = args.range > 0 and args.line1 or nil
+      require('dblens').format(from, from and args.line2 or nil)
+    end,
+    { range = true, desc = 'Format the dblens SQL buffer' },
+  },
+  {
     'DbLensHelp',
     function()
       require('dblens').help()

@@ -40,6 +40,11 @@ M.defaults = {
   --- STOPS the export and says so — it never trims the file in silence.
   export = { max_rows = 1000000 },
 
+  --- `:DbLensFormat`. An EMPTY command detects an installed formatter; set an argv ARRAY to pick
+  --- one, e.g. `{ 'sqlfluff', 'format', '--dialect', 'postgres', '-' }`. Never a shell string: it
+  --- is spawned directly, gets the SQL on stdin, and only reformats text.
+  format = { command = {} },
+
   history = { enabled = true, max_entries = 500 },
   --- Restoring reconnects, so it is opt-in: nothing reaches a database on startup by default.
   session = { restore = false, auto_save = true },
@@ -247,6 +252,20 @@ local function validate_ui(ui)
   end
 end
 
+--- `format.command` is an argv ARRAY, checked here rather than at spawn time: a shell string
+--- would be spawned as one binary with a name full of spaces, and the error would name the
+--- formatter instead of the option that is wrong.
+local function validate_format(command)
+  if not vim.islist(command) then
+    error('dblens: option `format.command` must be an argv list, e.g. { `pg_format`, `-` }', 0)
+  end
+  for index, part in ipairs(command) do
+    if type(part) ~= 'string' or part == '' then
+      error(('dblens: option `format.command[%d]` must be a non-empty string'):format(index), 0)
+    end
+  end
+end
+
 local function validate(options)
   positive_int(options.page_size, 'page_size')
   positive_int(options.max_rows, 'max_rows')
@@ -257,6 +276,7 @@ local function validate(options)
   positive_int(options.discovery.max_depth, 'discovery.max_depth')
   positive_int(options.discovery.max_entries, 'discovery.max_entries')
   one_of(options.completion.keyword_case, 'completion.keyword_case', { 'upper', 'lower', 'keep' })
+  validate_format(options.format.command)
   validate_ui(options.ui)
   validate_keymaps(options.keymaps)
 end

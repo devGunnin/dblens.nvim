@@ -102,6 +102,50 @@ function M.render(state)
   status.set(win, segments, state.options)
 end
 
+--- Replace a line range with the formatter's output.
+---
+--- The buffer is touched only on success: a formatter that failed, timed out or printed nothing
+--- leaves the SQL exactly as it was, and says why. Nothing here reaches a database — the text goes
+--- to another process and comes back as text.
+---@param state dblens.State
+---@param from integer  -- 1-based, inclusive
+---@param to integer    -- 1-based, inclusive
+function M.format_range(state, from, to)
+  local app = require('dblens.app')
+  local buf = state.layout.bufs.editor
+  assert(api.nvim_buf_is_valid(buf), 'editor.format_range: the editor buffer is gone')
+  assert(from >= 1 and to >= from, 'editor.format_range: expected a forward line range')
+  local lines = api.nvim_buf_get_lines(buf, from - 1, to, false)
+  if #lines == 0 then
+    app.notify('nothing to format')
+    return
+  end
+
+  local job = require('dblens.format').run(
+    table.concat(lines, '\n'),
+    state.options,
+    function(formatted, err)
+      if app.state() == state then
+        app.set_busy(nil, nil)
+      end
+      if not formatted then
+        app.error(err)
+        return
+      end
+      if not api.nvim_buf_is_valid(buf) then
+        return
+      end
+      -- A formatter that ends its output with a newline would otherwise add a blank line here.
+      local replacement = vim.split((formatted:gsub('\n$', '')), '\n', { plain = true })
+      api.nvim_buf_set_lines(buf, from - 1, to, false, replacement)
+      app.notify(('formatted %d line(s)'):format(#replacement))
+    end
+  )
+  if job and app.state() == state then
+    app.set_busy('format', job)
+  end
+end
+
 local function handlers(state, app)
   local buf = state.layout.bufs.editor
 
@@ -146,6 +190,21 @@ local function handlers(state, app)
     end,
     cancel = function()
       app.cancel()
+    end,
+    format = function()
+      M.format_range(state, 1, api.nvim_buf_line_count(buf))
+    end,
+    format_selection = function()
+      -- Leave visual mode first so the `<`/`>` marks are set; formatting is linewise, because a
+      -- formatter reflows whole statements and half a line is not one.
+      vim.cmd('normal! \27')
+      local from = api.nvim_buf_get_mark(buf, '<')[1]
+      local to = api.nvim_buf_get_mark(buf, '>')[1]
+      if from == 0 or to == 0 then
+        app.notify('nothing is selected')
+        return
+      end
+      M.format_range(state, math.min(from, to), math.max(from, to))
     end,
     save_snippet = function()
       require('dblens.ui.picker').save_snippet(

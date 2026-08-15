@@ -357,6 +357,19 @@ write on a LOCKED connection is refused and a destructive one still confirms.
 
 Completion is available while you type; see |dblens-completion|.
 
+                                                       *dblens-usage-format*
+`<localleader>f` formats the buffer, and the same key in visual mode formats
+the selected LINES; `:DbLensFormat` does either, with a range or without.
+
+dblens does not format SQL itself. It hands the text to a formatter you
+already have - `sqlfluff`, `pg_format` or `sqlformat`, tried in that order, or
+whatever `format.command` names - spawned as an argv ARRAY with the SQL on its
+STDIN. There is no shell, no connection and no client: the formatter cannot
+execute the statement, only reprint it. What comes back on stdout replaces the
+lines, and only on success - a formatter that fails, times out or prints
+nothing leaves the buffer exactly as it was and says why. With none installed
+it names the ones to install rather than doing anything clever.
+
 EDITING                                                    *dblens-usage-edit*
 
 With a table open in the grid, `e` edits the cell under the cursor, `i`
@@ -457,7 +470,7 @@ Normal mode, in the result grid.
     `C`               clear_filter     Clear the filter
     `R`               refresh          Re-run the query
     `gf`              follow_fk        Go to the referenced row
-    `gF`              find_referencing Find rows referencing this one
+    `gF`              find_referencing  Find rows referencing this one
     `gt`              next_tab         Next result tab
     `gT`              prev_tab         Previous result tab
     `gc`              close_tab        Close this result tab
@@ -487,6 +500,8 @@ In the SQL scratch buffer. Normal mode unless marked.
     `<localleader>e`  explain          EXPLAIN the statement
     `<localleader>E`  explain_analyze  EXPLAIN ANALYZE
     `<C-c>`           cancel           Cancel the query
+    `<localleader>f`  format           Format the buffer
+    `<localleader>f` (visual)  format_selection  Format the selection
     `<localleader>s`  save_snippet     Save as a snippet
     `<localleader>h`  history          Query history
     `<localleader>?`  help             This help
@@ -559,6 +574,11 @@ In the SQL scratch buffer. Normal mode unless marked.
 :DbLensHelp             Show every binding that applies in the current pane.
                         The same overlay `?` opens.
 
+                                                               *:DbLensFormat*
+:DbLensFormat           Format the SQL buffer through the detected formatter.
+                        Takes a range: `:'<,'>DbLensFormat` formats those lines
+                        only. dblens must already be open.
+
                                                               *:DbLensRestore*
 :DbLensRestore          Reopen the connection and table that were open when
                         dblens was last closed.
@@ -612,6 +632,12 @@ Every option with its default: >lua
         -- Hard cap on a streamed export. Reaching it STOPS the run and says
         -- so; it never trims the file in silence.
         max_rows   = 1000000,
+      },
+
+      format = {
+        -- {} detects sqlfluff, pg_format or sqlformat, in that order. An argv
+        -- ARRAY picks one; never a shell string. See |dblens-usage-format|.
+        command = {},
       },
 
       history = {

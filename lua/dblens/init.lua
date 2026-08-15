@@ -259,6 +259,24 @@ function M.lock()
   require('dblens.app').set_locked(true)
 end
 
+--- Format the SQL editor buffer, or the given line range of it, through the detected formatter.
+---
+--- Does not open dblens: there is no editor buffer to format until it is open, and opening one to
+--- format an empty scratch buffer would be a surprise.
+---@param from integer?  -- 1-based; the whole buffer when omitted
+---@param to integer?
+function M.format(from, to)
+  M.ensure_setup()
+  local app = require('dblens.app')
+  local state = app.state()
+  if not state or not app.is_open() then
+    app.error('dblens is not open, so there is no SQL buffer to format')
+    return
+  end
+  local last = vim.api.nvim_buf_line_count(state.layout.bufs.editor)
+  require('dblens.ui.editor').format_range(state, from or 1, math.min(to or last, last))
+end
+
 --- Show the binding overlay for the pane the cursor is in, for a user who turned the keymaps off.
 function M.help()
   M.ensure_setup()

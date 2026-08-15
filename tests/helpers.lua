@@ -151,7 +151,7 @@ end
 
 --- Modules that capture `dblens.exec` or `dblens.session` at require time, so they must be
 --- reloaded alongside the double or they would keep calling the real one.
-local EXEC_DEPENDENTS = { 'dblens.session', 'dblens.connections', 'dblens.app' }
+local EXEC_DEPENDENTS = { 'dblens.session', 'dblens.connections', 'dblens.app', 'dblens.format' }
 
 --- Deliver stdout the way a STREAMING run does: chunk by chunk, with nothing accumulated in the
 --- result. A canned `chunks` list drives the framing, so a spec can cut the wire mid-record.
