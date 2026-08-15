@@ -15,6 +15,8 @@ local function scratch_options(extra)
     connections_file = base .. '/connections.json',
     history_file = base .. '/history.json',
     state_file = base .. '/session.json',
+    -- Opening with no connections would otherwise scan the machine the suite runs on.
+    discovery = { auto = false },
   }, extra or {})
 end
 

@@ -15,7 +15,9 @@ local M = {}
 ---@field read_only boolean?
 ---@field password_env string?    -- environment variable holding the password
 ---@field password_cmd string[]?  -- argv printing the password on stdout
----@field source 'config'|'file'  -- assigned on load; 'config' specs are not editable
+---@field source 'config'|'file'|'discovered'
+--- Assigned on load; 'config' specs are not editable, and 'discovered' ones exist only in memory
+--- for the session that found them (see `dblens.discovery`).
 
 --- Keys never allowed in a stored spec, mapped to what to do instead.
 local FORBIDDEN = {
@@ -157,15 +159,19 @@ function M.load(options)
   return specs, problems, file_error
 end
 
---- Persist the file-sourced specs. Config-sourced specs are owned by the user's `setup{}` call
---- and are deliberately dropped here rather than copied into the file.
+--- Persist the file-sourced specs.
+---
+--- A WHITELIST, not a blacklist: only `source = 'file'` is written. Config-sourced specs are owned
+--- by the user's `setup{}` call, and a DISCOVERED spec exists only for the session that found it —
+--- writing one would persist a connection whose password was never stored and cannot be resolved
+--- again. A caller that means to keep a connection sets `source = 'file'` on it first.
 ---@param options table
 ---@param specs dblens.ConnectionSpec[]
 ---@return boolean ok, string? error
 function M.save(options, specs)
   local keep = {}
   for _, spec in ipairs(specs) do
-    if spec.source ~= 'config' then
+    if spec.source == 'file' then
       local copy = vim.deepcopy(spec)
       copy.source = nil
       local err = M.validate(vim.tbl_extend('force', copy, { source = 'file' }))

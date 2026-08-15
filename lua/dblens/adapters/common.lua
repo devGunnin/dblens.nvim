@@ -1,10 +1,45 @@
---- Statement fragments shared by every adapter.
+--- Statement fragments and the argv-safety rule shared by every adapter.
 ---
 --- Paging, sorting and filtering are ANSI enough that all three clients take the same shape;
 --- only quoting differs, and that comes in via the dialect.
 local sql = require('dblens.sql')
 
 local M = {}
+
+--- Whether a connection field would reach the client as an OPTION rather than as data.
+---
+--- Every field that becomes an argv element has to pass this. A client's option parser reads a
+--- leading `-` wherever it appears, so an unchecked `--host=elsewhere` or `--local-infile=1` in a
+--- spec is a flag the adapter's own flags cannot override — and since discovery builds specs out
+--- of untrusted repo text, that is the whole exposure. Nothing legitimate (host, user, database,
+--- file path) starts with `-`; `dblens.path` states the same rule for the file-backed engines.
+---@param value any        -- nil and non-strings are somebody else's check
+---@param label string     -- ``<engine> `<field>` ``, for the message
+---@return string? error
+function M.option_like_problem(value, label)
+  assert(type(label) == 'string' and label ~= '', 'common.option_like_problem: needs a label')
+  if type(value) == 'string' and value:sub(1, 1) == '-' then
+    return ('%s must not start with `-`: the client would read it as an option'):format(label)
+  end
+  return nil
+end
+
+--- The same rule over several fields of one spec, in a fixed order so the message is stable.
+---@param spec table
+---@param engine string
+---@param fields string[]
+---@return string? error
+function M.argv_field_problem(spec, engine, fields)
+  assert(type(spec) == 'table', 'common.argv_field_problem: expected a spec')
+  assert(#fields > 0, 'common.argv_field_problem: needs at least one field')
+  for _, field in ipairs(fields) do
+    local problem = M.option_like_problem(spec[field], ('%s `%s`'):format(engine, field))
+    if problem then
+      return problem
+    end
+  end
+  return nil
+end
 
 ---@class dblens.Relation
 ---@field schema string?

@@ -12,6 +12,7 @@ CONTENTS                                                     *dblens-contents*
   2. Requirements ............................ |dblens-requirements|
   3. Installation ............................ |dblens-install|
   4. Connections ............................. |dblens-connections|
+      Discovery .............................. |dblens-discovery|
   5. Usage ................................... |dblens-usage|
   6. Mappings ................................ |dblens-mappings|
   7. Commands ................................ |dblens-commands|
@@ -194,6 +195,81 @@ The connections file is written with `rw-------` permissions. `:checkhealth`
 reports whether a connection has a password reference, never which variable
 and never its value.
 
+DISCOVERY                                                   *dblens-discovery*
+
+|:DbLensDiscover| looks through the project you are in and offers the
+databases it appears to have. Opening dblens with no connection configured
+does the same instead of telling you to add one.
+
+The workspace is the git repository the working directory is in, or the
+working directory itself. Three things are read there:
+
+  DATABASE FILES  `*.db` `*.sqlite` `*.sqlite3` `*.sqlite2` `*.duckdb` `*.ddb`,
+                  by a bounded walk of the project - INCLUDING gitignored
+                  ones, which is what a development database usually is. The
+                  file's magic header decides between SQLite and DuckDB; an
+                  ambiguous `.db` with no header is treated as SQLite.
+
+  COMPOSE FILES   `docker-compose*.yml` and `compose*.yml`: services whose
+                  image is postgres, mysql, mariadb or mssql, with the host
+                  port they publish and the user, database and password from
+                  their `environment`. `${VAR}` is resolved from the `.env`
+                  beside the compose file. A service that publishes no host
+                  port is not offered - nothing could connect to it.
+
+  ENV FILES       `.env` and `.env.*`: every value that parses as a connection
+                  URL (`postgres://`, `postgresql://`, `mysql://`, `mariadb://`,
+                  `sqlite:///...`, `duckdb://...`), plus a `PG*` or `MYSQL_*`
+                  variable group that names a database. `.env.example` and
+                  friends are skipped: they hold placeholders.
+
+Every candidate shows where it came from, so a real database can be told from
+a guess: >
+    db/dev.sqlite3     (sqlite, file)
+    app-db             (postgres, localhost:5433/shopdb, from compose.yml)
+    DATABASE_URL       (postgres, localhost:5432/appdb, from .env)
+    Add manually...    the :DbLensAdd form
+    Rescan             look through the project again
+<
+The scan is bounded and asynchronous: at most `discovery.max_depth` levels
+deep and `discovery.max_entries` directory entries, skipping `.git`,
+`node_modules`, `vendor`, `target`, `dist`, `build`, `.venv`, `__pycache__` and
+the other heavy directories, a few directories per tick so the editor stays
+responsive, and cancellable with the usual cancel key. It never follows a
+symlink, so it cannot read anything outside the project -- and a database file
+that a `.env` NAMES outside the project (`sqlite:///../elsewhere.db`) is
+dropped rather than offered, so the same boundary holds however the path was
+written.
+
+WHAT DISCOVERY DOES NOT DO                          *dblens-discovery-safety*
+
+It never connects on its own. Nothing is scanned until dblens is opened or
+|:DbLensDiscover| is run, nothing is connected until a candidate is picked,
+and `setup()` starts nothing. With exactly one candidate the picker starts on
+it; it still has to be confirmed.
+
+A discovered connection opens LOCKED, like every other connection: the
+database itself refuses writes until |:DbLensWrite|. See |dblens-safety|.
+
+It executes nothing it finds. A `docker-compose.yml` is parsed, never run; a
+`.env` is read, never sourced.
+
+What a workspace file says is untrusted. A candidate is validated before it is
+offered, and a value a database client would read as an OPTION rather than as
+data (a host, user, database or path starting with `-`) is refused, so a cloned
+repository cannot steer the client dblens spawns. Anything dropped is reported
+alongside what was found.
+
+A discovered password is never written anywhere. A password parsed out of a
+`DATABASE_URL` or a compose file is held in memory for that editor session
+only, and a discovered connection is SESSION-ONLY: it is never added to the
+connections file, so that file cannot receive a secret discovery read. To keep
+one, add it with |:DbLensAdd|, which asks where its password comes from
+(`password_env` / `password_cmd`) rather than storing one.
+
+Set `discovery.auto = false` to stop the offer on open; |:DbLensDiscover| still
+works.
+
 ==============================================================================
 5. Usage                                                        *dblens-usage*
 
@@ -344,6 +420,10 @@ In the SQL scratch buffer. Normal mode unless marked.
 :DbLensAdd              Add a connection interactively. See
                         |dblens-connections-form|.
 
+                                                             *:DbLensDiscover*
+:DbLensDiscover         Look through the project for databases and offer what
+                        it finds. See |dblens-discovery|.
+
                                                                *:DbLensRemove*
 :DbLensRemove {name}    Remove a saved connection. Completes connection names.
                         A connection from `setup()` cannot be removed here.
@@ -425,6 +505,14 @@ Every option with its default: >lua
         -- Locked by default: a connection you have not thought about should
         -- not be one you can write to by accident.
         read_only_default   = true,
+      },
+
+      discovery = {
+        -- Opening dblens with NO connection configured offers what a scan of
+        -- the project finds. Nothing is scanned until then. |dblens-discovery|
+        auto        = true,
+        max_depth   = 6,      -- how deep into the project the scan walks
+        max_entries = 20000,  -- entries examined before it stops and says so
       },
 
       history = {
@@ -1126,6 +1214,11 @@ dblens.restore()        Reopen the connection and table that were open when
                                                      *dblens.add_connection()*
 dblens.add_connection()
                         Run the interactive connection form, as |:DbLensAdd|.
+
+                                                          *dblens.discover()*
+dblens.discover()
+                        Scan the project and offer what it finds, as
+                        |:DbLensDiscover|. |dblens-discovery|
 
                                                   *dblens.remove_connection()*
 dblens.remove_connection({name})

@@ -247,6 +247,11 @@ end
 -- ---------------------------------------------------------------------------
 -- the choosers
 
+--- Entries that are an action rather than a connection. Identity, not text, decides which was
+--- picked, so a database that happens to be named `Rescan` still connects.
+local DISCOVER = { action = 'discover' }
+local ADD = { action = 'add' }
+
 --- Pick a connection.
 ---@param on_choose fun(spec: dblens.ConnectionSpec)?
 function M.connections(state, on_choose)
@@ -255,19 +260,66 @@ function M.connections(state, on_choose)
     local adapter = require('dblens.adapters').get(spec.kind)
     items[#items + 1] = {
       text = spec.name,
-      detail = ('%s  %s%s'):format(
+      detail = ('%s  %s%s%s'):format(
         adapter and adapter.label or spec.kind,
         adapter and adapter.describe(spec) or '',
-        spec.read_only and '  read-only' or ''
+        spec.read_only and '  read-only' or '',
+        spec.source == 'discovered' and '  discovered' or ''
       ),
       value = spec,
     }
   end
+  items[#items + 1] =
+    { text = 'Discover…', detail = 'scan this project for databases', value = DISCOVER }
   M.select(state, {
     title = 'Connections',
     items = items,
-    on_choose = on_choose or function(spec)
-      require('dblens.app').connect(spec.name)
+    on_choose = function(value)
+      if value == DISCOVER then
+        require('dblens.app').discover()
+        return
+      end
+      if on_choose then
+        on_choose(value)
+        return
+      end
+      require('dblens.app').connect(value.name)
+    end,
+  })
+end
+
+--- Offer what discovery found in the workspace.
+---
+--- Candidates come first and the picker starts on the first one, so the single obvious candidate
+--- is preselected — but nothing connects until the user confirms it, and what connects opens
+--- LOCKED. `Add manually…` and `Rescan` are the two ways out.
+---@param state dblens.State
+---@param candidates dblens.Candidate[]
+---@param report dblens.DiscoveryReport
+function M.discovered(state, candidates, report)
+  assert(vim.islist(candidates) and #candidates > 0, 'picker.discovered: needs candidates')
+  local items = {}
+  for _, candidate in ipairs(candidates) do
+    items[#items + 1] = { text = candidate.name, detail = candidate.detail, value = candidate }
+  end
+  items[#items + 1] = { text = 'Add manually…', detail = 'the :DbLensAdd form', value = ADD }
+  items[#items + 1] =
+    { text = 'Rescan', detail = 'look through the project again', value = DISCOVER }
+
+  M.select(state, {
+    title = ('Discovered in %s'):format(vim.fn.fnamemodify(report.root, ':~')),
+    items = items,
+    on_choose = function(value)
+      local app = require('dblens.app')
+      if value == DISCOVER then
+        app.discover()
+        return
+      end
+      if value == ADD then
+        require('dblens.ui.form').add(state.options)
+        return
+      end
+      app.connect_discovered(value)
     end,
   })
 end

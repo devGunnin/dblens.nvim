@@ -36,49 +36,24 @@ local M = {
   },
 }
 
+--- Shared with mysql rather than copied. The copy this replaces was missing the bare-name and
+--- option-like rules mysql had, so untrusted text reached the mariadb client's option parser.
 function M.validate(spec)
-  if type(spec.database) ~= 'string' or spec.database == '' then
-    return 'mariadb connection needs a `database`'
-  end
-  if spec.port ~= nil and type(spec.port) ~= 'number' then
-    return 'mariadb `port` must be a number'
-  end
-  return nil
+  return mysql.validate_as(spec, 'mariadb')
 end
 
 M.describe = mysql.describe
 
---- Identical in shape to the mysql invocation, on the `mariadb` binary.
+--- The mysql invocation on the `mariadb` binary, built by the same function rather than a copy.
 ---
 --- Both switches are load-bearing and neither alone is enough: verified on 11.8.8 that inside a
 --- bare `START TRANSACTION READ ONLY` a `CREATE TABLE`/`DROP TABLE` still SUCCEEDS, because DDL
 --- commits the transaction implicitly. `SET SESSION TRANSACTION READ ONLY` is what refuses it.
 function M.command(spec, secret, mode, clients)
   assert(type(clients.mariadb) == 'string', 'mariadb.command: no `clients.mariadb` configured')
-  local argv = {
-    clients.mariadb,
-    '--default-character-set=utf8mb4',
-    '--connect-timeout=10',
-    '--local-infile=0',
-  }
-  if spec.read_only == true then
-    argv[#argv + 1] = '--init-command=SET SESSION TRANSACTION READ ONLY'
-  end
-  argv[#argv + 1] = mode == 'records' and '--xml' or '--batch'
-  if spec.host then
-    vim.list_extend(argv, { '-h', spec.host })
-  end
-  if spec.port then
-    vim.list_extend(argv, { '-P', tostring(spec.port) })
-  end
-  if spec.user then
-    vim.list_extend(argv, { '-u', spec.user })
-  end
-  argv[#argv + 1] = spec.database
-
   -- MariaDB's client reads the password from MYSQL_PWD too, so the secret still never hits argv.
   local env = secret and { MYSQL_PWD = secret } or nil
-  return { argv = argv, env = env }
+  return { argv = mysql.build_argv(spec, mode, clients.mariadb), env = env }
 end
 
 M.read_only_script = mysql.read_only_script

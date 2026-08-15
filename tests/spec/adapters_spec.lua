@@ -237,6 +237,8 @@ end)
 describe('mysql.command', function()
   local mysql = get('mysql')
 
+  --- The database is `--database=<name>`, never a bare positional: `my_getopt` splits a long
+  --- option at its first `=`, so the value cannot be re-read as a flag however it is spelled.
   it('builds the documented argv for both modes', function()
     local records = mysql.command({ database = 'app' }, nil, 'records', CLIENTS)
     eq(records.argv, {
@@ -245,7 +247,7 @@ describe('mysql.command', function()
       '--connect-timeout=10',
       '--local-infile=0',
       '--xml',
-      'app',
+      '--database=app',
     })
     local raw = mysql.command({ database = 'app' }, nil, 'raw', CLIENTS)
     eq(raw.argv, {
@@ -254,12 +256,12 @@ describe('mysql.command', function()
       '--connect-timeout=10',
       '--local-infile=0',
       '--batch',
-      'app',
+      '--database=app',
     })
     eq(raw.env, nil)
   end)
 
-  it('passes host, port and user as flags, with the database last', function()
+  it('passes host, port and user as flags, with the database bound to its option', function()
     local cmd = mysql.command(
       { host = 'db', port = 3307, user = 'ada', database = 'app' },
       nil,
@@ -272,7 +274,7 @@ describe('mysql.command', function()
     eq(h.flag_value(cmd.argv, '-h'), 'db')
     eq(h.flag_value(cmd.argv, '-P'), '3307')
     eq(h.flag_value(cmd.argv, '-u'), 'ada')
-    eq(cmd.argv[#cmd.argv], 'app')
+    eq(cmd.argv[#cmd.argv], '--database=app')
   end)
 
   it('puts the password in MYSQL_PWD and never in argv', function()

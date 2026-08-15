@@ -122,7 +122,7 @@ function M.validate(spec)
   if spec.database:find('[%s;=]') then
     return 'mssql `database` must be a bare database name, not a connection string'
   end
-  return nil
+  return common.argv_field_problem(spec, 'mssql', { 'host', 'user', 'database' })
 end
 
 function M.describe(spec)

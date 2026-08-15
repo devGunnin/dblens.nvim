@@ -42,14 +42,33 @@ local M = {
   },
 }
 
-function M.validate(spec)
+--- Validation for both engines that drive this client. The mariadb adapter calls this rather than
+--- keeping its own copy: the copy is what let the two rules below miss mariadb entirely.
+---@param spec dblens.ConnectionSpec
+---@param engine string  -- `mysql` or `mariadb`, for the message
+---@return string? error
+function M.validate_as(spec, engine)
+  assert(type(engine) == 'string' and engine ~= '', 'mysql.validate_as: needs an engine name')
   if type(spec.database) ~= 'string' or spec.database == '' then
-    return 'mysql connection needs a `database`'
+    return ('%s connection needs a `database`'):format(engine)
+  end
+  -- Same bare-name rule postgres and mssql carry. A database is a name, not a connection string,
+  -- and this is what turns a mis-parsed URL into a clean drop instead of a wrong target.
+  if spec.database:find('[%s=/:]') then
+    return ('%s `database` must be a bare database name, not a connection string'):format(engine)
+  end
+  local problem = common.argv_field_problem(spec, engine, { 'host', 'user', 'database' })
+  if problem then
+    return problem
   end
   if spec.port ~= nil and type(spec.port) ~= 'number' then
-    return 'mysql `port` must be a number'
+    return ('%s `port` must be a number'):format(engine)
   end
   return nil
+end
+
+function M.validate(spec)
+  return M.validate_as(spec, 'mysql')
 end
 
 function M.describe(spec)
@@ -73,10 +92,23 @@ end
 --- `--local-infile=0` blocks `LOAD DATA LOCAL INFILE`, which reads a file on THIS machine. There
 --- is no client flag that disables `system`/`source` (`--skip-named-commands` still honours them
 --- at the head of a line, verified on 8.4), so `sql.client_meta_problem` refuses those instead.
-function M.command(spec, secret, mode, clients)
-  assert(type(clients.mysql) == 'string', 'mysql.command: no `clients.mysql` configured')
+---
+--- The database is passed as `--database=<name>`, not as the trailing positional it used to be.
+--- `my_getopt` splits a long option at its FIRST `=`, so the value is bound to the option and can
+--- never be re-read as a flag however it is spelled. Shared with the mariadb adapter, which drives
+--- the same client with the same argv: two copies is how the missing validation reached mariadb.
+---@param spec dblens.ConnectionSpec
+---@param mode 'records'|'raw'
+---@param binary string
+---@return string[]
+function M.build_argv(spec, mode, binary)
+  assert(type(binary) == 'string' and binary ~= '', 'mysql.build_argv: no client configured')
+  assert(
+    common.argv_field_problem(spec, 'mysql', { 'host', 'user', 'database' }) == nil,
+    'mysql.build_argv: an option-like connection field reached argv'
+  )
   local argv =
-    { clients.mysql, '--default-character-set=utf8mb4', '--connect-timeout=10', '--local-infile=0' }
+    { binary, '--default-character-set=utf8mb4', '--connect-timeout=10', '--local-infile=0' }
   if spec.read_only == true then
     argv[#argv + 1] = '--init-command=SET SESSION TRANSACTION READ ONLY'
   end
@@ -90,10 +122,14 @@ function M.command(spec, secret, mode, clients)
   if spec.user then
     vim.list_extend(argv, { '-u', spec.user })
   end
-  argv[#argv + 1] = spec.database
+  argv[#argv + 1] = '--database=' .. spec.database
+  return argv
+end
 
+function M.command(spec, secret, mode, clients)
+  assert(type(clients.mysql) == 'string', 'mysql.command: no `clients.mysql` configured')
   local env = secret and { MYSQL_PWD = secret } or nil
-  return { argv = argv, env = env }
+  return { argv = M.build_argv(spec, mode, clients.mysql), env = env }
 end
 
 --- The script a read-only run actually sends.

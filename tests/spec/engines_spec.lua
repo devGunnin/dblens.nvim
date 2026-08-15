@@ -31,7 +31,7 @@ describe('mariadb.command', function()
     local cmd = mariadb.command({ database = 'app' }, nil, 'records', h.CLIENTS)
     eq(cmd.argv[1], 'mariadb')
     eq(h.has(cmd.argv, '--xml'), true)
-    eq(cmd.argv[#cmd.argv], 'app')
+    eq(cmd.argv[#cmd.argv], '--database=app')
   end)
 
   it('honours a configured client path', function()
