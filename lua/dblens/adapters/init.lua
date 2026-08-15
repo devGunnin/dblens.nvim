@@ -29,6 +29,10 @@
 ---@field command fun(spec, secret: string?, mode: 'records'|'raw', clients: table): { argv: string[], env: table? }
 ---@field read_only_script fun(statement: string): string  -- what a read_only run sends on stdin
 ---@field decode fun(stdout: string, opts: table?): dblens.ResultSet
+--- How much of a partial `records` stream is whole records, for a read decoded as it arrives.
+--- Absent when the decoder needs the client's whole output to know where the rows end, which
+--- makes a streamed read on that engine buffer instead (see `protocol.reader`).
+---@field stream_boundary nil|fun(text: string): integer
 ---@field estimate nil|fun(statement: string): { sql: string, mode: string, parse: fun(decoded, raw): integer? }
 ---@field file nil|fun(spec): string  -- set only by adapters whose database IS a local file
 ---@field sql table

@@ -228,11 +228,20 @@ local function handlers(state, app)
     open = with_relation(function(node)
       app.open_relation(node.relation)
     end),
+    open_tab = with_relation(function(node)
+      app.open_relation(node.relation, { new_tab = true })
+    end),
     row_count = with_relation(function(node)
       app.count_rows(node.relation)
     end),
     ddl = with_relation(function(node)
       require('dblens.ui.detail').ddl(state, node.relation)
+    end),
+    export = with_relation(function(node)
+      require('dblens.ui.exporter').prompt_relation(state, node.relation)
+    end),
+    import = with_relation(function(node)
+      require('dblens.ui.importer').start(state, node.relation)
     end),
     refresh = function()
       if not state.session then

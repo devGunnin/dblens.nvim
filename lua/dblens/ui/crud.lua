@@ -1,4 +1,4 @@
---- The editing flows: cell edit, row insert, row delete, ad-hoc write confirmation, and export.
+--- The editing flows: cell edit, row insert, row delete, and ad-hoc write confirmation.
 ---
 --- Each flow builds a statement, shows it, and only then asks the session to apply it. The
 --- session enforces the rules; this module's job is to make what will happen legible first.
@@ -42,7 +42,14 @@ end
 --- Apply a built change through the session, then reflect the outcome in the grid.
 ---@param change dblens.Change
 ---@param cell dblens.Cell?  -- present for a cell edit, so a queued change can be shown in place
-local function apply(state, change, cell)
+---@param target { grid: table, result: table }?  -- the tab and result the edit was built from
+local function apply(state, change, cell, target)
+  assert(cell == nil or (target and target.grid), 'crud.apply: a cell edit needs its own tab')
+  -- Captured by the CALLER, before its prompts: `vim.ui.input` and the confirmation are modal in
+  -- the default UI but a third-party one need not be, and reading the tab here would then mark a
+  -- cell in whatever is on screen when the write reports back.
+  local grid = target and target.grid
+  local result = target and target.result
   state.session:execute_write({
     sql = change.sql,
     guard = change.guard,
@@ -61,10 +68,10 @@ local function apply(state, change, cell)
       return
     end
     if outcome.queued then
-      if cell then
+      if cell and grid.result == result then
         -- Show the queued value in place, marked, rather than pretending it landed.
-        state.grid.result.rows[cell.row][cell.column] = cell.pending
-        state.grid.dirty[cell.row .. ':' .. cell.column] = true
+        result.rows[cell.row][cell.column] = cell.pending
+        grid.dirty[cell.row .. ':' .. cell.column] = true
       end
       app().notify(
         ('queued - %d change(s) pending, commit with <leader>dC'):format(state.session.txn:count())
@@ -83,13 +90,13 @@ local function apply(state, change, cell)
 end
 
 --- Preview a change, then apply it if confirmed.
-local function preview_and_apply(state, change, sections, cell)
+local function preview_and_apply(state, change, sections, cell, target)
   confirm.ask(state.options, {
     title = change.kind:upper() .. ' - confirm',
     danger = change.kind == 'delete',
     sections = sections,
   }, function()
-    apply(state, change, cell)
+    apply(state, change, cell, target)
   end)
 end
 
@@ -117,6 +124,7 @@ function M.edit_cell(state, cell)
   end
   local relation = current_relation(state)
   local result = state.grid.result
+  local target = { grid = state.grid, result = result }
   local key, key_err =
     mutate.row_key(state.session.catalog, relation, result.columns, result.rows[cell.row])
   if not key then
@@ -140,7 +148,7 @@ function M.edit_cell(state, cell)
           lines = { 'applied only if this predicate matches exactly 1 row' },
           hl = 'DbLensDim',
         },
-      }, vim.tbl_extend('force', cell, { pending = value }))
+      }, vim.tbl_extend('force', cell, { pending = value }), target)
     end
   )
 end
@@ -330,31 +338,6 @@ function M.confirm_script(state, statements, writes, on_confirm)
     }
   end
   ask()
-end
-
---- Write the current result to a file, choosing the format from the extension.
-function M.export(state)
-  local result = state.grid.result
-  if not result or #result.columns == 0 then
-    app().notify('there is no result to export')
-    return
-  end
-  local default = ('%s/%s.csv'):format(
-    vim.fn.getcwd(),
-    (state.grid.source and state.grid.source.label or 'result'):gsub('%W', '_')
-  )
-  vim.ui.input({ prompt = 'Export to ', default = default, completion = 'file' }, function(path)
-    if not path or vim.trim(path) == '' then
-      return
-    end
-    local format = path:lower():match('%.(%w+)$') == 'json' and 'json' or 'csv'
-    local ok, err = export.write(result, path, format)
-    if not ok then
-      app().error(err)
-      return
-    end
-    app().notify(('exported %d row(s) to %s'):format(#result.rows, path))
-  end)
 end
 
 return M

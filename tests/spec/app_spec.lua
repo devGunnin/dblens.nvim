@@ -183,6 +183,57 @@ describe('app: results are routed to the request that asked for them', function(
     end)
   end)
 
+  --- `count_rows` read `state.grid.filter`, so counting a table from the TREE applied whatever
+  --- WHERE the grid happened to be showing for a different table: either an error on a column
+  --- that table does not have, or a wrong count stored in the catalog and drawn in the tree as
+  --- that table's own row count.
+  it('counts a table from the tree without the grid WHERE that belongs to another one', function()
+    h.with_fake_exec(function(call)
+      if call.stdin:find('count(*)', 1, true) then
+        return { stdout = h.wire({ h.record('n'), h.record('42') }) }
+      end
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      local orders = { name = 'orders', kind = 'table' }
+      local customers = { name = 'customers', kind = 'table' }
+      state.grid.source = { kind = 'relation', relation = orders, label = 'orders' }
+      state.grid.filter = "status = 'shipped'"
+
+      app.count_rows(customers)
+
+      local sent = calls[#calls].stdin
+      eq(sent:find('customers', 1, true) ~= nil, true, { fail_reason = sent })
+      eq(sent:find('status', 1, true), nil, {
+        fail_reason = "the tree's count carried the grid's WHERE: " .. sent,
+      })
+      eq(state.session.catalog:info_for(customers).row_count, 42)
+      app.close()
+    end)
+  end)
+
+  it('keeps a filtered total out of the catalog, where it would read as the table count', function()
+    h.with_fake_exec(function(call)
+      if call.stdin:find('count(*)', 1, true) then
+        return { stdout = h.wire({ h.record('n'), h.record('3') }) }
+      end
+      return {}
+    end, function(session_mod, calls)
+      local app, state = open_with_session(session_mod)
+      local orders = { name = 'orders', kind = 'table' }
+      state.grid.source = { kind = 'relation', relation = orders, label = 'orders' }
+
+      app.count_rows(orders, "status = 'shipped'")
+
+      eq(calls[#calls].stdin:find('status', 1, true) ~= nil, true)
+      eq(state.grid.paging.total, 3, { fail_reason = 'the pager must show the filtered total' })
+      eq(state.session.catalog:info_for(orders).row_count, nil, {
+        fail_reason = 'a filtered total was cached as the row count of the whole table',
+      })
+      app.close()
+    end)
+  end)
+
   it('cancels the page fetch already in flight before starting another', function()
     h.with_fake_exec(function()
       return { pending = true }
@@ -275,18 +326,122 @@ describe('ui: the help overlay fits the screen', function()
   local help = require('dblens.ui.help')
   local keymaps = require('dblens.keymaps')
 
-  it('never runs below the fold, down to 80x24', function()
+  local function widest(lines)
+    local width = 0
+    for _, line in ipairs(lines) do
+      width = math.max(width, vim.fn.strdisplaywidth(line))
+    end
+    return width
+  end
+
+  --- v1.2 put 38 bindings in the grid, which cannot fit an 80x24 screen however they are laid
+  --- out. So the promise the overlay keeps is the one that still means something: it never DROPS
+  --- or CUTS a binding, it fits whenever the screen has the room, and where it does not it reports
+  --- that, so the caller offers scrolling instead of a panel ending mid-list.
+  ---
+  --- Both dimensions, and through `help.budget` — the same one `M.show` passes. A layout checked
+  --- against the height alone accepts the two-column candidate at any width, which is not a screen
+  --- the app ever draws on, and CUTTING is a width property, so the case would prove neither half
+  --- of what its name claims.
+  it('shows every binding in full at any size, and reports whether it fits', function()
     local options = require('dblens.config').setup(scratch_options())
     for _, scope in ipairs({ 'sidebar', 'results', 'editor' }) do
-      -- 80x24 leaves 17 rows inside the float at the default max_height.
-      local available = math.floor(24 * options.ui.float.max_height) - 2
-      local lines = help.layout(help.blocks(scope, options), available)
-      eq(
-        #lines <= available,
-        true,
-        { fail_reason = ('%s: %d lines into %d rows'):format(scope, #lines, available) }
-      )
+      local blocks = help.blocks(scope, options)
+      for _, screen in ipairs({ { 24, 80 }, { 40, 120 }, { 60, 200 } }) do
+        local rows, columns = help.budget(screen[1], screen[2])
+        local lines, _, fits = help.layout(blocks, rows, columns)
+        local text = table.concat(lines, '\n')
+        local at = ('%s at %dx%d'):format(scope, screen[2], screen[1])
+        for _, block in ipairs(blocks) do
+          for _, row in ipairs(block.rows) do
+            eq(text:find(row.left, 1, true) ~= nil, true, {
+              fail_reason = ('%s lost the key %s'):format(at, row.left),
+            })
+            eq(text:find(row.right, 1, true) ~= nil, true, {
+              fail_reason = ('%s lost the description of %s'):format(at, row.left),
+            })
+          end
+        end
+        eq(widest(lines) <= columns, true, {
+          fail_reason = ('%s is %d columns wide, past the %d it was given'):format(
+            at,
+            widest(lines),
+            columns
+          ),
+        })
+        eq(fits, #lines <= rows, {
+          fail_reason = ('%s reported fits=%s for %d lines into %d rows'):format(
+            at,
+            tostring(fits),
+            #lines,
+            rows
+          ),
+        })
+      end
     end
+  end)
+
+  it('fits without scrolling on a screen with the room for it', function()
+    local options = require('dblens.config').setup(scratch_options())
+    for _, scope in ipairs({ 'sidebar', 'results', 'editor' }) do
+      -- 120x40 is an ordinary editor window; `budget` leaves it 34 rows.
+      local rows, columns = help.budget(40, 120)
+      local lines, _, fits = help.layout(help.blocks(scope, options), rows, columns)
+      eq(fits, true, { fail_reason = ('%s: %d lines into %d rows'):format(scope, #lines, rows) })
+    end
+  end)
+
+  --- What 80x24 really does, measured at the budget the app passes: NO pane fits, all three
+  --- scroll, and that is fine — every binding is there, in full, at a width nothing is cut at.
+  --- The case this replaces asserted the overlay FITTED at 80x24 by omitting the width budget,
+  --- which let the ~82-cell two-column layout through; `M.show` never uses that path at 74
+  --- columns, so the suite was stating something about the product that was not true.
+  it('scrolls at 80x24 rather than fitting, and stays usable while it does', function()
+    local options = require('dblens.config').setup(scratch_options())
+    local rows, columns = help.budget(24, 80)
+    for _, scope in ipairs({ 'sidebar', 'results', 'editor' }) do
+      local blocks = help.blocks(scope, options)
+      local lines, _, fits = help.layout(blocks, rows, columns)
+      eq(fits, false, {
+        fail_reason = ('%s claims to fit 80x24 in %d lines of %d rows'):format(scope, #lines, rows),
+      })
+      eq(#lines > rows, true, { fail_reason = scope .. ' reported fits=false but is not too tall' })
+      -- Usable, which is the property that matters once it scrolls: nothing cut off the right.
+      eq(widest(lines) <= columns, true, {
+        fail_reason = ('%s is %d columns wide at 80x24 (budget %d)'):format(
+          scope,
+          widest(lines),
+          columns
+        ),
+      })
+      local text = table.concat(lines, '\n')
+      for _, block in ipairs(blocks) do
+        for _, row in ipairs(block.rows) do
+          eq(text:find(row.left, 1, true) ~= nil and text:find(row.right, 1, true) ~= nil, true, {
+            fail_reason = ('%s dropped %s at 80x24'):format(scope, row.left),
+          })
+        end
+      end
+    end
+  end)
+
+  it('offers scrolling in the footer on the screen where it scrolls', function()
+    h.with_fake_exec(function()
+      return {}
+    end, function(session_mod)
+      local app, state = open_with_session(session_mod)
+      local lines, columns = vim.o.lines, vim.o.columns
+      vim.o.lines, vim.o.columns = 24, 80
+      local popup = help.show(state, 'results')
+      local footer = vim.api.nvim_win_get_config(popup.win).footer
+      local text = type(footer) == 'table' and footer[1][1] or tostring(footer)
+      popup.close()
+      vim.o.lines, vim.o.columns = lines, columns
+      eq(text:find('scroll', 1, true) ~= nil, true, {
+        fail_reason = ('the 80x24 overlay offers only `%s`'):format(text),
+      })
+      app.close()
+    end)
   end)
 
   it('is generated from the registry, so it cannot drift from what is bound', function()

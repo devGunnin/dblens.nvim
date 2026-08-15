@@ -153,6 +153,20 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   and on demand ([Discovery](#discovery)).
 - Schema tree: connection -> schema -> table/view -> columns, indexes, constraints.
 - Primary key, foreign key, NOT NULL and type shown per column.
+- **Follow a foreign key** (`gf`) from the cell under the cursor to the row it references, and
+  see where you came from in the winbar.
+- **Find the rows that reference this one** (`gF`): the same metadata read the other way round,
+  so you can go from a customer to their orders. Tables the tree has not expanded are read first,
+  so "nothing references this" means it, and several referencing tables ask which one.
+- **Filter to the cell under the cursor** (`F`), or away from it (`!`), with the value quoted for
+  the dialect rather than retyped. `C` clears the filter.
+- Jump to the first, last, or an arbitrary page (`[P`, `]P`, `gp`).
+- **Search the loaded result** (`g/`, then `gn` / `gN`), matching the underlying values, so a hit
+  inside a value the grid clipped is still found and highlighted.
+- **Several results open at once**: `t` in the tree opens a table in a new result tab,
+  `<localleader>t` runs a statement into one, and `gt` / `gT` / `gc` / `gl` move between them,
+  close one, or list them. Each tab keeps its own filter, sort, search and page — and its own
+  race guard, so a slow query in one tab can never land its rows in another.
 - `SHOW CREATE TABLE` / `sqlite_schema` DDL where the server has it, reconstructed from the
   catalog where it does not (PostgreSQL).
 - Row counts on demand, and a schema reload.
@@ -163,15 +177,33 @@ Then `:DbLens` to open, `:DbLensAdd` to add your first connection.
   buffer. Multiple statements run in order and stop at the first error.
 - `EXPLAIN` and, where the server supports it, `EXPLAIN ANALYZE`.
 - Cancel a running query.
-- Query history and named snippets, persisted to disk.
+- Query history and named snippets, persisted to disk. `<CR>` in either picker puts the statement
+  in the editor; `<C-r>` runs it straight away, through the same gate as one you typed.
 - Schema-aware completion: keywords, tables, views, and columns qualified by table name or
   FROM/JOIN alias. Works through `omnifunc`, nvim-cmp or blink.cmp.
+- **Format the SQL** (`<localleader>f`, or `:DbLensFormat`) with a formatter you already have —
+  `sqlfluff`, `pg_format` or `sqlformat`, detected in that order, or whatever `format.command`
+  names. It is spawned as an argv array with the SQL on stdin: a text tool over text, never a
+  shell string and never anything that could execute the statement. With none installed it says
+  which to install and leaves the buffer alone.
 
 **Edit**
 
 - Edit a cell, insert a row (by editing the generated `INSERT`), delete a row.
 - Every change is previewed as the exact SQL that will run before it runs.
-- Yank a cell, a row as CSV, as JSON, or as an `INSERT`; export the whole result to CSV or JSON.
+- Yank a cell, a row as CSV, as JSON, or as an `INSERT`.
+- **Import a CSV into a table** (`I` in the tree, or `:DbLensImport`) — EDIT mode only, refused on
+  a LOCKED connection. The file is parsed by dblens (RFC 4180: quoted fields, embedded commas,
+  newlines and quotes), mapped to the table's columns by header name, and every value becomes a
+  QUOTED literal — a cell holding `'); DROP TABLE x;--` is imported as that string. The row count,
+  the mapping and a sample of the generated `INSERT`s are shown for confirmation first, and the
+  run is ONE transaction: if any row fails, nothing is imported and the failing row is named.
+- Export to CSV, JSON or `.sql` `INSERT` statements — the whole result from the grid (`X`), or a
+  whole table from the tree (`X`). A table export is ONE statement in one client invocation, so
+  the file is a SNAPSHOT: a write that lands while it runs belongs to the next export, never to
+  half of this one. Rows are written as the client emits them, the file is renamed into place only
+  once the run completes, and a run stopped by the `export.max_rows` cap says so loudly instead of
+  writing a short file that looks complete.
 
 **Safety**
 
@@ -381,6 +413,22 @@ require('dblens').setup({
     max_entries = 20000,          -- directory entries examined before the scan stops and says so
   },
 
+  format = {
+    -- {} detects sqlfluff, pg_format or sqlformat, in that order. An argv ARRAY picks one, e.g.
+    -- { 'sqlfluff', 'format', '--dialect', 'postgres', '-' }. Never a shell string: it is spawned
+    -- directly, is handed the SQL on stdin, and only reformats text.
+    command = {},
+  },
+
+  import = {
+    max_rows  = 10000,            -- rows one CSV import may insert; past it the import is refused
+    max_bytes = 16 * 1024 * 1024, -- largest CSV file that will be read at all
+  },
+
+  export = {
+    max_rows   = 1000000,         -- hard cap on a streamed export; reaching it STOPS it and says so
+  },
+
   history = {
     enabled     = true,           -- record executed statements
     max_entries = 500,            -- oldest entries drop past this
@@ -407,7 +455,8 @@ require('dblens').setup({
       position = 'left',          -- 'left' | 'right'
     },
     results = {
-      height = 0.55,              -- share of the main column given to results; fraction, 0 < h < 1
+      height   = 0.55,            -- share of the main column given to results; fraction, 0 < h < 1
+      max_tabs = 8,               -- results open at once; each tab holds a whole result set
     },
     grid = {
       max_col_width = 40,         -- widest a column renders before truncation; minimum 4
@@ -476,6 +525,8 @@ pane it belongs to is first opened.
 | `:DbLensCommit` | Commit the transaction |
 | `:DbLensRollback` | Roll back the transaction |
 | `:DbLensPending` | Show the pending changes |
+| `:DbLensImport` | Import a CSV file into a table (EDIT mode only, previewed, one transaction) |
+| `:DbLensFormat` | Format the SQL buffer, or the `:'<,'>` range, through the detected formatter |
 | `:DbLensRestore` | Reopen the last saved session |
 | `:DbLensHelp` | Show every binding for the current pane |
 
@@ -517,8 +568,11 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `zM` | `collapse_all` | Collapse everything |
 | `/` | `find` | Find a table |
 | `o` | `open` | Open the table in the grid |
+| `t` | `open_tab` | Open the table in a new result tab |
 | `c` | `row_count` | Count rows |
 | `D` | `ddl` | Show the DDL |
+| `X` | `export` | Export the table to a file |
+| `I` | `import` | Import a CSV into the table |
 | `R` | `refresh` | Reload the schema |
 | `?` | `help` | This help |
 | `q` | `close` | Close dblens |
@@ -530,9 +584,24 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<CR>` / `K` | `detail` | Row detail |
 | `]p` | `next_page` | Next page |
 | `[p` | `prev_page` | Previous page |
+| `[P` | `first_page` | First page |
+| `]P` | `last_page` | Last page |
+| `gp` | `goto_page` | Go to page N |
 | `s` | `sort` | Sort by this column |
 | `f` | `filter` | Filter rows (WHERE) |
+| `F` | `filter_cell` | Filter to this value |
+| `!` | `filter_not_cell` | Filter out this value |
+| `C` | `clear_filter` | Clear the filter |
 | `R` | `refresh` | Re-run the query |
+| `gf` | `follow_fk` | Go to the referenced row |
+| `gF` | `find_referencing` | Find rows referencing this one |
+| `gt` | `next_tab` | Next result tab |
+| `gT` | `prev_tab` | Previous result tab |
+| `gc` | `close_tab` | Close this result tab |
+| `gl` | `tab_list` | List the open results |
+| `g/` | `search` | Search the result |
+| `gn` | `next_match` | Next match |
+| `gN` | `prev_match` | Previous match |
 | `e` | `edit_cell` | Edit this cell |
 | `i` | `insert_row` | Insert a row |
 | `dd` | `delete_row` | Delete this row |
@@ -551,9 +620,12 @@ labelled `dblens` automatically; every binding's description comes from the same
 | `<CR>` | n | `run` | Run the statement |
 | `<CR>` | x | `run_selection` | Run the selection |
 | `<localleader>r` | n | `run_all` | Run the whole buffer |
+| `<localleader>t` | n | `run_new_tab` | Run into a new result tab |
 | `<localleader>e` | n | `explain` | EXPLAIN the statement |
 | `<localleader>E` | n | `explain_analyze` | EXPLAIN ANALYZE |
 | `<C-c>` | n | `cancel` | Cancel the query |
+| `<localleader>f` | n | `format` | Format the buffer |
+| `<localleader>f` | x | `format_selection` | Format the selection |
 | `<localleader>s` | n | `save_snippet` | Save as a snippet |
 | `<localleader>h` | n | `history` | Query history |
 | `<localleader>?` | n | `help` | This help |
@@ -944,9 +1016,14 @@ argv run with no shell, and it is checked only for being a runnable argv.
 
 **Filters are vetted by an allow-list.** A `WHERE` typed into the results filter is checked
 before it is spliced into a statement. Rejected: a comment (which would comment out the
-`LIMIT`/`OFFSET` appended after it), a backslash, an unclosed quote, any punctuation outside the
-SQL operator set — which drops `;` and `\` together — and a write verb where a nested statement
-could begin. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
+`LIMIT`/`OFFSET` appended after it), an unclosed quote, any punctuation outside the SQL operator
+set — which drops `;` and a bare `\` together, so psql's `\!` never reaches the client — and a
+write verb where a nested statement could begin. A backslash *inside a literal* is rejected only
+on MySQL and MariaDB, where `NO_BACKSLASH_ESCAPES` decides what it means; the other four accept
+it, so a Windows path or a regex filters normally there. What makes that safe is that no dialect
+is left guessing about its own server: dblens emits a PostgreSQL/DuckDB literal as `E'…'`, which
+means the same thing whatever `standard_conforming_strings` is set to, and it pins
+`standard_conforming_strings=on` and clears `NO_BACKSLASH_ESCAPES` on the connections it opens. `REPLACE(…)`, a column called `comment` and non-ASCII identifiers are accepted; a
 column named after a SQL verb can also be quoted. The filter bar is still raw SQL: the check
 stops it escaping the statement, it does not stop an expensive or volatile function call.
 
@@ -1010,8 +1087,9 @@ Both plugins are optional; a missing one is not an error.
 loaded or was refused, where its files live and the resolved limits; each database client and its
 version; **what LOCKED means per engine**, as a warning wherever it is best-effort rather than
 enforced by the server; every connection with its kind, access and whether it has a password
-reference; any global keymap it took over from another plugin; and which optional integrations
-are installed. It never resolves a password.
+reference; any global keymap it took over from another plugin; which SQL formatter
+`:DbLensFormat` would use; and which optional integrations are installed. It never resolves a
+password.
 
 ## Highlight groups
 
@@ -1113,6 +1191,24 @@ error reporting have much thinner live coverage everywhere — please report wha
   still does the full work. Client output is capped at `max_bytes`.
 - Sorting and filtering apply to a browsed table only. For a query result, put `ORDER BY` /
   `WHERE` in the query.
+- Foreign-key navigation, forward (`gf`) and reverse (`gF`), follows ONE column of a composite
+  key and says so, so the result may hold more rows than the single referenced one. Reverse
+  navigation sees the loaded schema only: it reads the columns of tables that were never
+  expanded, but a schema that has not been listed at all is not searched.
+- The `?` overlay no longer fits an 80x24 screen in ANY pane — the grid lists 44 bindings and
+  even the sidebar's list is taller than the 18 rows that size leaves. It scrolls there (`j`/`k`),
+  and the footer says so; nothing is dropped or cut off the right edge. It fits from about
+  100x33.
+- A `.sql` export replays TEXT faithfully. A binary/BLOB column does not survive it: the value
+  reaches dblens through the client's text output, where a NUL byte truncates it, so the INSERT
+  carries what the grid shows rather than the bytes in the table. Use the engine's own dump tool
+  for binary columns.
+- A `.sql` export for MySQL/MariaDB escapes backslashes for the default SQL mode, which is the
+  wrong escaping under `NO_BACKSLASH_ESCAPES`. The file says which mode it was written for in a
+  comment at the top.
+- A `.sql` export for PostgreSQL/DuckDB writes `E'…'` literals, so the file replays the same
+  whatever `standard_conforming_strings` is set to. That syntax is not portable to the other
+  engines.
 - SQLite exposes no schema level (attached databases are out of scope) and has no
   `EXPLAIN ANALYZE` or row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so `D` shows a DDL reconstructed from

@@ -449,7 +449,25 @@ describe('sql.quote_literal', function()
 
   it('escapes backslashes for dialects that honour them', function()
     eq(sql.quote_literal([[a\b'c]], sql.dialects.mysql), [['a\\b''c']])
-    eq(sql.quote_literal([[a\b'c]], sql.dialects.postgres), [['a\b''c']])
+    eq(sql.quote_literal([[a\b'c]], sql.dialects.sqlite), [['a\b''c']])
+    eq(sql.quote_literal([[a\b'c]], sql.dialects.mssql), [['a\b''c']])
+  end)
+
+  --- postgres and duckdb get `E'...'` because a plain literal's backslash rule is a SERVER
+  --- setting there: under `standard_conforming_strings = off` a trailing `\` escaped the closing
+  --- quote and the rest of the statement became SQL. An E-string means one thing in every mode.
+  it('emits an escape-string literal where a plain one is mode-dependent', function()
+    for _, kind in ipairs({ 'postgres', 'duckdb' }) do
+      local d = sql.dialects[kind]
+      eq(sql.quote_literal([[a\b'c]], d), [[E'a\\b''c']], { fail_reason = kind })
+      eq(sql.quote_literal([[trailing\]], d), [[E'trailing\\']], { fail_reason = kind })
+      -- The framing property the old form lost: the value cannot reach past its own quote.
+      local statement = ('SELECT * FROM t WHERE c = %s LIMIT 1'):format(
+        sql.quote_literal([[\'); DROP TABLE victim; --]], d)
+      )
+      eq(#sql.split(statement, d), 1, { fail_reason = statement })
+      eq(sql.classify(statement, d).destructive, false, { fail_reason = statement })
+    end
   end)
 
   it('keeps a `;` and a comment marker inert inside the literal', function()

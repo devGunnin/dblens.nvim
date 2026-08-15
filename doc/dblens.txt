@@ -284,13 +284,60 @@ constraints, with primary key, foreign key, NOT NULL and type shown per
 column. SQLite has no schema level, so the tree skips it.
 
 `<CR>` expands a node, or opens a table in the grid. `o` opens a table
-directly, `c` counts its rows, `D` shows its DDL, `R` reloads the schema.
+directly, `c` counts its rows, `D` shows its DDL, `X` exports it to a file,
+`R` reloads the schema.
 
-The grid pages through the table `page_size` rows at a time (`]p` and `[p`).
+The grid pages through the table `page_size` rows at a time (`]p` and `[p`,
+`[P` and `]P` for the first and last page, `gp` to jump to one). The last page
+needs the row count, which is why it says so when the count has not arrived.
+
 `s` sorts by the column under the cursor, cycling ascending, descending, then
 unsorted; `f` applies a WHERE predicate. Both are done by the server, and both
 reset to the first page. Sorting and filtering need a table: for a query
 result, put ORDER BY or WHERE in the query itself.
+
+`F` filters to the value under the cursor and `!` filters it out, without
+retyping it: dblens builds the predicate itself, quoted for the dialect, so a
+value holding a quote, a `;` or a `--` is data and not syntax. A NULL cell
+gives `IS NULL` / `IS NOT NULL`. `C` clears the filter again.
+
+                                                     *dblens-usage-follow-fk*
+`gf` on a cell whose column has a foreign key opens the referenced table,
+filtered to the referenced row; the winbar shows where you came from. A NULL
+cell references nothing and says so, and a column with several references asks
+which one. It is a read throughout - the target comes from metadata already
+loaded and the row is browsed by the same paged SELECT as any other table.
+
+                                                  *dblens-usage-referencing*
+`gF` goes the other way: the rows in OTHER tables whose foreign key points at
+the row under the cursor. It is the same metadata inverted, so it needs the
+columns of the other tables - the ones the tree never expanded are read first,
+which is what makes "no loaded table references this" mean it. Several
+referencing tables ask which one; a composite key matches on its own column
+and says so; a NULL key, or a table with no single-column primary key to
+assume, is reported rather than guessed at.
+
+Also a read: the key value reaches the WHERE through the same per-dialect
+quoting as `F`, never spliced into text.
+
+                                                         *dblens-usage-tabs*
+Several results can be open at once. `t` in the tree opens a table in a new
+result tab and `<localleader>t` in the editor runs a statement into one; `gt`
+and `gT` step between them, `gc` closes the one on screen and `gl` lists them.
+The winbar names every open result once there is more than one.
+
+A tab owns its whole view - result, filter, sort, search and page - and its
+own race guard. A query started in one tab lands in THAT tab whatever you are
+looking at when it finishes, and closing a tab stops what it was running.
+`ui.results.max_tabs` caps how many can be open, because each one holds a
+whole result set. Closing the last tab empties it rather than closing dblens.
+
+                                                       *dblens-usage-search*
+`g/` searches the loaded result and highlights every matching cell, `gn` and
+`gN` step through the matches. Matching is over the underlying values, so a
+hit inside a value the grid clipped at `ui.grid.max_col_width` is still found -
+which the buffer's own `/` cannot do, because it only sees the drawn text.
+`<CR>` on a match opens the row detail, which shows the value in full.
 
 QUERYING                                                    *dblens-usage-sql*
 
@@ -303,9 +350,25 @@ whatever is running.
 
 Executed statements are recorded in the history (`<leader>dh`), and
 `<localleader>s` saves the current statement as a named snippet
-(`<leader>ds`). Both persist to `history_file`.
+(`<leader>ds`). Both persist to `history_file`. In either picker `<CR>` puts
+the statement in the editor and `<C-r>` (or `<C-CR>`, where the terminal sends
+it) runs it immediately - through the same path as one you typed, so a stored
+write on a LOCKED connection is refused and a destructive one still confirms.
 
 Completion is available while you type; see |dblens-completion|.
+
+                                                       *dblens-usage-format*
+`<localleader>f` formats the buffer, and the same key in visual mode formats
+the selected LINES; `:DbLensFormat` does either, with a range or without.
+
+dblens does not format SQL itself. It hands the text to a formatter you
+already have - `sqlfluff`, `pg_format` or `sqlformat`, tried in that order, or
+whatever `format.command` names - spawned as an argv ARRAY with the SQL on its
+STDIN. There is no shell, no connection and no client: the formatter cannot
+execute the statement, only reprint it. What comes back on stdout replaces the
+lines, and only on success - a formatter that fails, times out or prints
+nothing leaves the buffer exactly as it was and says why. With none installed
+it names the ones to install rather than doing anything clever.
 
 EDITING                                                    *dblens-usage-edit*
 
@@ -316,8 +379,66 @@ row. Each shows the exact SQL before it runs. Type the value of
 NULL. What can and cannot be applied is described in |dblens-safety|.
 
 `y` yanks the cell, `Y` the row as CSV, `gy` the row as JSON, `gi` the row as
-an INSERT statement. `X` exports the whole result to a file; the format is
-chosen from the extension (`.json` for JSON, CSV otherwise).
+an INSERT statement.
+
+                                                       *dblens-usage-export*
+`X` exports. In the grid it writes the WHOLE result - a browsed table is
+re-read with its filter and sort applied, not just the page on screen - and in
+the tree it writes a whole table, unfiltered. The format comes from the
+extension: `.csv`, `.json` or `.sql` (INSERT statements, so it needs a table
+rather than a query result). An extension naming none of those is an error,
+never a silent CSV.
+
+A table is read by ONE statement in ONE client invocation, so the file is a
+SNAPSHOT of it: a write that commits while the export is running belongs to
+the next export, never to part of this one. Rows are written as the client
+emits them, so a large export never has to fit in memory, and the file is
+renamed into place only once the run has finished - a cancelled (`<C-c>`) or
+failed export leaves whatever was there before untouched. An existing file is
+confirmed before it is replaced. A sort is completed by the primary key, so
+two rows that sort equal come out in the same order every time.
+
+An export STOPS at `export.max_rows` (default 1,000,000), which is the LIMIT
+of that one statement, and says so in the notification and in a trailing
+comment where the format has one. CSV and JSON have nowhere to put it, so a
+capped one of those gets a `<name>.INCOMPLETE` file beside it - the
+notification is transient and the file is not. A short file is never reported
+as a complete one. Where a query result cannot be re-read
+safely - several statements, or one that writes - the rows already fetched are
+written and the shortfall is stated the same way.
+
+An empty string is written QUOTED (`""`) and SQL NULL is written empty, which
+is the only thing that tells the two apart in CSV and what the import below
+reads back. sqlite3, psql and `COPY ... CSV` write them the same way.
+
+                                                       *dblens-usage-import*
+`I` in the tree imports a CSV file into that table; `:DbLensImport` does the
+same for the table in the grid, or one picked from the list. This is the only
+place data from OUTSIDE the database is written into it, so it is the most
+guarded thing dblens does:
+
+  * EDIT MODE ONLY. A LOCKED connection is refused before a file is even
+    asked for, and the session gate refuses every statement again anyway.
+  * The path substitutes `~` and `$VAR` textually and evaluates nothing - no
+    shell sees it - and the file is parsed by dblens itself, to RFC 4180:
+    quoted fields, embedded commas, newlines and doubled quotes. A malformed
+    file is an error naming the line, and nothing runs.
+  * CSV columns are matched to table columns by HEADER NAME (case-insensitively
+    where that is unambiguous). A header naming a column the table does not
+    have is refused, never dropped or guessed at; columns the file does not
+    mention keep their default, and the preview says which those are.
+  * Every value becomes a QUOTED LITERAL. A cell holding `'); DROP TABLE x;--`
+    is imported as that string - it is data, not syntax.
+  * The row count, the mapping and a sample of the generated INSERTs are shown
+    and must be confirmed before anything runs.
+  * The run is ONE transaction (the deferred batch |dblens-transactions| uses).
+    If any row fails, NOTHING is imported and the message names the row. There
+    is no partial import.
+
+`import.max_rows` caps the rows one import may insert and `import.max_bytes`
+the size of the file that will be read; both refuse rather than importing part
+of a file. An import cannot start while other changes are queued - commit or
+roll those back first, so the two are never tied together.
 
 ==============================================================================
 6. Mappings                                                  *dblens-mappings*
@@ -357,8 +478,11 @@ Normal mode, in the schema tree.
     `zM`              collapse_all     Collapse everything
     `/`               find             Find a table
     `o`               open             Open the table in the grid
+    `t`               open_tab         Open the table in a new result tab
     `c`               row_count        Count rows
     `D`               ddl              Show the DDL
+    `X`               export           Export the table to a file
+    `I`               import           Import a CSV into the table
     `R`               refresh          Reload the schema
     `?`               help             This help
     `q`               close            Close dblens
@@ -367,12 +491,27 @@ RESULTS                                              *dblens-mappings-results*
 
 Normal mode, in the result grid.
 
-    `<CR>` / `K`        detail           Row detail
+    `<CR>` / `K`      detail           Row detail
     `]p`              next_page        Next page
     `[p`              prev_page        Previous page
+    `[P`              first_page       First page
+    `]P`              last_page        Last page
+    `gp`              goto_page        Go to page N
     `s`               sort             Sort by this column
     `f`               filter           Filter rows (WHERE)
+    `F`               filter_cell      Filter to this value
+    `!`               filter_not_cell  Filter out this value
+    `C`               clear_filter     Clear the filter
     `R`               refresh          Re-run the query
+    `gf`              follow_fk        Go to the referenced row
+    `gF`              find_referencing  Find rows referencing this one
+    `gt`              next_tab         Next result tab
+    `gT`              prev_tab         Previous result tab
+    `gc`              close_tab        Close this result tab
+    `gl`              tab_list         List the open results
+    `g/`              search           Search the result
+    `gn`              next_match       Next match
+    `gN`              prev_match       Previous match
     `e`               edit_cell        Edit this cell
     `i`               insert_row       Insert a row
     `dd`              delete_row       Delete this row
@@ -391,9 +530,12 @@ In the SQL scratch buffer. Normal mode unless marked.
     `<CR>`            run              Run the statement
     `<CR>` (visual)   run_selection    Run the selection
     `<localleader>r`  run_all          Run the whole buffer
+    `<localleader>t`  run_new_tab      Run into a new result tab
     `<localleader>e`  explain          EXPLAIN the statement
     `<localleader>E`  explain_analyze  EXPLAIN ANALYZE
     `<C-c>`           cancel           Cancel the query
+    `<localleader>f`  format           Format the buffer
+    `<localleader>f` (visual)  format_selection  Format the selection
     `<localleader>s`  save_snippet     Save as a snippet
     `<localleader>h`  history          Query history
     `<localleader>?`  help             This help
@@ -466,6 +608,16 @@ In the SQL scratch buffer. Normal mode unless marked.
 :DbLensHelp             Show every binding that applies in the current pane.
                         The same overlay `?` opens.
 
+                                                               *:DbLensImport*
+:DbLensImport           Import a CSV file into a table: the one the grid is
+                        browsing, or one picked from the list. EDIT mode only.
+                        See |dblens-usage-import|.
+
+                                                               *:DbLensFormat*
+:DbLensFormat           Format the SQL buffer through the detected formatter.
+                        Takes a range: `:'<,'>DbLensFormat` formats those lines
+                        only. dblens must already be open.
+
                                                               *:DbLensRestore*
 :DbLensRestore          Reopen the connection and table that were open when
                         dblens was last closed.
@@ -515,6 +667,25 @@ Every option with its default: >lua
         max_entries = 20000,  -- entries examined before it stops and says so
       },
 
+      export = {
+        -- Hard cap on a streamed export. Reaching it STOPS the run and says
+        -- so; it never trims the file in silence.
+        max_rows   = 1000000,
+      },
+
+      format = {
+        -- {} detects sqlfluff, pg_format or sqlformat, in that order. An argv
+        -- ARRAY picks one; never a shell string. See |dblens-usage-format|.
+        command = {},
+      },
+
+      import = {
+        -- Rows one CSV import may insert, and the largest file that is read
+        -- at all. Both REFUSE rather than importing part of a file.
+        max_rows  = 10000,
+        max_bytes = 16 * 1024 * 1024,
+      },
+
       history = {
         enabled     = true,   -- record executed statements
         max_entries = 500,    -- oldest entries drop past this
@@ -543,7 +714,8 @@ Every option with its default: >lua
         },
         results = {
           -- Share of the main column given to results; 0 < height < 1.
-          height = 0.55,
+          height   = 0.55,
+          max_tabs = 8,       -- results open at once; each holds a whole result
         },
         grid = {
           max_col_width = 40,     -- widest a column renders; minimum 4
@@ -1042,9 +1214,18 @@ FILTERS                                                 *dblens-safety-filter*
 
 A WHERE typed into the results filter is checked by an allow-list before it is
 spliced into a statement. Rejected: a comment (which would comment out the
-LIMIT/OFFSET appended after it), a backslash, an unclosed quote, any
-punctuation outside the SQL operator set - which drops `;` and `\` together -
-and a write verb where a nested statement could begin.
+LIMIT/OFFSET appended after it), an unclosed quote, any punctuation outside
+the SQL operator set - which drops `;` and a bare `\` together, so psql's `\!`
+never reaches the client - and a write verb where a nested statement could
+begin. A backslash INSIDE a literal is rejected only on MySQL and MariaDB,
+where `NO_BACKSLASH_ESCAPES` decides what it means; the other engines accept
+it, so a Windows path or a regex filters normally there.
+
+What makes that safe is that no dialect is left guessing about its own server.
+A PostgreSQL/DuckDB literal is written `E'...'`, which means the same thing
+whatever `standard_conforming_strings` is set to, and dblens also pins
+`standard_conforming_strings=on` and clears `NO_BACKSLASH_ESCAPES` on the
+connections it opens.
 
 `REPLACE(...)`, a column called `comment` and non-ASCII identifiers are
 accepted; a column named after a SQL verb can also be quoted.
@@ -1132,6 +1313,7 @@ Both plugins are optional and a missing one is not an error.
 - every connection with its kind, its access, and whether it has a password
   reference - never which variable, never its value;
 - any global `<leader>d*` map dblens took over from another plugin;
+- which SQL formatter `:DbLensFormat` would use, or what to install;
 - which optional integrations (nvim-web-devicons, nvim-cmp, blink.cmp,
   which-key.nvim) are installed.
 
@@ -1267,6 +1449,25 @@ Other limits:
   separately at `max_bytes`.
 - Sorting and filtering apply to a browsed table only. For a query result, put
   ORDER BY or WHERE in the query.
+- Foreign-key navigation, forward (`gf`) and reverse (`gF`), follows ONE column
+  of a composite key and says so, so the view may hold more rows than the
+  single row referenced. Reverse navigation searches the LOADED schema: it
+  reads the columns of tables the tree never expanded, but a schema that has
+  not been listed at all is not searched.
+- The `?` overlay no longer fits an 80x24 screen in ANY pane - the grid lists
+  44 bindings, and even the sidebar's list is taller than the 18 rows that
+  size leaves. It scrolls there (`j`/`k`) and the footer says so; nothing is
+  dropped or cut off the right edge. It fits from about 100x33.
+- A `.sql` export replays TEXT faithfully. A binary/BLOB column does not
+  survive it: the value reaches dblens through the client's text output, where
+  a NUL byte truncates it, so the INSERT carries what the grid shows rather
+  than the bytes in the table. Use the engine's own dump tool for those.
+- A `.sql` export for MySQL/MariaDB escapes backslashes for the default SQL
+  mode, which is the wrong escaping under NO_BACKSLASH_ESCAPES. The file names
+  the mode it was written for in a comment at the top.
+- A `.sql` export for PostgreSQL/DuckDB writes `E'...'` literals, so the file
+  replays the same whatever standard_conforming_strings is set to. That syntax
+  is not portable to the other engines.
 - SQLite exposes no schema level (attached databases are out of scope) and has
   neither EXPLAIN ANALYZE nor a row estimate.
 - PostgreSQL and SQL Server have no native DDL statement, so the DDL view is

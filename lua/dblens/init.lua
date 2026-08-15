@@ -8,7 +8,7 @@ local keymaps = require('dblens.keymaps')
 local M = {}
 
 --- Release version. Bumped on tag; see CHANGELOG.md.
-M.VERSION = '1.0.0'
+M.VERSION = '1.2.0'
 
 local configured = false
 
@@ -257,6 +257,55 @@ end
 function M.lock()
   M.ensure_setup()
   require('dblens.app').set_locked(true)
+end
+
+--- Import a CSV file into a table: the one the grid is browsing, or one picked from the list.
+---
+--- EDIT mode only, previewed and confirmed, and run as a single transaction — see
+--- `dblens.ui.importer` for what each of those means.
+function M.import()
+  M.ensure_setup()
+  local app = require('dblens.app')
+  if not app.is_open() then
+    app.open()
+  end
+  local state = app.state()
+  if not state then
+    return
+  end
+  local source = state.grid.source
+  if source and source.kind == 'relation' then
+    require('dblens.ui.importer').start(state, source.relation)
+    return
+  end
+  require('dblens.ui.picker').tables(state, function(relation)
+    require('dblens.ui.importer').start(state, relation)
+  end)
+end
+
+--- Format the SQL editor buffer, or the given line range of it, through the detected formatter.
+---
+--- Does not open dblens: there is no editor buffer to format until it is open, and opening one to
+--- format an empty scratch buffer would be a surprise.
+---@param from integer?  -- 1-based; the whole buffer when omitted
+---@param to integer?
+function M.format(from, to)
+  M.ensure_setup()
+  local app = require('dblens.app')
+  local state = app.state()
+  if not state or not app.is_open() then
+    app.error('dblens is not open, so there is no SQL buffer to format')
+    return
+  end
+  -- Both ends clamped: `:DbLensFormat` comes pre-clamped from vim, a direct Lua call does not,
+  -- and `format_range` asserts its range is inside the buffer rather than reporting it.
+  local last = vim.api.nvim_buf_line_count(state.layout.bufs.editor)
+  local first = math.min(math.max(from or 1, 1), last)
+  require('dblens.ui.editor').format_range(
+    state,
+    first,
+    math.min(math.max(to or last, first), last)
+  )
 end
 
 --- Show the binding overlay for the pane the cursor is in, for a user who turned the keymaps off.

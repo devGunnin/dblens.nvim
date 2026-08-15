@@ -97,11 +97,16 @@ describe('help: it fits the terminal it is drawn on', function()
     end
   end)
 
+  --- 30 rows, not 24: the grid now binds enough keys that two columns of them do not fit 24 rows
+  --- either, and there the overlay scrolls instead — which the 80x24 case above is what covers.
+  --- The property here is the reflow itself: given a screen that is short but has the width, the
+  --- bindings go into two columns rather than off the bottom.
   it('uses the room a large terminal has, in two columns', function()
     local opts = options()
     local blocks = help.blocks('results', opts)
     local tall = help.layout(blocks, 200, 200)
-    local wide = select(1, help.layout(blocks, 24, 200))
+    local wide, _, fits = help.layout(blocks, 30, 200)
+    eq(fits, true, { fail_reason = 'a short, wide screen could not fit the bindings at all' })
     eq(#wide < #tall, true, { fail_reason = 'a short, wide screen did not reflow into columns' })
     eq(widest(wide) > widest(tall), true)
   end)

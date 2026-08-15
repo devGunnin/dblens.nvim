@@ -9,10 +9,11 @@ local uv = vim.uv or vim.loop
 ---@class dblens.ExecResult
 ---@field ok boolean
 ---@field code integer
----@field stdout string
+---@field stdout string        -- empty on a streaming run: nothing is accumulated
 ---@field stderr string
 ---@field truncated boolean    -- output hit `max_bytes` and the client was killed
----@field reason string?       -- 'timeout' | 'cancelled' | 'max_bytes' | 'spawn'
+---@field reason string?       -- 'timeout' | 'cancelled' | 'max_bytes' | 'spawn' | 'consumer'
+---@field consumer_error string?  -- why a streaming consumer stopped the run
 ---@field elapsed_ms number
 
 ---@class dblens.Job
@@ -25,6 +26,7 @@ local uv = vim.uv or vim.loop
 ---@field stdin string?
 ---@field timeout_ms integer
 ---@field max_bytes integer
+---@field on_stdout fun(chunk: string): string?  -- streaming consumer; a returned message stops the run
 
 local function fail_fast(message, on_done)
   vim.schedule(function()
@@ -73,6 +75,13 @@ end
 --- Run a client process.
 ---
 --- `on_done` is always called exactly once, on the main loop, including on spawn failure.
+---
+--- STREAMING (`spec.on_stdout`): each chunk is handed straight to the consumer and nothing is
+--- kept, so `max_bytes` — which exists to bound what a result costs in memory — does not apply to
+--- stdout and `result.stdout` comes back empty. What bounds a streaming run is the statement's
+--- own LIMIT and the consumer, which stops it by returning a message. The timeout becomes an IDLE
+--- timeout for the same reason: a client that is still delivering rows has not hung, and a
+--- whole-table export legitimately outlives the deadline a single page was given.
 ---@param spec dblens.ExecSpec
 ---@param on_done fun(result: dblens.ExecResult)
 ---@return dblens.Job
@@ -82,6 +91,11 @@ function M.run(spec, on_done)
   assert(
     spec.timeout_ms > 0 and spec.max_bytes > 0,
     'exec.run: timeout and byte cap must be positive'
+  )
+  local streaming = spec.on_stdout ~= nil
+  assert(
+    not streaming or type(spec.on_stdout) == 'function',
+    'exec.run: on_stdout must be a function'
   )
 
   local client = spec.argv[1]
@@ -118,6 +132,30 @@ function M.run(spec, on_done)
     stop('max_bytes')
   end)
 
+  local consumer_error
+  --- Hand a chunk to a streaming consumer, stopping the client if it cannot take it.
+  ---
+  --- The consumer runs in the libuv callback rather than on a scheduled tick, so it stays behind
+  --- the client rather than queueing every chunk in front of a busy main loop. Its errors are
+  --- caught here: an uncaught one inside this callback would take the loop with it.
+  local function feed(chunk)
+    if consumer_error or not chunk then
+      return
+    end
+    if timer then
+      timer:start(spec.timeout_ms, 0, function()
+        stop('timeout')
+      end)
+    end
+    local ok, problem = pcall(spec.on_stdout, chunk)
+    if ok and not problem then
+      return
+    end
+    consumer_error = ok and tostring(problem)
+      or ('the reader of this output failed: ' .. tostring(problem))
+    stop('consumer')
+  end
+
   local function complete(res)
     if finished then
       return
@@ -142,10 +180,11 @@ function M.run(spec, on_done)
     on_done({
       ok = res.code == 0 and reason == nil,
       code = res.code,
-      stdout = stdout.text(),
+      stdout = streaming and '' or stdout.text(),
       stderr = stderr.text(),
-      truncated = stdout.overflowed(),
+      truncated = not streaming and stdout.overflowed(),
       reason = reason,
+      consumer_error = consumer_error,
       elapsed_ms = elapsed_ms,
     })
   end
@@ -157,7 +196,9 @@ function M.run(spec, on_done)
       env = spec.env,
       stdin = spec.stdin,
       text = false,
-      stdout = function(_, data)
+      stdout = streaming and function(_, data)
+        feed(data)
+      end or function(_, data)
         stdout.push(data)
       end,
       stderr = function(_, data)
@@ -196,6 +237,11 @@ end
 ---@return string
 function M.format_error(result, label)
   assert(type(result) == 'table', 'exec.format_error: expected a result')
+  -- The consumer's own message, not the client's: the client was fine, the run stopped on this
+  -- side, and prefixing it with the client name would blame the wrong end.
+  if result.reason == 'consumer' then
+    return result.consumer_error or ('%s: the output consumer stopped the run'):format(label)
+  end
   if result.reason == 'timeout' then
     return ('%s: timed out'):format(label)
   end

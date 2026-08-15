@@ -58,6 +58,7 @@ end
 
 M.read_only_script = mysql.read_only_script
 M.decode = mysql.decode
+M.stream_boundary = mysql.stream_boundary
 M.estimate = mysql.estimate
 
 --- Statement builders are shared, not copied: they are pure functions of a relation and the

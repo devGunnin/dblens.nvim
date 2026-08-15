@@ -424,10 +424,19 @@ function M.sql.page(relation, opts)
   )
   local order = '(SELECT NULL)'
   if opts.order_by then
-    order = ('%s %s'):format(
-      sql.quote_ident(opts.order_by.column, dialect),
-      opts.order_by.desc and 'DESC' or 'ASC'
-    )
+    local keys = {
+      ('%s %s'):format(
+        sql.quote_ident(opts.order_by.column, dialect),
+        opts.order_by.desc and 'DESC' or 'ASC'
+      ),
+    }
+    -- Appended so a sort on a non-unique column orders every row, not just the distinct ones.
+    for _, column in ipairs(opts.tiebreak or {}) do
+      if column ~= opts.order_by.column then
+        keys[#keys + 1] = sql.quote_ident(column, dialect) .. ' ASC'
+      end
+    end
+    order = table.concat(keys, ', ')
   end
   local where = ''
   if opts.where and vim.trim(opts.where) ~= '' then

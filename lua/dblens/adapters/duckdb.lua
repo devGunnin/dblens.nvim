@@ -119,6 +119,10 @@ end
 
 M.decode = protocol.decode
 
+--- `-newline` sets the record separator to the same control byte sqlite3 uses, so the same
+--- framing rule applies to a streamed read here.
+M.stream_boundary = protocol.record_boundary
+
 M.sql = {}
 
 --- One row per schema of the CURRENT database. DuckDB can have several databases attached and

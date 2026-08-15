@@ -332,6 +332,44 @@ function Session:stdin_for(statement)
   return script
 end
 
+--- Spawn the client for an already-gated statement, registering the job before it starts.
+---
+--- The handle is registered BEFORE the process starts, so `cancel_all` can never miss a job that
+--- called back before `exec.run` returned.
+---@param spec { mode: string, stdin: string, timeout_ms: integer?, on_stdout: (fun(chunk: string): string?)? }
+---@param on_result fun(result: dblens.ExecResult)
+---@return dblens.Job
+local function spawn(session, spec, on_result)
+  local command = session.adapter.command(
+    session:client_spec(),
+    session.secret,
+    spec.mode,
+    session.options.clients
+  )
+  local handle = {
+    cancel = function() end,
+    is_done = function()
+      return false
+    end,
+  }
+  session.jobs[handle] = true
+
+  local job = exec.run({
+    argv = command.argv,
+    env = command.env,
+    stdin = spec.stdin,
+    timeout_ms = spec.timeout_ms or session.options.timeout_ms,
+    max_bytes = session.options.max_bytes,
+    on_stdout = spec.on_stdout,
+  }, function(result)
+    session.jobs[handle] = nil
+    on_result(result)
+  end)
+
+  handle.cancel, handle.is_done = job.cancel, job.is_done
+  return handle
+end
+
 --- Run one statement, through the gate.
 ---
 --- `opts.mode` selects the record protocol ('records', the default) or the client's plain text
@@ -351,29 +389,13 @@ function Session:run(statement, opts, on_done)
   end
   assert(type(info) == 'table', 'session:run: the gate must report a classification')
   local is_write = info.write
-
   local mode = opts.mode or 'records'
-  local command = self.adapter.command(self:client_spec(), self.secret, mode, self.options.clients)
-  local stdin = self:stdin_for(statement)
 
-  -- The handle is registered BEFORE the process starts, so `cancel_all` can never miss a job
-  -- that called back before `exec.run` returned.
-  local handle = {
-    cancel = function() end,
-    is_done = function()
-      return false
-    end,
-  }
-  self.jobs[handle] = true
-
-  local job = exec.run({
-    argv = command.argv,
-    env = command.env,
-    stdin = stdin,
-    timeout_ms = opts.timeout_ms or self.options.timeout_ms,
-    max_bytes = self.options.max_bytes,
+  return spawn(self, {
+    mode = mode,
+    stdin = self:stdin_for(statement),
+    timeout_ms = opts.timeout_ms,
   }, function(result)
-    self.jobs[handle] = nil
     -- A truncated READ still renders what arrived. A truncated WRITE does not: hitting the byte
     -- cap means the client was SIGTERM'd mid-batch, so the change's fate is unknown and calling
     -- that a success reported "committed" for a batch the server had rolled back.
@@ -407,9 +429,101 @@ function Session:run(statement, opts, on_done)
       raw = result.stdout,
     }, nil)
   end)
+end
 
-  handle.cancel, handle.is_done = job.cancel, job.is_done
-  return handle
+--- Run ONE statement and hand its rows over as they arrive.
+---
+--- This is what makes an export a consistent read. ONE statement in ONE client invocation is ONE
+--- server snapshot, so what the caller receives cannot be a mix of two reads of a table something
+--- else is writing to; a run split across client processes has no such tie, whatever it orders by.
+--- The single-statement rule is enforced here rather than assumed, for locked and unlocked
+--- connections alike — it is the guarantee, not a formality.
+---
+--- Nothing accumulates the result, so what bounds the run is the statement's own LIMIT rather than
+--- `max_bytes`. An engine whose decoder cannot frame a partial stream (mssql) buffers instead and
+--- is bounded by `max_bytes`, reporting an error rather than a short result.
+---
+--- `on_rows` is called at least once, so a zero-row result still delivers its columns. It may
+--- return a message to stop the run, which is how a failing writer stops the client. It runs in a
+--- FAST EVENT context — it is the client's own output callback, which is what keeps it behind the
+--- client rather than queued in front of a busy main loop — so it must not touch `vim.fn`,
+--- `vim.api` or anything else that needs the main loop. Anything that does belongs in `on_done`.
+---@param statement string
+---@param opts { columns: string[]?, timeout_ms: integer?, on_rows: fun(columns: string[], rows: any[][]): string? }
+---@param on_done fun(summary: { rows: integer, malformed: integer, elapsed_ms: number }?, err: string?)
+---@return dblens.Job
+function Session:stream(statement, opts, on_done)
+  assert(type(statement) == 'string' and statement ~= '', 'session:stream: needs a statement')
+  assert(type(opts.on_rows) == 'function', 'session:stream: on_rows must be a function')
+  assert(type(on_done) == 'function', 'session:stream: on_done must be a function')
+  local function stop(message)
+    return refused(message, function(_, reported)
+      on_done(nil, reported)
+    end)
+  end
+  local framing = sqlmod.single_statement_problem(statement)
+  if framing then
+    return stop(('a streamed read must be exactly one statement: %s'):format(framing))
+  end
+  local refusal = self:gate(statement)
+  if refusal then
+    return stop(refusal)
+  end
+
+  local reader = protocol.reader({
+    decode = self.adapter.decode,
+    boundary = self.adapter.stream_boundary,
+    columns = opts.columns,
+    max_buffer = self.options.max_bytes,
+  })
+  local delivered = 0
+
+  --- Hand on what the reader produced. An empty batch is not delivered: the columns a caller
+  --- latches must come from the header the client sent, not from the catalog list seeded as a
+  --- fallback, which a schema change since the last load would have made stale.
+  local function deliver(rows, err)
+    if err then
+      return err
+    end
+    if #rows == 0 then
+      return nil
+    end
+    delivered = delivered + #rows
+    return opts.on_rows(reader.columns(), rows)
+  end
+
+  return spawn(self, {
+    mode = 'records',
+    stdin = self:stdin_for(statement),
+    timeout_ms = opts.timeout_ms,
+    on_stdout = function(chunk)
+      return deliver(reader.push(chunk))
+    end,
+  }, function(result)
+    if not result.ok then
+      on_done(nil, exec.format_error(result, self.adapter.label))
+      return
+    end
+    local tail_err = deliver(reader.finish())
+    if tail_err then
+      on_done(nil, tail_err)
+      return
+    end
+    -- A result with no rows at all still has columns, and a caller writing a file needs them for
+    -- its header, so it is told once rather than left to guess from an empty run.
+    if delivered == 0 then
+      local empty_err = opts.on_rows(reader.columns(), {})
+      if empty_err then
+        on_done(nil, empty_err)
+        return
+      end
+    end
+    on_done({
+      rows = delivered,
+      malformed = reader.malformed(),
+      elapsed_ms = result.elapsed_ms,
+    }, nil)
+  end)
 end
 
 --- Run statements in order, stopping at the first failure.
@@ -575,6 +689,9 @@ end
 local KILLED = { timeout = true, cancelled = true, max_bytes = true }
 
 --- Name the queued change a client blamed, using the line it reported.
+---
+--- The queuer's own `label` wins over the queue position: an import numbers by FILE row, and
+--- reporting the queue ordinal there gave the same failure two different numbers.
 ---@return string
 local function describe_failure(owners, info, total, run_err)
   local line = info and info.stderr and exec.error_line(info.stderr) or nil
@@ -582,13 +699,11 @@ local function describe_failure(owners, info, total, run_err)
   if not owner then
     return ('the batch failed and was rolled back: %s'):format(run_err)
   end
+  local named = owner.label or ('change %d of %d'):format(owner.index, total)
   if owner.guard then
-    return ('change %d of %d no longer matches exactly one row, so nothing was applied'):format(
-      owner.index,
-      total
-    )
+    return ('%s no longer matches exactly one row, so nothing was applied'):format(named)
   end
-  return ('change %d of %d failed, so nothing was applied: %s'):format(owner.index, total, run_err)
+  return ('%s failed, so nothing was applied: %s'):format(named, run_err)
 end
 
 --- Commit the queued batch as one atomic script.

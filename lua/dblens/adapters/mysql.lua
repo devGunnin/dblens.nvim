@@ -80,9 +80,33 @@ function M.describe(spec)
   )
 end
 
+--- Statements every connection runs before dblens sends anything.
+---
+--- ONE `--init-command`, both settings inside it: the client keeps only the LAST occurrence of the
+--- option, so passing two silently dropped the read-only switch (verified on 8.4 and MariaDB
+--- 11.8 — `@@transaction_read_only` came back 0). Two statements in one are honoured on both.
+---
+--- Clearing `NO_BACKSLASH_ESCAPES` makes an assumption dblens cannot otherwise see TRUE: this
+--- dialect doubles `\` when quoting a literal and frames strings the same way when it scans them,
+--- and under that mode the server would both store the extra backslash and disagree with dblens
+--- about where a string ends. The `,`-wrapping is what lets the flag be removed wherever it sits
+--- in the list, MySQL's leading position included.
+local CLEAR_NO_BACKSLASH_ESCAPES = "SET SESSION sql_mode = TRIM(BOTH ',' FROM "
+  .. "REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))"
+
+---@param spec dblens.ConnectionSpec
+---@return string
+function M.init_command(spec)
+  local statements = { CLEAR_NO_BACKSLASH_ESCAPES }
+  if spec.read_only == true then
+    table.insert(statements, 1, 'SET SESSION TRANSACTION READ ONLY')
+  end
+  return '--init-command=' .. table.concat(statements, '; ')
+end
+
 --- The password goes through MYSQL_PWD, never argv, which would expose it in the process list.
 ---
---- `--init-command=SET SESSION TRANSACTION READ ONLY` and the transaction wrap are BOTH
+--- `SET SESSION TRANSACTION READ ONLY` (see `init_command`) and the transaction wrap are BOTH
 --- load-bearing, and neither alone is enough. Verified live on MySQL 8.4 and MariaDB 11.8: inside
 --- a bare `START TRANSACTION READ ONLY`, `CREATE TABLE` and `DROP TABLE` SUCCEED -- DDL commits
 --- the transaction implicitly and then runs outside it. The SESSION setting is what refuses those
@@ -109,9 +133,7 @@ function M.build_argv(spec, mode, binary)
   )
   local argv =
     { binary, '--default-character-set=utf8mb4', '--connect-timeout=10', '--local-infile=0' }
-  if spec.read_only == true then
-    argv[#argv + 1] = '--init-command=SET SESSION TRANSACTION READ ONLY'
-  end
+  argv[#argv + 1] = M.init_command(spec)
   argv[#argv + 1] = mode == 'records' and '--xml' or '--batch'
   if spec.host then
     vim.list_extend(argv, { '-h', spec.host })
@@ -252,6 +274,19 @@ function M.decode(stdout, opts)
   end
 
   return { columns = columns, rows = rows, malformed = malformed }
+end
+
+--- How much of a partial `--xml` stream is whole rows: everything up to the last `</row>`.
+---
+--- Safe because the client escapes `<` and `>` in values, so the closing tag cannot appear inside
+--- one. A streamed read is one statement (`Session:stream` refuses anything else), so there is
+--- only ever the one `<resultset>` and no second one's rows can be mistaken for the first's.
+---@param text string
+---@return integer
+function M.stream_boundary(text)
+  assert(type(text) == 'string', 'mysql.stream_boundary: expected a string')
+  local at = text:match('^.*()</row>')
+  return at and (at + 5) or 0
 end
 
 M.sql = {}

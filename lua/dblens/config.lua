@@ -35,6 +35,21 @@ M.defaults = {
   --- without the user picking it, and nothing is scanned until dblens is opened.
   discovery = { auto = true, max_depth = 6, max_entries = 20000 },
 
+  --- Exporting a whole result or a whole table. `max_rows` is a foot-gun bound, not a render
+  --- limit: it becomes the LIMIT of the single statement the export reads with, and reaching it
+  --- STOPS the export and says so — it never trims the file in silence.
+  export = { max_rows = 1000000 },
+
+  --- `:DbLensFormat`. An EMPTY command detects an installed formatter; set an argv ARRAY to pick
+  --- one, e.g. `{ 'sqlfluff', 'format', '--dialect', 'postgres', '-' }`. Never a shell string: it
+  --- is spawned directly, gets the SQL on stdin, and only reformats text.
+  format = { command = {} },
+
+  --- Importing a CSV into a table (`:DbLensImport`). EDIT mode only. `max_rows` caps the rows one
+  --- import may insert, `max_bytes` the file it will read: both refuse loudly rather than
+  --- importing part of a file.
+  import = { max_rows = 10000, max_bytes = 16 * 1024 * 1024 },
+
   history = { enabled = true, max_entries = 500 },
   --- Restoring reconnects, so it is opt-in: nothing reaches a database on startup by default.
   session = { restore = false, auto_save = true },
@@ -49,8 +64,9 @@ M.defaults = {
     icons = true,
     winbar = true,
     sidebar = { width = 34, position = 'left' },
-    --- Share of the main column given to results; the editor takes the rest.
-    results = { height = 0.55 },
+    --- Share of the main column given to results; the editor takes the rest. `max_tabs` caps how
+    --- many results can be open at once — each tab holds a whole result set.
+    results = { height = 0.55, max_tabs = 8 },
     grid = {
       max_col_width = 40,
       null_display = 'NULL',
@@ -222,6 +238,7 @@ local function validate_ui(ui)
   fraction(ui.results.height, 'ui.results.height')
   fraction(ui.float.max_width, 'ui.float.max_width')
   fraction(ui.float.max_height, 'ui.float.max_height')
+  positive_int(ui.results.max_tabs, 'ui.results.max_tabs')
   positive_int(ui.sidebar.width, 'ui.sidebar.width')
   positive_int(ui.grid.chunk_size, 'ui.grid.chunk_size')
   positive_int(ui.spinner.interval, 'ui.spinner.interval')
@@ -240,15 +257,33 @@ local function validate_ui(ui)
   end
 end
 
+--- `format.command` is an argv ARRAY, checked here rather than at spawn time: a shell string
+--- would be spawned as one binary with a name full of spaces, and the error would name the
+--- formatter instead of the option that is wrong.
+local function validate_format(command)
+  if not vim.islist(command) then
+    error('dblens: option `format.command` must be an argv list, e.g. { `pg_format`, `-` }', 0)
+  end
+  for index, part in ipairs(command) do
+    if type(part) ~= 'string' or part == '' then
+      error(('dblens: option `format.command[%d]` must be a non-empty string'):format(index), 0)
+    end
+  end
+end
+
 local function validate(options)
   positive_int(options.page_size, 'page_size')
   positive_int(options.max_rows, 'max_rows')
   positive_int(options.max_bytes, 'max_bytes')
   positive_int(options.timeout_ms, 'timeout_ms')
+  positive_int(options.export.max_rows, 'export.max_rows')
+  positive_int(options.import.max_rows, 'import.max_rows')
+  positive_int(options.import.max_bytes, 'import.max_bytes')
   positive_int(options.history.max_entries, 'history.max_entries')
   positive_int(options.discovery.max_depth, 'discovery.max_depth')
   positive_int(options.discovery.max_entries, 'discovery.max_entries')
   one_of(options.completion.keyword_case, 'completion.keyword_case', { 'upper', 'lower', 'keep' })
+  validate_format(options.format.command)
   validate_ui(options.ui)
   validate_keymaps(options.keymaps)
 end

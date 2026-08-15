@@ -151,7 +151,23 @@ end
 
 --- Modules that capture `dblens.exec` or `dblens.session` at require time, so they must be
 --- reloaded alongside the double or they would keep calling the real one.
-local EXEC_DEPENDENTS = { 'dblens.session', 'dblens.connections', 'dblens.app' }
+local EXEC_DEPENDENTS = { 'dblens.session', 'dblens.connections', 'dblens.app', 'dblens.format' }
+
+--- Deliver stdout the way a STREAMING run does: chunk by chunk, with nothing accumulated in the
+--- result. A canned `chunks` list drives the framing, so a spec can cut the wire mid-record.
+local function feed_stream(spec, result, chunks)
+  local pieces = chunks or { result.stdout }
+  result.stdout = ''
+  for _, chunk in ipairs(pieces) do
+    local problem = spec.on_stdout(chunk)
+    if problem then
+      result.ok = false
+      result.reason = 'consumer'
+      result.consumer_error = problem
+      return
+    end
+  end
+end
 
 local function make_fake_exec(real, respond, calls)
   local fake = setmetatable({}, { __index = real })
@@ -162,8 +178,12 @@ local function make_fake_exec(real, respond, calls)
     calls[#calls + 1] = call
     local canned = respond(call, #calls) or {}
     local pending = canned.pending == true
-    canned.pending = nil
+    local chunks = canned.chunks
+    canned.pending, canned.chunks = nil, nil
     local result = vim.tbl_extend('force', blank_result(), canned)
+    if spec.on_stdout then
+      feed_stream(spec, result, chunks)
+    end
     if not pending then
       on_done(result)
       call.done = true
@@ -200,7 +220,7 @@ function M.with_fake_exec(respond, fn)
   assert(type(respond) == 'function', 'helpers.with_fake_exec: respond must be a function')
   assert(type(fn) == 'function', 'helpers.with_fake_exec: fn must be a function')
   local real = require('dblens.exec')
-  local saved = { ['dblens.exec'] = real }
+  local saved = {}
   for _, name in ipairs(EXEC_DEPENDENTS) do
     saved[name] = package.loaded[name]
     package.loaded[name] = nil
@@ -209,8 +229,12 @@ function M.with_fake_exec(respond, fn)
   package.loaded['dblens.exec'] = make_fake_exec(real, respond, calls)
 
   local ok, err = pcall(fn, require('dblens.session'), calls)
-  for name, module in pairs(saved) do
-    package.loaded[name] = module
+  package.loaded['dblens.exec'] = real
+  -- Restored by NAME, nil included: a dependent that was not loaded before must go back to not
+  -- being loaded. Putting only the non-nil ones back left a `dblens.session` still holding the
+  -- DOUBLE, so a later "live" case ran against the stub and passed without touching a database.
+  for _, name in ipairs(EXEC_DEPENDENTS) do
+    package.loaded[name] = saved[name]
   end
   if not ok then
     error(err, 0)

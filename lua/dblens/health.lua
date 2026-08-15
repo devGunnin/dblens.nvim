@@ -253,6 +253,18 @@ local function check_integrations()
   end
 end
 
+--- The SQL formatter `:DbLensFormat` would use. Reported here rather than left to fail at the
+--- keystroke: an external tool that is simply not installed is exactly what checkhealth is for.
+local function check_formatter(options)
+  health.start('SQL formatter')
+  local argv, err = require('dblens.format').detect(options.format.command)
+  if not argv then
+    health.info(err .. ' (optional; only `:DbLensFormat` needs it)')
+    return
+  end
+  health.ok(('%s: %s'):format(argv[1], table.concat(argv, ' ')))
+end
+
 function M.check()
   check_nvim()
   local ok, options = pcall(config.get)
@@ -266,6 +278,7 @@ function M.check()
   check_read_only()
   check_connections(options)
   check_keymaps()
+  check_formatter(options)
   check_integrations()
 end
 

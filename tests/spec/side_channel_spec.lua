@@ -380,8 +380,17 @@ describe('postgres, live: the dblink write is refused on a locked connection', f
   end
 
   --- Seed, and confirm dblink is actually installed: without it the refusal proves nothing.
-  ---@return boolean ready
+  ---
+  --- Reachability is checked FIRST and reported separately. Both failures used to be reported as
+  --- "no dblink extension", which sent a reader hunting for an extension on a server that was
+  --- simply not answering.
+  ---@return boolean ready, string? why_not
   local function seed()
+    local reachable = send(false, 'SELECT 1')
+    if reachable.code ~= 0 then
+      local first_line = vim.split(vim.trim(tostring(reachable.stderr or '')), '\n')[1]
+      return false, ('the postgres server did not answer (%s)'):format(first_line)
+    end
     local out = send(
       false,
       'CREATE EXTENSION IF NOT EXISTS dblink;\n'
@@ -389,7 +398,10 @@ describe('postgres, live: the dblink write is refused on a locked connection', f
         .. 'CREATE TABLE victim(note text);\n'
         .. "INSERT INTO victim VALUES ('seed');"
     )
-    return out.code == 0
+    if out.code ~= 0 then
+      return false, 'postgres has no `dblink` extension available'
+    end
+    return true, nil
   end
 
   local function skip()
@@ -399,8 +411,9 @@ describe('postgres, live: the dblink write is refused on a locked connection', f
       )
       return true
     end
-    if not seed() then
-      MiniTest.add_note('postgres has no `dblink` extension available; the live proof did not run')
+    local ready, why_not = seed()
+    if not ready then
+      MiniTest.add_note(('%s; the live dblink proof did not run'):format(why_not))
       return true
     end
     return false
