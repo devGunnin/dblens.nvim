@@ -1340,7 +1340,10 @@ function M.filter_with(column, op, values, combine)
     M.error(locked)
     return
   end
-  M.set_filter(combine == 'and' and filter.combine(state.grid.filter, predicate) or predicate)
+  M.set_filter(
+    combine == 'and' and filter.combine(state.grid.filter, predicate, state.session.adapter.dialect)
+      or predicate
+  )
 end
 
 function M.clear_filter()

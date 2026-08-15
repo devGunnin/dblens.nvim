@@ -129,8 +129,9 @@ for class, order in pairs(ORDER) do
   assert(#order == #M.OPERATORS, ('filter: the %s order is missing an operator'):format(class))
 end
 
---- Type fragments that decide a column's class. Temporal is tested FIRST because `interval` and
---- postgres's `point` both contain `int`.
+--- Type fragments that decide a column's class. Temporal is tested FIRST because `interval`
+--- contains `int` and would otherwise fall into `numeric` (order only decides menu order, so
+--- `point`, which also contains `int`, lands in `numeric` regardless — nothing temporal matches it).
 local TYPE_CLASS = {
   { class = 'temporal', fragments = { 'date', 'time', 'year', 'interval' } },
   {
@@ -268,6 +269,15 @@ function M.build(column, op_id, values, dialect)
       return nil, ('cannot filter on `%s`: the value contains a NUL byte'):format(column)
     end
   end
+  -- Only `two` (BETWEEN): its bounds are a range, not a value, so a blank one has nothing to
+  -- mean. Other arities keep '' as a legitimate literal (an empty string is real data).
+  if operator.arity == 'two' then
+    for _, value in ipairs(values) do
+      if vim.trim(value) == '' then
+        return nil, ('%s needs both bounds'):format(operator.id)
+      end
+    end
+  end
 
   local predicate = compose(sql.quote_ident(column, dialect), operator, values, dialect)
   local problem = common.check_predicate(predicate, dialect)
@@ -277,20 +287,39 @@ function M.build(column, op_id, values, dialect)
   return predicate, nil
 end
 
+--- Requote a bare leading column name that names a write verb (`comment`, `set`, ...).
+---
+--- `common.check_predicate` exempts a write-verb word ONLY at the head of the token stream — a
+--- filter predicate starts with a column name. Wrapping `existing` in `(` for the AND moves that
+--- head word to right after `(`, which the same check reads as a nested statement opening.
+--- Quoting it back into an identifier token sidesteps the check instead of racing it: it was
+--- never compared against the write-verb list unquoted, it just stops looking like a bare word.
+---@param text string  -- already trimmed, non-empty
+---@param dialect dblens.Dialect?
+---@return string
+local function guard_leading_column(text, dialect)
+  local head = sql.scan(text, dialect)[1]
+  if not head or head.type ~= 'word' or not sql.is_write_verb(head.text, dialect) then
+    return text
+  end
+  return sql.quote_ident(head.text, dialect) .. text:sub(head.to + 1)
+end
+
 --- AND the new predicate onto the one already applied.
 ---
 --- Both sides are parenthesised: the filter bar takes raw SQL, so an `OR` on either side would
 --- otherwise change meaning as soon as something was ANDed to it.
 ---@param existing string?
 ---@param predicate string
+---@param dialect dblens.Dialect?
 ---@return string
-function M.combine(existing, predicate)
+function M.combine(existing, predicate, dialect)
   assert(type(predicate) == 'string' and predicate ~= '', 'filter.combine: needs a predicate')
   local current = vim.trim(existing or '')
   if current == '' then
     return predicate
   end
-  return ('(%s) AND (%s)'):format(current, predicate)
+  return ('(%s) AND (%s)'):format(guard_leading_column(current, dialect), predicate)
 end
 
 return M

@@ -76,6 +76,22 @@ describe('filter builder: each operator builds its own WHERE', function()
     eq(build('n', 'IN', { "o'brien" }, sqlmod.dialects.mysql), [[`n` IN ('o''brien')]])
     eq(build('n', '=', { "o'brien" }, sqlmod.dialects.postgres), [["n" = E'o''brien']])
   end)
+
+  --- A blank bound is a half-finished BETWEEN, not a value: unlike `=`, there is nothing an
+  --- empty range endpoint could legitimately mean, and the server otherwise sees it (a raw type
+  --- error on postgres, a silently empty result on sqlite).
+  it('refuses a blank BETWEEN bound instead of sending it', function()
+    local predicate, problem = filter.build('n', 'BETWEEN', { '1', '' }, DIALECT)
+    eq(predicate, nil)
+    eq(problem, 'BETWEEN needs both bounds')
+
+    predicate, problem = filter.build('n', 'BETWEEN', { '  ', '9' }, DIALECT)
+    eq(predicate, nil)
+    eq(problem, 'BETWEEN needs both bounds')
+
+    -- An empty string is still a legitimate value for the operators that take one.
+    eq(build('n', '=', { '' }), [["n" = '']])
+  end)
 end)
 
 describe('filter builder: a hostile value is data, and a hostile column is a name', function()
@@ -314,6 +330,22 @@ describe('filter builder: combining with the filter already applied', function()
     local combined = filter.combine(first, second)
     eq(common.check_predicate(combined, DIALECT), nil, { fail_reason = combined })
     eq(#sqlmod.split(page_with(combined), DIALECT), 1, { fail_reason = combined })
+  end)
+
+  --- `(comment = 1)` moves `comment` right after the `(` the AND adds, which is exactly where
+  --- `common.check_predicate` reads a write-verb word as a nested statement opening -- combine
+  --- used to refuse this hand-typed filter for a reason the new predicate never mentioned.
+  it('ANDs onto a hand-typed filter whose column is a keyword name', function()
+    local combined = filter.combine('comment = 1', [["c" IS NULL]], DIALECT)
+    eq(combined, [[("comment" = 1) AND ("c" IS NULL)]])
+    eq(common.check_predicate(combined, DIALECT), nil, { fail_reason = combined })
+
+    combined = filter.combine('set = 1', [["c" IS NULL]], DIALECT)
+    eq(combined, [[("set" = 1) AND ("c" IS NULL)]])
+    eq(common.check_predicate(combined, DIALECT), nil, { fail_reason = combined })
+
+    -- `select` is a read verb, never refused here -- combine leaves it untouched either way.
+    eq(filter.combine('select = 1', [["c" IS NULL]], DIALECT), [[(select = 1) AND ("c" IS NULL)]])
   end)
 end)
 

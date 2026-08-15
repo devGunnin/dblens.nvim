@@ -254,7 +254,9 @@ function M.current_cell(state)
   if row < 1 or row > #result.rows then
     return nil, 'put the cursor on a data row'
   end
-  local column = grid.nearest_column(state.grid.spans, vim.fn.virtcol({ cursor[1], cursor[2] }))
+  -- nvim_win_get_cursor returns a 0-based byte column; virtcol wants 1-based, or it resolves
+  -- the column BEFORE the cursor (wrong on a cell's first char, incl. after focus_match).
+  local column = grid.nearest_column(state.grid.spans, vim.fn.virtcol({ cursor[1], cursor[2] + 1 }))
   if not column then
     return nil, 'put the cursor on a column'
   end
