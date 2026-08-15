@@ -1308,6 +1308,7 @@ Both plugins are optional and a missing one is not an error.
 - every connection with its kind, its access, and whether it has a password
   reference - never which variable, never its value;
 - any global `<leader>d*` map dblens took over from another plugin;
+- which SQL formatter `:DbLensFormat` would use, or what to install;
 - which optional integrations (nvim-web-devicons, nvim-cmp, blink.cmp,
   which-key.nvim) are installed.
 

@@ -1085,8 +1085,9 @@ Both plugins are optional; a missing one is not an error.
 loaded or was refused, where its files live and the resolved limits; each database client and its
 version; **what LOCKED means per engine**, as a warning wherever it is best-effort rather than
 enforced by the server; every connection with its kind, access and whether it has a password
-reference; any global keymap it took over from another plugin; and which optional integrations
-are installed. It never resolves a password.
+reference; any global keymap it took over from another plugin; which SQL formatter
+`:DbLensFormat` would use; and which optional integrations are installed. It never resolves a
+password.
 
 ## Highlight groups
 
