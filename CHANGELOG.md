@@ -14,7 +14,38 @@ All notable changes to this project are documented here. Format follows
   cell references nothing and says so, a column carrying several references asks which, and a key
   spanning several columns follows the one under the cursor and states that it did. It is a read
   throughout: the predicate is built and quoted here, and the row is fetched by the same paged
-  SELECT a browse uses. Reverse navigation ("what references this row") is not in this release.
+  SELECT a browse uses.
+- **Reverse foreign-key navigation** (`gF` in the grid): the rows in OTHER tables whose foreign key
+  points at the row under the cursor. `fk.referencing` inverts the same metadata `gf` reads,
+  through the same resolution rules, so a relationship is described in one place. The columns of
+  tables the tree never expanded are read first, which is what makes "no loaded table references
+  this" mean it; several referencing tables ask which one, a composite key matches on its own
+  column and says so, and a NULL key or a table with no single-column primary key is reported
+  rather than guessed at. A read like `gf`: the key value reaches the WHERE through the same
+  per-dialect quoting as `F`.
+- **Several results open at once.** `t` in the tree opens a table in a new result tab,
+  `<localleader>t` in the editor runs a statement into one, and `gt` / `gT` / `gc` / `gl` step,
+  close and list them; the winbar names the open results once there is more than one. Each tab
+  owns its whole view — result, filter, sort, search, page — AND its own race guard: a query
+  started in one tab lands in that tab whatever is on screen when it finishes, and two queries
+  completing out of order cannot cross. Closing a tab stops what it was running; closing the last
+  one empties it. `ui.results.max_tabs` (default 8) caps them, because each holds a whole result.
+- **Format the SQL buffer** (`<localleader>f`, visual mode for the selected lines, or
+  `:DbLensFormat` with or without a range). dblens does not format SQL itself: it hands the text
+  to `sqlfluff`, `pg_format` or `sqlformat` — detected in that order, or whatever `format.command`
+  names as an argv ARRAY — spawned directly with the SQL on stdin. No shell, no session, no
+  client, so the formatter can only reprint the text, never run it. The buffer is replaced only on
+  success; a formatter that fails, times out or prints nothing leaves it alone and says why, and
+  with none installed the message names what to install.
+- **Import a CSV into a table** (`I` in the tree, or `:DbLensImport`). EDIT mode only: a LOCKED
+  connection is refused before a file is even asked for. The path is expanded without any shell,
+  the file is parsed by dblens to RFC 4180 (quoted fields, embedded commas, newlines and doubled
+  quotes), and CSV columns are matched to table columns by header name — a name the table does not
+  have is refused, never dropped or guessed at. Every value becomes a quoted literal, so a cell
+  holding `'); DROP TABLE x;--` is imported as that string. The row count, the mapping and a
+  sample of the generated `INSERT`s are confirmed first, and the run is ONE transaction: if any
+  row fails, nothing is imported and the failing row is named. `import.max_rows` and
+  `import.max_bytes` refuse rather than importing part of a file.
 - **Filter from the cell under the cursor**: `F` filters to it, `!` filters it out, `C` clears the
   filter. The value is quoted for the dialect by the same helpers the CRUD statements use and the
   predicate then goes through the same `check_predicate` vetting as a typed one — a cell holding
@@ -69,9 +100,14 @@ All notable changes to this project are documented here. Format follows
 - **An export format is no longer guessed with a silent CSV fallback.** `.csv`, `.json` and `.sql`
   are recognised; anything else is an error naming the three, instead of a `.tsv` quietly written
   as CSV.
-- The `?` overlay does not fit an 80x24 screen in any pane — the grid lists 38 bindings and even
+- The `?` overlay does not fit an 80x24 screen in any pane — the grid lists 44 bindings and even
   the sidebar's list outgrows the 18 rows that size leaves. It scrolls there (`j`/`k`), the footer
-  says so, and nothing is dropped or cut off the right edge.
+  says so, and nothing is dropped or cut off the right edge. It fits from about 100x33.
+- **A CSV export quotes the empty string and leaves NULL empty.** Both were written as an empty
+  field, so a table holding `''` came back from its own export as NULL. Quoting is the only thing
+  that tells the two apart in CSV — the convention sqlite3, psql and `COPY ... CSV` follow, and
+  what the new import reads back, so a table exported and imported into a fresh one is the same
+  table.
 - **A filter is refused for a backslash only where a backslash may escape.** MySQL and MariaDB read
   one inside a literal differently depending on `NO_BACKSLASH_ESCAPES`, which dblens cannot see, so
   the refusal stands there. SQLite, PostgreSQL, DuckDB and SQL Server have no such escape, so `F`

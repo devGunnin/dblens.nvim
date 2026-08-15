@@ -552,3 +552,153 @@ describe('sqlite, live: a table exported to CSV imports back identical', functio
     eq(protocol.decode_csv(counted.stdout).rows[1][1], tostring(#VALUES + 1))
   end)
 end)
+
+--- postgres, live. The transactional claim, proved by a server that really rolls back: a good
+--- file lands every row, and a file whose last row violates a constraint imports NOTHING.
+describe('postgres, live: a failing row rolls the whole import back', function()
+  local MiniTest = require('mini.test')
+  local adapter = assert(require('dblens.adapters').get('postgres'))
+  local loader = require('dblens.loader')
+  local target = nil
+  local RELATION = { schema = 'public', name = 'import_live', kind = 'table' }
+
+  --- Send a statement over the adapter's own argv, with no gate in front of it.
+  local function psql(statement)
+    local spec = vim.tbl_extend('force', target.spec, { read_only = false })
+    local command = adapter.command(spec, target.secret, 'records', target.clients)
+    return vim.system(command.argv, { env = command.env, stdin = statement }):wait(60000)
+  end
+
+  local function rows_now()
+    local out = psql('SELECT id, note FROM import_live ORDER BY id')
+    if out.code ~= 0 then
+      return 'gone: ' .. tostring(out.stderr)
+    end
+    local decoded = adapter.decode(out.stdout, {})
+    local lines = {}
+    for _, row in ipairs(decoded.rows) do
+      lines[#lines + 1] = table.concat({ tostring(row[1]), tostring(row[2]) }, '|')
+    end
+    return table.concat(lines, '\n')
+  end
+
+  local function skip()
+    if target then
+      return false
+    end
+    MiniTest.add_note(
+      'no postgres server (set DBLENS_TEST_POSTGRES_PORT); the live import did not run'
+    )
+    return true
+  end
+
+  before_each(function()
+    target = h.live_target('postgres')
+  end)
+
+  --- A UI over a REAL writable session, with the table's columns loaded.
+  local function live_ui()
+    local app = require('dblens.app')
+    require('dblens.config').setup(
+      vim.tbl_deep_extend('force', options(), { clients = target.clients })
+    )
+    app.open()
+    local state = assert(app.state(), 'app.open left no state')
+    local session = assert(
+      require('dblens.session').new(
+        vim.tbl_extend('force', target.spec, { read_only = false }),
+        state.options
+      )
+    )
+    session.secret = target.secret
+    session.connected = true
+    state.session = session
+
+    local done = false
+    loader.relations(session, 'public', function(err)
+      assert(not err, tostring(err))
+      done = true
+    end)
+    assert(
+      vim.wait(60000, function()
+        return done
+      end),
+      'the live client never listed the schema'
+    )
+    return app, state
+  end
+
+  --- Run the importer end to end, answering its prompt and its confirmation.
+  ---
+  --- The hooks stay installed across the WAIT: every step here is a real client call, so the
+  --- messages the flow ends with arrive long after `start` has returned.
+  ---@return string[] messages
+  local function run_import(state, text)
+    local path = csv_file(text)
+    local said = {}
+    local input, notify = vim.ui.input, vim.notify
+    local confirm = require('dblens.ui.confirm')
+    local ask = confirm.ask
+    vim.ui.input = function(_, on_input)
+      on_input(path)
+    end
+    vim.notify = function(message)
+      said[#said + 1] = message
+    end
+    confirm.ask = function(_, _, on_confirm)
+      on_confirm()
+    end
+    local ok, err = pcall(require('dblens.ui.importer').start, state, RELATION)
+    local finished = ok and vim.wait(60000, function()
+      return #said > 0
+    end)
+    vim.ui.input, vim.notify, confirm.ask = input, notify, ask
+    assert(ok, tostring(err))
+    assert(finished, 'the live import never reported an outcome')
+    return said
+  end
+
+  it('imports every row, then imports nothing at all when one row fails', function()
+    if skip() then
+      return
+    end
+    local seeded = psql([[
+DROP TABLE IF EXISTS import_live;
+CREATE TABLE import_live(id int PRIMARY KEY, note text);
+]])
+    eq(seeded.code, 0, { fail_reason = tostring(seeded.stderr) })
+
+    local app, state = live_ui()
+    -- A payload value and a NULL, so the live path carries the same data the unit cases do.
+    local hostile = table.concat({
+      'id,note',
+      [[1,"'); DROP TABLE import_live;--"]],
+      '2,',
+      '3,"a,b"',
+      '',
+    }, '\n')
+    local said = run_import(state, hostile)
+    eq(
+      table.concat(said, '\n'):find('imported 3 row', 1, true) ~= nil,
+      true,
+      { fail_reason = table.concat(said, '\n') }
+    )
+    local landed = rows_now()
+    eq(landed:find('DROP TABLE import_live', 1, true) ~= nil, true, { fail_reason = landed })
+    eq(
+      select(2, landed:gsub('\n', '')),
+      2,
+      { fail_reason = 'three rows should have landed: ' .. landed }
+    )
+
+    -- Now a file whose LAST row collides with the primary key: nothing may land.
+    local before = rows_now()
+    local failed = run_import(state, 'id,note\n4,four\n5,five\n1,collides\n')
+    local text = table.concat(failed, '\n')
+    eq(text:find('nothing was imported', 1, true) ~= nil, true, { fail_reason = text })
+    eq(text:find('change 3 of 3', 1, true) ~= nil, true, { fail_reason = text })
+    eq(rows_now(), before, { fail_reason = 'a failed import left rows behind' })
+    eq(state.session.txn:is_active(), false, { fail_reason = 'the queue outlived the failure' })
+    app.close()
+  end)
+end)

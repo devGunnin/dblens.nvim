@@ -1295,3 +1295,97 @@ INSERT INTO orders VALUES (10, 1, 'first'), (11, 1, 'second'), (12, 2, 'other');
     eq({ rows[1][1], rows[2][1] }, { '10', '11' }, { fail_reason = out.stdout })
   end)
 end)
+
+--- postgres, live. The same inversion against a server that qualifies its relations with a
+--- schema, which is the part sqlite cannot exercise at all.
+describe('postgres, live: the inversion holds on a schema-qualified engine', function()
+  local MiniTest = require('mini.test')
+  local adapter = assert(require('dblens.adapters').get('postgres'))
+  local loader = require('dblens.loader')
+  local target = nil
+
+  local function psql(statement)
+    local spec = vim.tbl_extend('force', target.spec, { read_only = false })
+    local command = adapter.command(spec, target.secret, 'records', target.clients)
+    return vim.system(command.argv, { env = command.env, stdin = statement }):wait(60000)
+  end
+
+  local function skip()
+    if target then
+      return false
+    end
+    MiniTest.add_note(
+      'no postgres server (set DBLENS_TEST_POSTGRES_PORT); the live proof did not run'
+    )
+    return true
+  end
+
+  before_each(function()
+    target = h.live_target('postgres')
+  end)
+
+  it('names the referencing table and column postgres itself reports', function()
+    if skip() then
+      return
+    end
+    local seeded = psql([[
+DROP TABLE IF EXISTS fk_orders;
+DROP TABLE IF EXISTS fk_customers;
+CREATE TABLE fk_customers(id int PRIMARY KEY);
+CREATE TABLE fk_orders(id int PRIMARY KEY, customer_id int REFERENCES fk_customers(id));
+INSERT INTO fk_customers VALUES (1), (2);
+INSERT INTO fk_orders VALUES (10, 1), (11, 1), (12, 2);
+]])
+    eq(seeded.code, 0, { fail_reason = tostring(seeded.stderr) })
+
+    local options = require('dblens.config').setup({ clients = target.clients })
+    local session =
+      assert(require('dblens.session').new(vim.tbl_extend('force', target.spec, {}), options))
+    session.secret = target.secret
+    session.connected = true
+
+    local function wait_for(start)
+      local done, failure = false, nil
+      start(function(err)
+        done, failure = true, err
+      end)
+      assert(
+        vim.wait(60000, function()
+          return done
+        end),
+        'the live client never answered'
+      )
+      eq(failure, nil)
+    end
+
+    -- Schemas first: on an engine that has them, `all_relations` walks the loaded schema list.
+    wait_for(function(done)
+      loader.schemas(session, done)
+    end)
+    wait_for(function(done)
+      loader.relations(session, 'public', done)
+    end)
+    for _, relation in ipairs(session.catalog:all_relations()) do
+      wait_for(function(done)
+        loader.part(session, relation, 'columns', done)
+      end)
+    end
+
+    local customers = { schema = 'public', name = 'fk_customers', kind = 'table' }
+    local found = fk.referencing(session.catalog, customers)
+    eq(#found, 1, { fail_reason = 'postgres metadata did not invert' })
+    eq(found[1].relation.name, 'fk_orders')
+    eq(found[1].column, 'customer_id')
+    eq(found[1].target_column, 'id')
+
+    -- The predicate the navigation builds, run by the real server.
+    local predicate = common.cell_predicate('customer_id', '1', '=', session.adapter.dialect)
+    local statement = session.adapter.sql.page(
+      { schema = 'public', name = 'fk_orders', kind = 'table' },
+      { limit = 100, offset = 0, where = predicate }
+    )
+    local out = psql(statement)
+    eq(out.code, 0, { fail_reason = tostring(out.stderr) })
+    eq(#adapter.decode(out.stdout, {}).rows, 2, { fail_reason = out.stdout })
+  end)
+end)
